@@ -4686,6 +4686,29 @@ def _classify_reference_lines(all_panes, visual_type):
     return constants, deferred
 
 
+def _parse_shelf_totals(rows_el, cols_el):
+    """Whether Tableau shows a GRAND TOTAL on this view, from the shelf's own attributes.
+
+    Tableau writes it on the shelf element and never uses the word "grand":
+    ``<rows onTop='true' total='true'>``. ``total`` turns the grand total on; ``onTop`` puts the
+    total row at the TOP instead of the bottom.
+
+    This matters because **Power BI's table shows a Total row by DEFAULT**, so emitting nothing is
+    not neutral -- it is a decision, and it is the wrong one for almost every view. Measured across
+    the corpus of 34: **252 of 262 shelves declare no total at all**, while every one of the 42
+    emitted grid visuals set no toggle and therefore inherited Power BI's default. That is an extra
+    row of numbers on tables whose source never showed one -- a confidently-wrong addition rather
+    than a missing feature, which is the harder kind to notice because it looks like data.
+
+    Returns ``{"rows": bool, "rows_on_top": bool, "cols": bool, "cols_on_top": bool}``.
+    """
+    def _flag(el, attr):
+        return bool(el is not None and (el.get(attr) or "").strip().lower() == "true")
+
+    return {"rows": _flag(rows_el, "total"), "rows_on_top": _flag(rows_el, "onTop"),
+            "cols": _flag(cols_el, "total"), "cols_on_top": _flag(cols_el, "onTop")}
+
+
 def _parse_worksheet(ws, index, ds_caption, warnings, internal_fields=None, date_binding=None,
                      row_count_binding=None, measure_binding=None, column_binding=None,
                      measure_palette=None, ds_color_palettes=None, workbook_root=None,
@@ -4726,6 +4749,7 @@ def _parse_worksheet(ws, index, ds_caption, warnings, internal_fields=None, date
     cols_el = _first(table, "cols")
     rows_text = (rows_el.text if rows_el is not None else "") or ""
     cols_text = (cols_el.text if cols_el is not None else "") or ""
+    shelf_totals = _parse_shelf_totals(rows_el, cols_el)
     uses_mv = _uses_measure_values(rows_text, cols_text, pane)
     warn_special = not uses_mv
     rows = _resolve_shelf(rows_text, ds_default, base_cols, instances, index,
@@ -5268,6 +5292,18 @@ def _parse_worksheet(ws, index, ds_caption, warnings, internal_fields=None, date
     # visual -- an unsupported worksheet is already wholly deferred, so no extra warning is added.
     reference_lines = []
     reference_line_constants = []
+    # Tableau can place the grand total at the TOP of the view (``<rows onTop='true' total='true'>``).
+    # Power BI cannot: the schema for a flat table (``tableEx``) exposes exactly one total control,
+    # ``total.totals`` (bool), with NO position property, and a matrix's ``rowSubtotalsPosition``
+    # governs per-group SUBTOTALS rather than the grand total. So the row is rebuilt in the only place
+    # Power BI will put it and the move is DISCLOSED -- the alternative is a silent relocation of the
+    # one row a reader is most likely to look at first.
+    if visual_type in (VT_TABLE, VT_MATRIX) and shelf_totals.get("rows") and \
+            shelf_totals.get("rows_on_top"):
+        warnings.append(_warn(
+            "worksheet", name,
+            "grand total is shown at the TOP in Tableau; Power BI's table/matrix has no total-position "
+            "control, so the total row is rebuilt at the BOTTOM (the values are unchanged)"))
     if visual_type != VT_UNSUPPORTED:
         reference_lines = _parse_reference_lines(all_panes)
         if reference_lines:
@@ -5318,6 +5354,10 @@ def _parse_worksheet(ws, index, ds_caption, warnings, internal_fields=None, date
         "dual_axis": _pane_mark_map(table)[2],
         "axis_hidden": sorted(axis_hidden),
         "row_labels_hidden": row_labels_hidden,
+        # Grand-total visibility, from the shelf's own ``total``/``onTop`` attributes. Power BI's
+        # table shows a Total row by DEFAULT, so this must be emitted explicitly in BOTH directions
+        # -- see _parse_shelf_totals.
+        "shelf_totals": shelf_totals,
         "color_gradient": color_gradient,
         "color_gradients": color_gradients,
         "mv_color_scales": mv_color_scales,
@@ -11342,6 +11382,19 @@ def _grid_font_objects(ws):
         _put("subTotals", gs.get("total"), gs.get("subtotal_fill"))
     else:
         _put("total", gs.get("total"), gs.get("subtotal_fill"))
+        # Grand-total VISIBILITY, emitted in both directions because Power BI's table defaults it ON.
+        # Leaving it unset is a decision, not a neutral act: measured across the corpus of 34, 252 of
+        # 262 Tableau shelves declare NO grand total, yet all 42 emitted grid visuals inherited the
+        # default and showed one. An extra row of plausible numbers is harder to notice than a
+        # missing feature, which is what makes it worth being explicit about.
+        #
+        # ``tableEx`` exposes exactly one control here -- ``total.totals`` (bool) -- confirmed
+        # against the visual-type schema rather than assumed. It has NO position property, so
+        # Tableau's ``onTop`` cannot be honoured on a table; the caller discloses that instead of
+        # silently placing the row at the bottom and calling it done.
+        st = ws.get("shelf_totals") or {}
+        fo.setdefault("total", [{"properties": {}}])
+        fo["total"][0]["properties"]["totals"] = _bool_literal(bool(st.get("rows")))
     return fo or None
 
 

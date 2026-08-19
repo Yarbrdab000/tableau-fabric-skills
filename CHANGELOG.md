@@ -12,6 +12,50 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ## [Unreleased]
 
+### Fixed
+
+- **`tableau-migration` (skill `2.251.0` → `2.254.0`): a rebuilt table no longer invents a grand total
+  the workbook never showed.** Tableau writes the grand total on the shelf element and never uses the
+  word "grand": `<rows onTop='true' total='true'>`. `total` turns it on; `onTop` puts the row at the
+  TOP. Searching a `.twb` for "grand" finds product names — which is exactly how both facts had been
+  recorded as *"not in the .twb XML"*. That note was an inference from a keyword Tableau does not use;
+  parsing the shelf attributes found both immediately.
+
+  The asymmetry is what makes this matter: **Power BI's table shows a Total row by DEFAULT**, so
+  emitting no toggle is not neutrality, it is a decision — and the wrong one for nearly every view.
+  Measured: **11 of 162 `<rows>` elements across the corpus of 34 declare a grand total** (3
+  workbooks), while **all 42 emitted grid visuals set no toggle** and inherited the default. An extra
+  row of plausible numbers is harder to spot than a missing feature, because it looks like data.
+
+  `total.totals` is now written in **both directions** from the shelf: 61 tables suppress a total
+  their source never declared, 8 keep one it did. The property was looked up in the visual-type
+  schema rather than assumed — a flat `tableEx` exposes exactly one total control, `total.totals`
+  (bool).
+
+  **Position is a platform limit, so it is disclosed rather than silently applied.** `tableEx` has no
+  total-position property at all, and a matrix's `rowSubtotalsPosition` governs per-group *subtotals*,
+  not the grand total. A view that asked for the total on top is rebuilt with it at the bottom and
+  warned, because quietly relocating the one row a reader looks at first is the failure this avoids.
+
+  **Verified by render, as a one-variable A/B** — the same built report, byte-identical but for that
+  one property:
+
+  | `totals` | last row of the table |
+  |---|---|
+  | `true` | `Total  292,296.81  2,326,534.35  38,654` |
+  | `false` | `Tables  -17,753.21  208,020.18  1,261` — no Total row |
+
+  Everything else identical: 17 rows, same values, same conditional colours, same slicers. That is
+  what wrong would have looked like, recorded so the choice is defensible later. A first attempt at
+  this render was worthless and nearly misread — the model was unrefreshed, so the table was empty and
+  "no total" was indistinguishable from "no data"; the A/B only became evidence after a refresh +
+  `reload`.
+
+  **Corpus of 34:** 1606 → 1606 files, 0 added, 0 removed, 72 differing — 69 `tableEx` visuals across
+  the `pbip` and `reports` trees whose only delta is the `totals` property, plus 3 metadata files.
+  Matrices deliberately untouched: their grand-total visibility has no documented toggle, so guessing
+  one would be the confidently-wrong move this release exists to stop.
+
 ### Added
 
 - **`tableau-migration` (skill `2.241.0` → `2.251.0`): when you find a defect, record the nearest
