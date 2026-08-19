@@ -2009,10 +2009,62 @@ def _date_binding_from_model(res_report):
     then). Returns ``None`` when there is no usable marked Date table or no active date -- the report
     then keeps binding date axes to the source column (warn-never-wrong). ``grain_columns`` is left
     to the binder's standard calendar-column default, so the contract stays minimal.
+
+    **Per-island models** (several datasources -> one calendar each) report ``islands`` instead of a
+    single ``table``, so this used to fall straight through the ``dr.get("table")`` gate and return
+    ``None`` -- disabling date binding for the whole workbook. Measured cost of that: 0073 went 6 -> 0
+    calendar-bound refs, 0088 5 -> 0, 0079 1 -> 0; the axes still rendered correct values on the
+    fact's own column, but lost the calendar hierarchy entirely. Those models now emit ``by_island``:
+    the datasource CAPTION -> that island's calendar + keys. A resolved report field carries its own
+    ``datasource`` (the same caption), so the binder can send each pill to its own island's calendar.
     """
     dr = (res_report or {}).get("date_table") or {}
+    if dr.get("generated") and dr.get("per_island") and dr.get("islands"):
+        return _per_island_date_binding(dr)
     if not (dr.get("generated") and dr.get("mark_as_date") and dr.get("table")):
         return None
+    return _single_calendar_date_binding(dr)
+
+
+def _per_island_date_binding(dr):
+    """``date_binding`` for a model with one calendar per datasource island.
+
+    Keyed on the ISLAND (datasource caption), because that is the one identifier both sides share: a
+    resolved report field carries ``datasource``, and the model build tags each relation with
+    ``source_datasource``.
+
+    Keying on the workbook RELATION NAME instead was tried and is wrong -- measured, not reasoned:
+    ``pmdm__ProgramEngagement__c`` exists in all four Salesforce islands, so the key collides, and
+    resolving the collision "first wins" bound an **Intake** pill to the **Service Delivery**
+    calendar. That is a cross-island rebind onto a calendar with no active join to the fact: every
+    bucket returns the grand total, which is precisely the flat series this split exists to remove.
+
+    The flat single-calendar keys are kept for the first island so a consumer reading ``date_table``
+    still sees something coherent, but the binder prefers ``by_island`` and DECLINES when a pill's
+    datasource is unknown -- binding it to an arbitrary island would reintroduce the same defect.
+    """
+    by_island = {}
+    first = None
+    for isl in dr.get("islands") or []:
+        if not (isl.get("mark_as_date") and isl.get("table")):
+            continue
+        one = _single_calendar_date_binding(isl)
+        if one is None:
+            continue
+        if first is None:
+            first = one
+        key = (isl.get("island") or "").strip().lower()
+        if key:
+            by_island[key] = one
+    if first is None:
+        return None
+    out = dict(first)
+    out["by_island"] = by_island
+    return out
+
+
+def _single_calendar_date_binding(dr):
+    """The original single-calendar derivation, unchanged, reused per island."""
     rels = [r for r in (dr.get("relationships") or []) if r.get("column")]
     active = [r["column"] for r in rels if r.get("active")]
     if not active:

@@ -2862,7 +2862,7 @@ def _select_primary_date(date_cols):
 # to NO table while `pmdm__Stage__c` binds to the Intake island's copy of ProgramEngagement, and a
 # calc spanning two tables is refused. The proper fix is ISLAND-SCOPED FIELD RESOLUTION -- a calc
 # binds within its own datasource no matter how many calendars exist -- which keeps both wins.
-PER_ISLAND_DATE_ENABLED = False
+PER_ISLAND_DATE_ENABLED = True
 
 
 # The placeholder partition an untranslatable connector emits: ``#table(type table [], {})``. This
@@ -2972,6 +2972,13 @@ def _build_date_dimensions(tables, emitted_names, relationships, *, mark_as_date
         built.append((name, part))
         taken.append(name)
         all_rels.extend(rels)
+        # ``island`` is the datasource CAPTION, which is also what a resolved report field carries as
+        # its own ``datasource``. That pairing is what lets the report binder send each date pill to
+        # ITS island's calendar. Deliberately NOT keyed on relation names: the same relation
+        # (``pmdm__ProgramEngagement__c``) exists in all four Salesforce islands, so a relation-name
+        # key is ambiguous and resolving it "first wins" bound an Intake pill to the Service Delivery
+        # calendar -- a cross-island rebind with no active join, i.e. the flat series this split
+        # exists to prevent.
         reports.append(dict(report, island=ds))
     return built, all_rels, {"generated": bool(built), "per_island": True,
                              "tables": [n for n, _ in built], "islands": reports}
@@ -4298,6 +4305,7 @@ def assemble_import_model(descriptor, *, model_name, calcs=None, dim_calcs=None,
                     else (descriptor.get("relationships") or []))
     date_report = {"generated": False, "reason": "date_table disabled"}
     date_name = None
+    date_table_names = []
     active_date_cols = set()
     if date_table:
         _date_built, date_rels, date_report = _build_date_dimensions(
@@ -4311,6 +4319,11 @@ def assemble_import_model(descriptor, *, model_name, calcs=None, dim_calcs=None,
             # single one (date-hierarchy wiring, the model manifest). With one island -- every
             # single-datasource workbook -- that is the only calendar, exactly as before.
             date_name = _date_built[0][0]
+            # ...but the CONFORMED-HUB set must name EVERY calendar (see the conformed_hubs
+            # assignment below). A calendar is a degenerate hub whether or not it happens to be the
+            # first one built, and any hub left un-excluded manufactures spurious co-occurrence
+            # paths that force a false-ambiguity stub in _unique_countd_path.
+            date_table_names = [n for n, _ in _date_built]
             all_rels = all_rels + date_rels
             active_date_cols = {(r["from_table"], r["from_col"])
                                 for r in date_rels if r.get("is_active")}
@@ -4640,7 +4653,7 @@ def assemble_import_model(descriptor, *, model_name, calcs=None, dim_calcs=None,
     # collapses those spurious paths, leaving the real FK path. C/F in a COUNTD-IF are always entity
     # tables (never Date), so this can only remove co-occurrence paths, never a genuine FK path
     # (fail-closed: a pair with no real FK path still correctly stubs).
-    conformed_hubs = {date_name} if date_name else None
+    conformed_hubs = set(date_table_names) if date_table_names else None
     measures_table, measure_report, assisted_suggestions = _measures_part(
         calcs, measure_resolve, consumed=consumed, param_resolver=param_resolver,
         calc_lookup=calc_lookup if calc_lookup is not None else _calc_lookup_from(calcs),

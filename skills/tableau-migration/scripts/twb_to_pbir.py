@@ -509,6 +509,27 @@ def _rebind_date_axis(field, deriv, date_binding, for_filter=False):
     """
     if not date_binding or field.get("role") == "measure":
         return None
+    # PER-ISLAND MODELS: several datasources -> one calendar each. A resolved field carries its own
+    # ``datasource`` (the island's caption), which is the one identifier the model build and the
+    # report share -- so a pill binds to ITS OWN island's calendar. Selecting the island first also
+    # repairs the name-based gates below: ``active_keys`` / ``ambiguous_keys`` become that island's,
+    # so a column name active in one island and not another stops contesting itself workbook-wide.
+    #
+    # Keyed on the datasource, NOT on the field's ``entity``: the same relation name
+    # (``pmdm__ProgramEngagement__c``) exists in all four Salesforce islands, so an entity key
+    # collides and picking one bound an Intake pill to the Service Delivery calendar -- a
+    # cross-island rebind onto a calendar with no active join, which is the flat series this split
+    # exists to remove.
+    #
+    # DECLINES when the pill's datasource names no island: binding it to an arbitrary calendar is
+    # exactly that defect. Falls through untouched for single-calendar models, so a
+    # single-datasource workbook is byte-for-byte unchanged.
+    by_island = date_binding.get("by_island")
+    if by_island:
+        scoped = by_island.get((field.get("datasource") or "").strip().lower())
+        if not scoped:
+            return None
+        date_binding = scoped
     table = date_binding.get("date_table")
     if not table:
         return None

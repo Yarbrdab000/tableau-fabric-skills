@@ -14,6 +14,56 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ### Fixed
 
+- **`tableau-migration` (skill `2.258.0` → `2.260.0`): separate Tableau datasources now get separate
+  calendars — the months-old blocker, root-caused.** A Tableau workbook can hold several
+  datasources, and Tableau never lets one datasource's filters reach another's marks. Power BI has no
+  such boundary and *requires* a marked date table, so the rebuild fabricated **one** calendar and
+  wired it to facts in every datasource — silently giving a date slicer reach the source never had.
+  Measured on Salesforce NPSP: one `Date` table related to **10 facts across all four** datasources.
+
+  The per-datasource fix was written months ago and switched **off**, because enabling it cost three
+  calculations (119 → 116 translated). The recorded suspicion was calc *field-resolution
+  tie-breaking*. **That was the wrong mechanism.** The emitted table sets are identical apart from the
+  calendars, and `Record ID` — the field blamed for it — resolves to no table in *either* build.
+
+  The real cause is one line:
+
+  ```python
+  conformed_hubs = {date_name} if date_name else None      # date_name = _date_built[0][0]
+  ```
+
+  A generated calendar is a **degenerate hub**: every fact joins its dates into the shared key, so any
+  two facts look "connected" by same-calendar co-occurrence. `_unique_countd_path` therefore excludes
+  calendars as transit nodes — but the exclusion set was built from **one** name. With four calendars
+  it named the first and left three live hubs, so the spurious paths returned, `COUNTD(IF ...)` saw
+  false ambiguity, and three calcs stubbed. Naming **every** calendar as a hub restores **119/158**,
+  with a `needs_review` set byte-identical to the single-calendar build — the same three calcs, not
+  merely the same total.
+
+  Enabling the split then exposed a second defect: `_date_binding_from_model` gated on `table`
+  (singular), which a per-island report does not carry, so date binding switched **off** for the whole
+  workbook — `0073` 6 → 0, `0088` 5 → 0, `0079` 1 → 0 calendar-bound refs. Per-island reports now emit
+  `by_island`, and the binder sends each pill to its own island's calendar.
+
+  **Keyed on the DATASOURCE — the first attempt keyed on the relation name and was wrong.**
+  `pmdm__ProgramEngagement__c` is a table in all four Salesforce islands, so an entity key collides;
+  resolving it "first wins" bound an **Intake** pill to the **Service Delivery** calendar — a calendar
+  with no active join to that fact, i.e. the flat series this split exists to remove. It presented as
+  an *improvement* (the corpus count read 6, up from 5). A resolved field carries its own
+  `datasource`, and the model tags each relation with `source_datasource`; that pair is the only
+  identifier both sides genuinely share. An unattributable pill now **declines** rather than binding
+  to an arbitrary calendar.
+
+  **Corpus of 34:** 1606 → 1612 files, 11 added / 5 removed (each `Date.tmdl` → one calendar per
+  datasource), 24 differing — confined to the **5** multi-datasource workbooks plus 3 metadata files.
+  **29 workbooks untouched.** Calc coverage identical at **216/287**; calendar-bound refs identical at
+  **59**; cross-island flat series on `0088`: **0**. Injecting the one-calendar hub set fails exactly
+  one test out of 4,989 — the new one — so no neighbour already catches it.
+
+  Still open, and deliberately not claimed as fixed: this restores **isolation**, not the inactive
+  date joins. `0088` keeps 5 active / 11 inactive, because a table with two date columns (`StartDate`
+  *and* `EndDate`) can still have only one active relationship to a given calendar.
+
 - **`tableau-migration` (skill `2.257.0` → `2.258.0`): Snowflake custom SQL emits the drilled native
   query instead of an empty-table scaffold (#162).** A Snowflake `custom_sql` relation landed as
   `Source = #table(type table [], {})` — a model that opens, validates, and returns nothing. In one
