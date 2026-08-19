@@ -12,6 +12,53 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ## [Unreleased]
 
+### Fixed
+
+- **`tableau-migration` (skill `2.257.0` → `2.258.0`): Snowflake custom SQL emits the drilled native
+  query instead of an empty-table scaffold (#162).** A Snowflake `custom_sql` relation landed as
+  `Source = #table(type table [], {})` — a model that opens, validates, and returns nothing. In one
+  reader's 46-asset estate that literal marker appeared in **40 tables across 33 of 46 assets
+  (~72%)**, making it the largest single source of manual completion on a Snowflake migration.
+
+  **Measured before changing anything, at the artifact rather than the gate:** emitting both
+  partitions for a synthetic Snowflake descriptor showed the TABLE path *already* producing the exact
+  drill (`Source{[Name=<db>, Kind="Database"]}[Data]`) while the custom-SQL path scaffolded. So the
+  branch was reaching the scaffold on `cls in NATIVE_QUERY_CATALOG_DRILL` alone, not for want of an
+  emitter — one set membership.
+
+  **The exclusion was deliberate and its promotion bar was written down**: *"unverified against live
+  … promotion is a one-line addition once a connector's drilled native query is confirmed live."*
+  #162 supplies exactly that, and the comment now records **whose** live instance, because it changes
+  what the claim is worth: a reader's SHIPPED model emits this shape across 2 workbooks / 10+ tables
+  including ~90-line multi-join SQL, and the same shape was derived independently from the
+  connector's navigation semantics. The three recorded doubts are each answered rather than waived —
+  the drilled-handle capability *is* the shipped shape; the mandatory warehouse is already threaded
+  (`Snowflake.Databases(#"Server", #"Warehouse")` on the table path today); and uppercase identifier
+  folding is untouched, because the SQL passes through verbatim apart from M string escaping.
+
+  Emitted output is shape-identical to the reader's shipped model, and the native query runs against
+  the **drilled** handle — the root collection rejects native queries outright.
+
+  **Fail-closed preserved:** a custom-SQL relation has no three-part name, so it can only take the
+  connection's database; when that is absent the partition still scaffolds with a specific reason
+  rather than inventing a catalog. Pinned by test.
+
+  **Two existing tests asserted the opposite and were rewritten, not deleted** —
+  `test_emit_snowflake_custom_sql_still_scaffolds` and
+  `test_snowflake_custom_sql_is_flagged_needs_review`. Both were *correct when written*; the
+  assertion changed because the evidence changed, and each now says so in place. Their real intent —
+  *an unverified connector fails loud at build time* — is preserved against **Oracle**, which still
+  hits the same branch. That exemplar was itself chosen by measurement: the first attempt used
+  Redshift and failed, because Redshift is a `server_database` connector reaching an
+  already-verified branch and proving nothing about this gate.
+
+  **Inert on the corpus by construction, not by diff:** parsing every `<connection class=…>` across
+  the 34 staged workbooks gives **0 using Snowflake** (29 excel-direct, 9 federated, 1 databricks…).
+  A change that cannot fire is a stronger statement than a diff that happens to show nothing — and it
+  names the real gap: this path has no corpus coverage at all, exactly like Custom SQL before `0136`.
+
+  Suite 4988 → **4995**.
+
 ### Added
 
 - **`tableau-migration` (skill `2.254.0` → `2.257.0`): a keyword search can only disprove the word you

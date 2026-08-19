@@ -1903,19 +1903,29 @@ def test_emit_databricks_custom_sql_binds_raw_source_columns_in_tmdl():
     assert "column Sales" in tmdl and "sourceColumn: Sales" in tmdl  # simple name stays bare
 
 
-def test_emit_snowflake_custom_sql_still_scaffolds():
-    # Snowflake shares the nav shape but is deliberately NOT in NATIVE_QUERY_CATALOG_DRILL, so its
-    # custom SQL stays a flagged scaffold (and is reported needs_review), never auto-emitted.
+def test_emit_snowflake_custom_sql_now_emits_the_catalog_drill():
+    # WAS `test_emit_snowflake_custom_sql_still_scaffolds`, which pinned the opposite and was correct
+    # when written: Snowflake shared the nav shape but its DRILLED-handle native query was unverified,
+    # so it stayed a flagged scaffold. Promoted in 2.258.0 (#162) on live evidence -- a reader's
+    # SHIPPED model emits exactly this shape across 2 workbooks / 10+ tables, and the same shape was
+    # derived independently from the connector's navigation semantics. Rewritten rather than deleted
+    # so the reversal is visible: the assertion changed because the EVIDENCE changed, not because the
+    # test was inconvenient.
     d = parse_tds(SNOWFLAKE_CUSTOM_SQL)
     assert d["connection_class"] == "snowflake"
     rel = d["relations"][0]
     assert rel["kind"] == "custom_sql"
     body = emit_m_partition_source(rel, d, "DirectQuery")
-    assert "TODO" in body
-    assert "Value.NativeQuery" not in body
-    assert "Snowflake.Databases" in body                   # names the intended connector as a hint
-    reason = m_partition_review_reason(rel, d, "DirectQuery")
-    assert reason and "isn't verified" in reason
+    assert "TODO" not in body
+    assert "#table(type table [], {})" not in body
+    assert "Snowflake.Databases" in body
+    assert 'Kind="Database"' in body
+    assert "Value.NativeQuery" in body
+    assert "[EnableFolding=true]" in body
+    # The native query must run against the DRILLED handle: the root collection rejects native
+    # queries ("Native queries aren't supported by this value").
+    assert body.index("Value.NativeQuery") > body.index('Kind="Database"')
+    assert m_partition_review_reason(rel, d, "DirectQuery") is None
 
 
 def test_emit_sqlserver_custom_sql_golden_m_unchanged():

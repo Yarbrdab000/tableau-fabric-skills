@@ -2723,23 +2723,26 @@ def test_write_model_folder_writes_past_max_path():
         shutil.rmtree(_win_long_path(base), ignore_errors=True)
 
 
-def test_snowflake_custom_sql_is_flagged_needs_review():
+def test_snowflake_custom_sql_now_builds_a_real_partition():
+    # WAS `test_snowflake_custom_sql_is_flagged_needs_review`. That test was right when written and
+    # its INTENT is preserved elsewhere rather than dropped: "an unverified connector fails LOUD at
+    # build time" is still asserted, now against Oracle, in
+    # tests/test_snowflake_custom_sql.py::test_a_connector_whose_custom_sql_is_still_unverified_keeps_the_scaffold.
+    # Snowflake specifically was promoted in 2.258.0 (#162) on live evidence from a reader's shipped
+    # model, so for THIS connector the loud scaffold is no longer the correct outcome.
     out = migrate_tds_to_semantic_model(SNOWFLAKE_CUSTOM_SQL, model_name="SnowSQL")
     report = out["report"]
-    # fail LOUD at build time: the unverified-connector scaffold is counted and listed, with the
-    # original SQL preserved for manual completion -- not silently passed to deploy.
-    assert report["partitions_stubbed"] == 1
-    entries = report["partitions_needs_review"]
-    assert len(entries) == 1
-    entry = entries[0]
-    assert entry["table"] == "Custom SQL Query"
-    assert entry["kind"] == "m_partition"
-    assert "isn't verified" in entry["reason"]
-    assert entry["sql"] == 'SELECT "ORDER ID", SALES FROM ORDERS'
-    # and the emitted partition is a DEPLOY-valid scaffold (empty typed table, single let..in)
+    assert report["partitions_stubbed"] == 0
+    assert not report["partitions_needs_review"]
     part = out["parts"]["definition/tables/Custom SQL Query.tmdl"]
-    assert "Source = #table(type table [], {})" in part
-    assert "Source = null" not in part
+    assert "Source = #table(type table [], {})" not in part
+    # The author's SQL reaches the partition VERBATIM apart from M string escaping -- a literal `"`
+    # is doubled because the query is embedded in an M string, which is correct M and not a rewrite
+    # of the identifier. That distinction is the whole reason Snowflake's uppercase folding is not a
+    # risk on this path: nothing changes the identifiers, only the quoting of the surrounding literal.
+    assert 'SELECT ""ORDER ID"", SALES FROM ORDERS' in part
+    assert "Value.NativeQuery" in part
+    assert 'Kind="Database"' in part
 
 
 def test_databricks_doubled_custom_sql_emits_clean_partition_and_report():
