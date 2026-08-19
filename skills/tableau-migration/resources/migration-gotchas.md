@@ -225,7 +225,6 @@ fixable inside the gate — it needs the integration step to look at both sides 
 what stops the claim being overstated.
 
 ### Prefer the failure mode a reader can detect
-
 When a faithful translation is unavailable, the choice is not between right and wrong but between two
 wrongs, and the tiebreak is **which one is legible to the person looking at the report**. Two
 decisions reached this from opposite directions on the same day:
@@ -240,6 +239,26 @@ decisions reached this from opposite directions on the same day:
 
 One prefers the visible-but-imperfect over the absent; the other prefers the plain over the
 plausible. Both pick the outcome whose wrongness is **detectable**, which is the rule underneath.
+
+### When you find a defect, record the nearest artifact that does NOT have it
+
+The pair outlives the theory. A defect was filed against corpus workbook `0133` with the note *"the
+sibling `0132` rebuilds all four correctly, so the difference is something about the multi-dashboard
+workbook"*. **That explanation was wrong** — it had nothing to do with multiple dashboards; the two
+workbooks differ in one Tableau menu choice, *Apply to → All Worksheets Using This Data Source*,
+which hoists the filter out of the worksheet into a workbook-level `<shared-views>` element the
+parser never read.
+
+The mistaken theory cost nothing, because what had been written down was the **pair**. Instrumenting
+both at the same seam gave the answer in one probe: the dashboard zone tokens were byte-identical and
+only the resolver map differed, 3 entries against 0. That converted *"filter cards are flaky on this
+workbook"* into *"the parse never produced the filters"*.
+
+So when something is wrong on one artifact, the highest-value thing to write beside it is the
+**nearest artifact where it is right** — even when your account of why is mistaken, and even when you
+are not going to fix it now. A control you already have is worth more than an explanation you might
+have to retract, and it is the cheapest form of the *"vary one thing"* discipline: you are not
+building a control, you are noticing one.
 
 ### Structurally valid, semantically absent
 

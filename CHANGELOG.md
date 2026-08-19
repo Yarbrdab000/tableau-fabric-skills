@@ -12,6 +12,32 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ## [Unreleased]
 
+### Added
+
+- **`tableau-migration` (skill `2.241.0` → `2.251.0`): when you find a defect, record the nearest
+  artifact that does NOT have it.** Docs-only; no code, no corpus change.
+
+  2.241.0 fixed a whole Tableau filter scope that was being dropped, and it was diagnosed in **one
+  probe** because the corpus already held the control: `0132` and `0133` differ in that scope and
+  almost nothing else. Instrumenting both at the same seam showed the dashboard zone tokens
+  byte-identical and only the resolver map differing — 3 entries against 0 — which converted *"filter
+  cards are flaky on this workbook"* into *"the parse never produced the filters"*.
+
+  The reusable part is that **the note filed weeks earlier was wrong about the cause** — it blamed
+  the multi-dashboard structure, when the real difference was one Tableau menu choice (*Apply to →
+  All Worksheets Using This Data Source*, which hoists the filter into a workbook-level
+  `<shared-views>` element). The mistaken theory cost nothing because what had been written down was
+  the **pair**. A control you already have outlives an explanation you may have to retract, and it is
+  the cheapest form of "vary one thing": you are not building a control, you are noticing one.
+
+  **Reach independently re-measured** rather than quoted, and with a better denominator: parsing
+  every `<shared-view>` across the 34 staged workbooks gives **1** using this scope (`0133`, 3 shared
+  filters, 0 worksheet-local). But **18 of 34 carry no filters at all**, so among workbooks that
+  actually filter it is 1 of 16 — thin either way, and worth a purpose-built workbook, since `0133`
+  is currently the only thing standing between this path and a silent regression.
+
+  Suite 4980, unchanged (docs-only).
+
 ### Fixed
 
 - **`tableau-migration` (skill `2.236.0` → `2.241.0`): a filter scoped to *All Worksheets Using This
