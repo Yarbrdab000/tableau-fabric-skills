@@ -2270,16 +2270,78 @@ def _dedupe_str(values):
     return out
 
 
+def _shared_view_filter_index(root):
+    """Index the filters Tableau hoists OUT of worksheets into a workbook-level ``<shared-views>``.
+
+    ``Apply to -> All Worksheets Using This Data Source`` does **not** write a ``<filter>`` on each
+    participating worksheet. It writes ONE filter under
+    ``<shared-views><shared-view name='<datasource>'>`` and leaves every participating worksheet only
+    a ``<slices><column>`` naming the sliced field. Reading worksheet-local ``<filter>`` elements
+    alone therefore loses every filter authored in that scope -- and with them every dashboard filter
+    CARD, because a card resolves to its model column through the matching worksheet filter's token.
+
+    Measured on corpus `0133` against its sibling `0132`, which differ in this scope and almost
+    nothing else: `0132` keeps three filters on worksheet ``Profit`` and rebuilds all three slicers;
+    `0133` hoists the byte-identical three into ``<shared-views>`` and rebuilt NONE, on all three of
+    its dashboards -- nine cards, disclosed as "resolved to no model field" and otherwise silent.
+    The dashboard zone tokens are the SAME in both workbooks; only the resolver map differed
+    (3 entries vs 0), which is why the failure looked like a card problem and was a parse problem.
+
+    Returns ``{(datasource, field_instance): <filter element>}``. Built once per workbook rather than
+    per worksheet: the lookup walks the whole tree, and a 49-worksheet workbook would otherwise walk
+    it 49 times.
+    """
+    out = {}
+    for holder in _children_local(root, "shared-views"):
+        for sv in _children_local(holder, "shared-view"):
+            for filt in _findall_local(sv, "filter"):
+                tok = _split_token_attr(filt.get("column"))
+                if tok[1] is not None:
+                    out.setdefault(tok, filt)
+    return out
+
+
+def _worksheet_shared_filters(ws, shared_index):
+    """The shared-view filters that apply to THIS worksheet, via its own ``<slices>`` record.
+
+    ``<slices><column>`` is Tableau's per-sheet statement of which fields the sheet is sliced by, so
+    it is the exact participation signal: a sheet that opted out of a data-source-scoped filter does
+    not list it, and therefore is not handed a filter it does not have. Keying on the sheet's own
+    record rather than on "every sheet using this datasource" keeps the inference evidence-based.
+    """
+    if not shared_index:
+        return []
+    sliced = []
+    for sl in _findall_local(ws, "slices"):
+        for c in _children_local(sl, "column"):
+            tok = _split_token_attr((c.text or "").strip())
+            if tok[1] is not None and tok not in sliced:
+                sliced.append(tok)
+    return [shared_index[t] for t in sliced if t in shared_index]
+
+
 def _parse_filters(ws, ds_default, base_cols, instances, index, ds_caption,
                    worksheet, warnings, warn_special=True, internal_fields=None,
-                   date_binding=None, table_calc_filters=None, table_calc_peers=0):
+                   date_binding=None, table_calc_filters=None, table_calc_peers=0,
+                   extra_filters=()):
     """Returns ``(filters, swap_controls)``. ``swap_controls`` carries any parameter-driven
     sheet-swap visibility controls detected on this worksheet (a categorical filter pinned to a
     pure parameter-passthrough calc). Recognising them structurally keeps them from being
-    mis-warned as unmappable measure filters and lets :func:`parse_twb` group swap partners."""
+    mis-warned as unmappable measure filters and lets :func:`parse_twb` group swap partners.
+
+    ``extra_filters`` are filter elements that live OUTSIDE the worksheet but apply to it -- today,
+    the workbook-level ``<shared-views>`` filters written by *Apply to -> All Worksheets Using This
+    Data Source* (see :func:`_shared_view_filter_index`). They are appended AFTER the local ones and
+    skipped when the worksheet already carries a filter on the same token, so a sheet-level filter
+    always wins over the inherited one and a workbook with no shared views is byte-identical.
+    """
     filters = []
     swap_controls = []
-    for filt in _findall_local(ws, "filter"):
+    local = _findall_local(ws, "filter")
+    seen_tokens = {_split_token_attr(x.get("column")) for x in local}
+    inherited = [x for x in extra_filters
+                 if _split_token_attr(x.get("column")) not in seen_tokens]
+    for filt in local + inherited:
         cls = (filt.get("class") or "").lower()
         ds, fid = _split_token_attr(filt.get("column"))
         if fid is None:
@@ -4626,7 +4688,8 @@ def _classify_reference_lines(all_panes, visual_type):
 
 def _parse_worksheet(ws, index, ds_caption, warnings, internal_fields=None, date_binding=None,
                      row_count_binding=None, measure_binding=None, column_binding=None,
-                     measure_palette=None, ds_color_palettes=None, workbook_root=None):
+                     measure_palette=None, ds_color_palettes=None, workbook_root=None,
+                     shared_filters=None):
     name = ws.get("name")
     table = _first(ws, "table")
     if table is None:
@@ -4685,7 +4748,8 @@ def _parse_worksheet(ws, index, ds_caption, warnings, internal_fields=None, date
                                             ds_caption, name, warnings, warn_special=warn_special,
                                             internal_fields=internal_fields, date_binding=date_binding,
                                             table_calc_filters=_tc_filters,
-                                            table_calc_peers=_worksheet_table_calc_count(ws))
+                                            table_calc_peers=_worksheet_table_calc_count(ws),
+                                            extra_filters=_worksheet_shared_filters(ws, shared_filters))
     sort = _parse_sort(view, ds_default, base_cols, instances, index,
                        ds_caption, name, warnings, internal_fields=internal_fields)
 
@@ -6447,6 +6511,9 @@ def parse_twb(xml_text, *, date_binding=None, row_count_binding=None, measure_bi
     ws_elems = []
     for h in ws_holder:
         ws_elems.extend(_children_local(h, "worksheet"))
+    # Built once for the workbook -- see _shared_view_filter_index: the lookup walks the tree, and a
+    # 49-worksheet workbook would otherwise walk it 49 times.
+    shared_filters = _shared_view_filter_index(root)
     worksheets = []
     for ws in ws_elems:
         parsed = _parse_worksheet(ws, index, ds_caption, warnings,
@@ -6456,7 +6523,8 @@ def parse_twb(xml_text, *, date_binding=None, row_count_binding=None, measure_bi
                                   column_binding=column_binding,
                                   measure_palette=measure_palette,
                                  ds_color_palettes=ds_color_palettes,
-                                 workbook_root=root)
+                                 workbook_root=root,
+                                 shared_filters=shared_filters)
         if parsed:
             worksheets.append(parsed)
     worksheet_names = {w["name"] for w in worksheets}

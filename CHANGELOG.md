@@ -12,6 +12,50 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ## [Unreleased]
 
+### Fixed
+
+- **`tableau-migration` (skill `2.236.0` → `2.241.0`): a filter scoped to *All Worksheets Using This
+  Data Source* is no longer lost, and its dashboard cards rebuild.** Tableau serialises filter scope
+  **structurally**, and the two shapes live in different places: *Only This Worksheet* writes
+  `<filter>` inside the worksheet's own `<view>`, while *All Worksheets Using This Data Source*
+  **hoists** the filter out to a workbook-level `<shared-views><shared-view name='<datasource>'>` and
+  leaves each participating sheet only a `<slices><column>` naming the sliced field.
+
+  The parser read worksheet-local `<filter>` elements only. Every filter authored in the second
+  (entirely ordinary) scope therefore vanished — and with it every dashboard filter **card**, because
+  a card is little more than a `(datasource, field-instance)` token that has to resolve through a
+  matching worksheet filter.
+
+  **The control is what makes this provable.** Corpus workbooks `0132` and `0133` differ in this
+  scope and almost nothing else. `0132` keeps three filters on worksheet `Profit` and rebuilt all
+  three slicers; `0133` hoists the byte-identical three into `<shared-views>` and rebuilt **none** —
+  nine cards across three dashboards. Instrumenting both showed the dashboard zone tokens are
+  **identical**; only the resolver map differed, **3 entries against 0**. That is why the failure
+  presented as a filter-card problem and was really a parse problem, and why the fix belongs at the
+  parse seam rather than at the card.
+
+  A sheet inherits a hoisted filter exactly when its own `<slices>` names the column — Tableau's
+  per-sheet record of what it is sliced by — so a sheet that opted out is never handed a filter it
+  does not have, and the inference stays evidence-based rather than "every sheet on this datasource".
+  A worksheet-level filter on the same token always **wins**, so the specific beats the inherited and
+  no column yields two slicers.
+
+  **Corpus of 34:** 1588 → 1606 files, **18 added** (9 cards × the `pbip` and `reports` trees), 0
+  removed, 3 differing (timestamps + the warning count). Thirty-three workbooks untouched. Warned
+  visuals **118 → 109**, exactly the nine. The `added > 0, removed == 0` shape is normally this
+  project's enumeration-failure signature; here the roots were equal-length and the additions are
+  named slicer visuals, so it is genuine codegen.
+
+  Verified at the artifact: each of `0133`'s three dashboards now emits Category + Segment +
+  `Date.Year` beside its existing parameter slicer, laid out non-overlapping — and the date filter
+  correctly rebinds to the calendar's `Year` column rather than the raw datetime.
+
+  **Reach, stated honestly:** only **1 of 34** corpus workbooks uses this scope, so coverage here is
+  thin — but it is a single menu choice in Tableau's filter card, so its real-world frequency is far
+  higher than the corpus implies. What wrong looks like: the broken form does not render a broken
+  slicer, it renders **no** slicer on a page that otherwise looks complete, so the reader never learns
+  an interaction was authored.
+
 ### Added
 
 - **`tableau-migration` (skill `2.230.0` → `2.236.0`): two verification rules that only became
