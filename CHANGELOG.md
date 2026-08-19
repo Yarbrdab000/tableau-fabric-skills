@@ -12,6 +12,42 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ## [Unreleased]
 
+### Added
+
+- **`tableau-migration` (skill `2.254.0` → `2.257.0`): a keyword search can only disprove the word you
+  chose, and the block protocol gains a timing rule.** Docs-only; no code, no corpus change.
+
+  **The search that closed an investigation.** A parked note read *"grand total at TOP and whole
+  numbers — neither is in the `.twb` XML; searched: `grand` appears only in product names"*, and the
+  work stayed closed for days on it. Tableau writes `<rows onTop='true' total='true'>` — `total` is
+  the on/off, `onTop` is the position — and one parse found both instantly. The failure mode is
+  specific enough to name separately from the other inference errors already recorded: **the search
+  term came from the TARGET system's vocabulary** (Power BI says *"grand total"*) **and was run
+  against the SOURCE system's serialisation**, which uses different words for the same concept. A
+  negative keyword result is evidence about your guess, never about the artifact. Parsing has no such
+  mode because it enumerates what is present rather than asking whether one guess is.
+
+  Two habits recorded with it: enumerate the attributes actually on the elements you care about
+  before concluding absent, and **look the target property up** —
+  `powerbi-report-author formatting describe-object <visualType> <object>` is a real schema oracle
+  that also answers *"does this visual type even have this object"*.
+
+  **Emitting nothing is a decision, not neutrality.** Power BI's table shows a total row by default,
+  so 42 emitted grids inherited a row their Tableau source never displayed. An addition is harder to
+  notice than an omission because it looks like data. Wherever a platform default exists, "we did not
+  set it" and "we chose the default" are the same artifact.
+
+  **Block timing (`AGENTS.md`).** Publishing a block's whole extent up front made its size visible;
+  it did not stop blocks dying, because a block dies the instant the other party's tip passes it
+  whatever its size. The complement is *when*: blocks claimed at the start of a lane died **four
+  times in one day**; a block claimed seconds before committing survived. So **publish fully when you
+  claim, and claim at the release step.** Also recorded there: `refs/tags` is shared across every
+  worktree, so a version collision is also an anchor collision — never `git tag -d` an anchor you did
+  not create, leave a dead block's anchors alone (deletion is the only irreversible step in the
+  ritual), and remember an anchor tells you a version is *claimed*, never that it is unlanded.
+
+  Suite 4988, unchanged (docs-only).
+
 ### Fixed
 
 - **`tableau-migration` (skill `2.251.0` → `2.254.0`): a rebuilt table no longer invents a grand total

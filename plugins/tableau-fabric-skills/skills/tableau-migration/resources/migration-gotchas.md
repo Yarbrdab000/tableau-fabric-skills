@@ -260,6 +260,35 @@ are not going to fix it now. A control you already have is worth more than an ex
 have to retract, and it is the cheapest form of the *"vary one thing"* discipline: you are not
 building a control, you are noticing one.
 
+### A keyword search can only disprove the word you chose
+
+A parked note read: *"grand total at TOP and whole numbers — neither is in the `.twb` XML; searched:
+`grand` appears only in product names."* Both halves were wrong, and the investigation stayed closed
+for days on the strength of them. Tableau writes:
+
+```xml
+<rows onTop='true' total='true'>
+```
+
+`total` is the on/off and `onTop` is the position. One parse found both instantly.
+
+The failure mode is specific and worth naming separately from the other inference errors: the search
+term came from the **target** system's vocabulary (Power BI says *"grand total"*) and was run against
+the **source** system's serialisation, which uses different words for the same concept. A negative
+keyword result is therefore evidence about your guess, never about the artifact. Parsing has no such
+mode, because it enumerates what is present instead of asking whether one guess is.
+
+Two habits follow. **Enumerate before concluding absent** — list the attributes actually on the
+elements you care about, and read them. And **look the target property up rather than infer it**:
+`powerbi-report-author formatting describe-object <visualType> <object>` is a real schema oracle, and
+it also answers *"does this visual type even HAVE this object"*, which is the question behind a
+`PBIR_FORMATTING_OBJECT_UNKNOWN`.
+
+**Emitting nothing is a decision, not neutrality.** The same release found Power BI's table showing a
+total row *by default*, so 42 emitted grids inherited a row their Tableau source never displayed —
+an addition, which is harder to notice than an omission because it looks like data. Whenever a
+platform default exists, "we did not set it" and "we chose the default" are the same artifact.
+
 ### Structurally valid, semantically absent
 
 The defect family that no structural gate can see, because the artifact is *well-formed and says
