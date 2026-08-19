@@ -12,6 +12,33 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ## [Unreleased]
 
+### Added
+
+- **`tableau-migration` (skill `2.230.0` → `2.236.0`): two verification rules that only became
+  visible by working in parallel.** Docs-only; no code, no corpus change.
+
+  **A per-commit gate is structurally blind to a defect that lives in the RELATION between two
+  artifacts.** The three clauses recorded in 2.226.0 all ask whether a gate can detect a defect *in*
+  something. This is a different axis. Observed live: two parallel sessions produced CHANGELOG
+  entries declaring `2.227.0 → 2.230.0` and `2.227.0 → 2.228.0`. **Each passed the chain gate in
+  isolation** — it checks predecessor *equality*, not increment-by-one — and the chain was broken
+  only at the seam where the branches met. So `git rebase --exec` proves every commit green
+  independently and says nothing about the order they land in; *"green at every commit"* is a weaker
+  claim than it sounds. Not fixable inside the gate, which can only ever see one commit's copy of the
+  file — it needs the integration step to look at both sides. Recorded so the claim stops being
+  overstated.
+
+  **Prefer the failure mode a reader can detect.** When no faithful translation exists the choice is
+  between two wrongs, and the tiebreak is which one is legible to the person looking at the report.
+  Two decisions reached this from opposite directions in one day: `ATTR()` was being *dropped*, and
+  rebuilding it as `MIN` is wrong only where Tableau itself prints `*` — *a reader cannot notice a
+  missing value, but can notice a minimum*. A date axis on a table the calendar had skipped was being
+  *bound anyway*, producing a flat line at the grand total; declining the binding gives a plainer
+  axis — *a flat series looks like data*. One prefers visible-but-imperfect over absent, the other
+  plain over plausible; both pick the outcome whose wrongness is **detectable**.
+
+  Suite 4971, unchanged (docs-only).
+
 ### Fixed
 
 - **`tableau-migration` (skill `2.229.0` → `2.230.0`): a date axis on a table the calendar SKIPPED no

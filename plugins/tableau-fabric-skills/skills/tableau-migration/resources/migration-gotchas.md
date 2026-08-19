@@ -213,6 +213,34 @@ habit and the requirement point in opposite directions, so attach the discipline
 step** — "I am about to claim this is proved" triggers a full-suite run, the way "I am about to claim
 this is green" already does.
 
+**(4) A per-commit gate is structurally blind to a defect that lives in the RELATION between two
+artifacts.** Clauses 1–3 ask whether a gate can detect a defect *in* something. This is a different
+axis: a defect where each artifact is individually valid and only the arrangement is wrong. Observed
+live — two parallel sessions, one CHANGELOG entry declaring `2.227.0 → 2.230.0` and another declaring
+`2.227.0 → 2.228.0`. Each commit passed the chain gate in isolation, because the gate checks
+*predecessor equality*, not increment-by-one; the chain was broken only at the seam where the two
+branches met. `git rebase --exec` proves every commit green independently and says **nothing** about
+the order they land in, so "green at every commit" is a weaker claim than it sounds. This one is not
+fixable inside the gate — it needs the integration step to look at both sides — but knowing it is
+what stops the claim being overstated.
+
+### Prefer the failure mode a reader can detect
+
+When a faithful translation is unavailable, the choice is not between right and wrong but between two
+wrongs, and the tiebreak is **which one is legible to the person looking at the report**. Two
+decisions reached this from opposite directions on the same day:
+
+* `ATTR()` had no Power BI equivalent, so the pill was being **dropped**. Rebuilding it as `MIN` is
+  exact wherever the value is unique (which is what `ATTR` asserts) and differs only where Tableau
+  itself prints `*`. Wrong-in-one-case beats absent-in-every-case: *a reader cannot notice a missing
+  value, but can notice a minimum.*
+* A date axis on a table the generated calendar had skipped was being **bound anyway**, producing a
+  flat line at the grand total. Declining the calendar binding gives a plainer axis with no
+  hierarchy. Plainer-but-correct beats confidently-wrong: *a flat series looks like data.*
+
+One prefers the visible-but-imperfect over the absent; the other prefers the plain over the
+plausible. Both pick the outcome whose wrongness is **detectable**, which is the rule underneath.
+
 ### Structurally valid, semantically absent
 
 The defect family that no structural gate can see, because the artifact is *well-formed and says
