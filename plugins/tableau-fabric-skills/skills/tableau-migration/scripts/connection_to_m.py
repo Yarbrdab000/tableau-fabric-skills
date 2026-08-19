@@ -230,6 +230,140 @@ def custom_sql_parameter_refs(sql):
     return out
 
 
+# A ``WHERE``-clause equality between a bare column and a Tableau parameter token. The column may be
+# quoted per dialect (backtick / bracket / double-quote) and may be table-qualified.
+_PARAM_EQ_PREDICATE = re.compile(
+    r"(?:(?P<qual>[`\"\[]?\w+[`\"\]]?)\s*\.\s*)?"
+    r"(?P<q1>[`\"\[])?(?P<col>\w+)(?P<q2>[`\"\]])?"
+    r"\s*=\s*"
+    r"<\[Parameters\]\.\[(?P<param>[^\]]+)\]>",
+    re.IGNORECASE,
+)
+_WHERE_SPLIT = re.compile(r"\bWHERE\b", re.IGNORECASE)
+_CLAUSE_END = re.compile(
+    r"\b(GROUP\s+BY|ORDER\s+BY|HAVING|LIMIT|WINDOW|QUALIFY|UNION|EXCEPT|INTERSECT)\b",
+    re.IGNORECASE,
+)
+
+
+def surfaced_parameter_predicates(sql, columns):
+    """Classify each ``WHERE <col> = <[Parameters].[X]>`` predicate as SURFACED, and strip those.
+
+    A Tableau author embeds a parameter in Custom SQL because Custom SQL is Tableau's only way to
+    push a predicate to the source. Power BI does not need that: when the filtered column is IN THE
+    RESULT SET, the idiomatic rebuild is to drop the predicate and let an ordinary slicer on that
+    column do the filtering -- in DirectQuery the slicer folds back into a ``WHERE`` at the source,
+    so nothing is lost, and no dynamic-M-parameter binding (with its no-RLS / no-aggregations /
+    no-spaces-in-names / restricted-slicer-operations tail) is needed.
+
+    The oracle for "is the column in the result set" is deliberately ``columns`` -- the relation's
+    own metadata records, which are TABLEAU's account of what the query returns -- rather than this
+    function's reading of the SELECT list. A ``SELECT *`` needs no special case that way, and a
+    hand-parsed projection list cannot disagree with what the model actually emits.
+
+    Returns ``(rewritten_sql, surfaced, unresolved)``:
+      * ``rewritten_sql`` -- the query with every surfaced predicate removed (and the whole ``WHERE``
+        removed when it held nothing else). Byte-identical to the input when nothing qualifies.
+      * ``surfaced`` -- ``[{"param", "column", "predicate"}]``, the facts the report layer needs to
+        point a slicer at the real column instead of a disconnected picker table.
+      * ``unresolved`` -- parameter tokens still present afterwards, which stay a needs-review reason.
+
+    FAIL-CLOSED, and the refusals matter more than the acceptances:
+      * a ``WHERE`` containing ``OR`` anywhere is left ENTIRELY alone -- dropping one disjunct
+        changes which rows come back, whereas dropping one conjunct only widens them (and the slicer
+        re-narrows it);
+      * a parameter inside a subquery (parentheses) is refused, because the predicate's scope is not
+        the outer result set;
+      * a column absent from ``columns`` is refused -- that is the genuine dynamic-M case, where no
+        model filter can reach the column;
+      * anything not a simple ``=`` equality is refused.
+    """
+    text = sql or ""
+    if not text or "<[Parameters]." not in text:
+        return text, [], []
+    parts = _WHERE_SPLIT.split(text)
+    if len(parts) != 2:
+        # No WHERE, or more than one (a subquery or a UNION): out of scope, hands off.
+        return text, [], custom_sql_parameter_refs(text)
+    head, rest = parts
+    end = _CLAUSE_END.search(rest)
+    where_body, tail = (rest[:end.start()], rest[end.start():]) if end else (rest, "")
+    if re.search(r"\bOR\b", where_body, re.IGNORECASE) or "(" in where_body:
+        return text, [], custom_sql_parameter_refs(text)
+
+    known = set()
+    for c in columns or []:
+        for key in ("remote_name", "model_name", "local_name"):
+            v = (c or {}).get(key)
+            if v:
+                known.add(str(v).strip().strip("[]`\"").lower())
+
+    conjuncts = re.split(r"\bAND\b", where_body, flags=re.IGNORECASE)
+    kept, surfaced = [], []
+    for cj in conjuncts:
+        m = _PARAM_EQ_PREDICATE.search(cj)
+        if m and m.group(0).strip() == cj.strip():
+            col = m.group("col").strip()
+            if col.lower() in known:
+                surfaced.append({
+                    "param": "<[Parameters].[%s]>" % m.group("param"),
+                    "column": col,
+                    "predicate": cj.strip(),
+                })
+                continue
+        kept.append(cj)
+    if not surfaced:
+        return text, [], custom_sql_parameter_refs(text)
+
+    if [k for k in kept if k.strip()]:
+        new_sql = head + "WHERE" + "AND".join(kept) + tail
+    else:
+        # The WHERE held nothing but surfaced predicates -> drop the clause. Keep the separator so
+        # the FROM and the trailing clause do not weld together.
+        new_sql = head.rstrip() + (" " + tail.lstrip() if tail.strip() else "")
+    return new_sql, surfaced, custom_sql_parameter_refs(new_sql)
+
+
+def _custom_sql_emit_facts(relation):
+    """``(escaped SQL, needs-review reason, surfaced facts)`` for one ``custom_sql`` relation.
+
+    Single place where a Tableau parameter inside Custom SQL is decided, so the ODBC and the
+    ``Value.NativeQuery`` emitters cannot drift apart on it. Surfaced predicates are stripped from
+    the emitted query AND recorded on the relation, so the model layer can relate the parameter's
+    picker table to the real column and let an ordinary slicer do the filtering.
+    """
+    raw = (relation or {}).get("sql", "")
+    new_sql, surfaced, unresolved = surfaced_parameter_predicates(
+        raw, (relation or {}).get("columns"))
+    if surfaced and isinstance(relation, dict):
+        relation["surfaced_param_filters"] = surfaced
+    reason = None
+    if unresolved:
+        # A token we could NOT surface is the genuine dynamic-M case. Name the exact Desktop step
+        # rather than say "not translated": Desktop writes the binding annotation itself, and its
+        # on-disk form is not documented well enough for us to author it without guessing.
+        reason = (
+            "custom SQL contains Tableau parameter reference(s) "
+            f"{', '.join(unresolved)} whose column is not in the query's result set, so no model "
+            "filter can reach it; bind it in Power BI Desktop (select the column > Properties > "
+            "Advanced > Bind to parameter, which requires the table to be DirectQuery and the "
+            "parameter and table names to contain no spaces) or replace it with a literal "
+            "before refresh")
+    elif surfaced:
+        # DISCLOSE THE REWRITE. Stripping the predicate makes the query runnable, but it also widens
+        # what comes back -- the source view showed ONE parameter value, this returns every one until
+        # something filters it. Saying nothing here would trade a loud failure (a query the source
+        # rejects) for a silent difference, which is strictly worse.
+        cols = ", ".join(sorted({s["column"] for s in surfaced}))
+        reason = (
+            "custom SQL filtered on a Tableau parameter whose column (%s) IS in the query's result "
+            "set, so the predicate was removed and the column is filtered in the model instead -- "
+            "the idiomatic Power BI shape, and in DirectQuery a slicer folds back to a WHERE at the "
+            "source. The rebuilt table therefore returns EVERY value of %s until a slicer or filter "
+            "narrows it; confirm the page carries one." % (cols, cols))
+    return escape_m_string(new_sql), reason, surfaced
+
+
 # -- generic ODBC connection string -------------------------------------------
 # A generic-ODBC <connection> can carry credentials inline (a real .tds may even hold
 # password='...'); we NEVER emit them -- Power BI / the gateway supplies credentials at bind
@@ -1745,6 +1879,55 @@ def _equality_operands(relationship):
     return kids[0].get("op"), kids[1].get("op")
 
 
+def relationship_column_aliases(datasource):
+    """``{qualified_caption: plain_caption}`` for each single-column equality relationship.
+
+    A Tableau field reference carries its relation's name when the caption would otherwise be
+    ambiguous -- ``[Region (Custom SQL Query2)]`` next to a plain ``[Region]``. A calc that mixes the
+    two spans TWO tables, and the measure translator correctly refuses it ("SUM(expr) must reference
+    exactly one table"): a row expression cannot be evaluated across an unjoined pair, so the calc
+    stubs to ``BLANK()`` and its visual renders empty.
+
+    But the workbook itself declares the two columns EQUAL. The relationship's own predicate is
+    ``[Region] = [Region (Custom SQL Query2)]``, so for every row the join produces, the qualified
+    reference and the plain one hold the same value -- by the author's declaration, not by
+    inference. Substituting the plain caption is therefore faithful AND makes the expression
+    single-table, which is what unblocks the translation.
+
+    Why this beats reaching across with ``RELATED()``: that requires a many-to-one direction to
+    traverse, and an authored object-graph relationship is emitted many-to-many on purpose (see
+    ``generate_relationships_tmdl``) precisely because it is uniqueness-agnostic -- so there is no
+    ONE side to traverse, and the reach would have to invent a cardinality the source never stated.
+
+    KEYED ON THE DECLARATION, NEVER ON THE NAME. An alias is recorded only when a relationship's
+    single-column ``=`` predicate names both captions. Two columns that merely LOOK related --
+    ``[Region]`` and ``[Region (Other)]`` with no relationship between them -- yield nothing, because
+    their values are not equal and substituting one for the other would silently change the answer.
+
+    Returns an empty dict for a datasource with no such relationship, so a workbook without this
+    shape is byte-for-byte unchanged.
+    """
+    out = {}
+    for og in _findall_object_graph(datasource):
+        for rship in _findall_local(og, "relationship"):
+            ops = _equality_operands(rship)
+            if not ops:
+                continue
+            a, b = (_strip_brackets(o or "") for o in ops)
+            if not a or not b or a == b:
+                continue
+            # The qualified side is the one whose caption is the other's plus a ``(relation)``
+            # suffix. Anything else -- two plain captions, or two differently-qualified ones -- is
+            # NOT an alias: those are genuinely different columns that happen to be joined, and
+            # collapsing them would rewrite the author's meaning.
+            for far, near in ((a, b), (b, a)):
+                if far.startswith(near + " (") and far.endswith(")"):
+                    if out.get(far, near) == near:
+                        out[far] = near
+                    break
+    return out
+
+
 # -- data-free "one"-side inference for join predicates ------------------------
 # A Tableau join predicate never records cardinality, and we cannot probe the data to find out:
 # a live/DirectQuery datasource is routinely migrated without any database credential. So the
@@ -2359,6 +2542,11 @@ def parse_tds(xml_text, select=None):
         "relations": relations,
         "relationships": relationships,
         "relationship_warnings": relationship_warnings,
+        # Qualified-caption aliases the object-graph itself DECLARES equal (e.g.
+        # "Region (Custom SQL Query2)" -> "Region"). Carried on the descriptor because the calc
+        # translation happens far from the XML, and a calc mixing a qualified reference with plain
+        # ones is otherwise refused as multi-table and stubs to BLANK().
+        "column_aliases": relationship_column_aliases(datasource),
         "hidden_prune": hidden_prune,
         "logical_fields": _logical_fields(datasource),
         "unsupported_reasons": unsupported,
@@ -3684,19 +3872,12 @@ def _emit_odbc_partition(relation, conn, cls):
     conn_str_m = escape_m_string(conn_str)
 
     if relation.get("kind") == "custom_sql":
-        sql = escape_m_string(relation.get("sql", ""))
+        sql, param_reason, _surfaced = _custom_sql_emit_facts(relation)
         steps = [f'Source = Odbc.Query("{conn_str_m}", "{sql}")']
         prev = "Source"
         # No Table.RenameColumns: columns bind to the raw ODBC query headers via sourceColumn
         # (fold-safe -- see the Value.NativeQuery path for why renaming in M breaks folding).
         body = ",\n\t\t\t\t".join(steps)
-        param_reason = None
-        params = custom_sql_parameter_refs(relation.get("sql", ""))
-        if params:
-            param_reason = (
-                "custom SQL contains Tableau parameter reference(s) "
-                f"{', '.join(params)} that are not translated to a Power Query parameter; "
-                "replace them with a literal or a bound parameter before refresh")
         return f"let\n\t\t\t\t{body}\n\t\t\tin\n\t\t\t\t{prev}", param_reason
 
     return _scaffold_review(
@@ -3742,7 +3923,7 @@ def _emit_m_partition_review(relation, descriptor, mode):
     connector, connect_style, nav_style = spec
 
     if relation["kind"] == "custom_sql":
-        sql = escape_m_string(relation.get("sql", ""))
+        sql, param_reason, _surfaced = _custom_sql_emit_facts(relation)
         if connect_style == "server_database":
             # SQL Server family: Value.NativeQuery folds against the database handle directly.
             steps = [f'Source = {_connect_expr(connector, connect_style, _param_suffix_for(conn, descriptor))}']
@@ -3779,18 +3960,10 @@ def _emit_m_partition_review(relation, descriptor, mode):
         # 't0.Order_Date' doesn't exist in the current context" at query time (Import works locally
         # because the mashup applies the rename in-engine, but the Service folds it into SQL).
         body = ",\n\t\t\t\t".join(steps)
-        # The operators are already de-escaped at parse, so a real native query is emitted. The
-        # one thing we cannot complete is a recovered Tableau parameter reference
-        # (<[Parameters].[Name]>): the source can't run it and we don't translate it to a Power
-        # Query parameter yet, so flag it for review (the partition is still emitted) rather than
-        # ship a query that fails at refresh.
-        param_reason = None
-        params = custom_sql_parameter_refs(relation.get("sql", ""))
-        if params:
-            param_reason = (
-                "custom SQL contains Tableau parameter reference(s) "
-                f"{', '.join(params)} that are not translated to a Power Query parameter; "
-                "replace them with a literal or a bound parameter before refresh")
+        # The operators are already de-escaped at parse, so a real native query is emitted. A
+        # recovered Tableau parameter reference (<[Parameters].[Name]>) is decided by
+        # _custom_sql_emit_facts above: when the filtered column is in the result set the predicate
+        # is stripped and a slicer takes over; otherwise the token survives and param_reason says so.
         return f"let\n\t\t\t\t{body}\n\t\t\tin\n\t\t\t\t{prev}", param_reason
 
     source = _connect_expr(connector, connect_style, _param_suffix_for(conn, descriptor))

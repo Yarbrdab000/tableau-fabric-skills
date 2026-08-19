@@ -2009,10 +2009,62 @@ def _date_binding_from_model(res_report):
     then). Returns ``None`` when there is no usable marked Date table or no active date -- the report
     then keeps binding date axes to the source column (warn-never-wrong). ``grain_columns`` is left
     to the binder's standard calendar-column default, so the contract stays minimal.
+
+    **Per-island models** (several datasources -> one calendar each) report ``islands`` instead of a
+    single ``table``, so this used to fall straight through the ``dr.get("table")`` gate and return
+    ``None`` -- disabling date binding for the whole workbook. Measured cost of that: 0073 went 6 -> 0
+    calendar-bound refs, 0088 5 -> 0, 0079 1 -> 0; the axes still rendered correct values on the
+    fact's own column, but lost the calendar hierarchy entirely. Those models now emit ``by_island``:
+    the datasource CAPTION -> that island's calendar + keys. A resolved report field carries its own
+    ``datasource`` (the same caption), so the binder can send each pill to its own island's calendar.
     """
     dr = (res_report or {}).get("date_table") or {}
+    if dr.get("generated") and dr.get("per_island") and dr.get("islands"):
+        return _per_island_date_binding(dr)
     if not (dr.get("generated") and dr.get("mark_as_date") and dr.get("table")):
         return None
+    return _single_calendar_date_binding(dr)
+
+
+def _per_island_date_binding(dr):
+    """``date_binding`` for a model with one calendar per datasource island.
+
+    Keyed on the ISLAND (datasource caption), because that is the one identifier both sides share: a
+    resolved report field carries ``datasource``, and the model build tags each relation with
+    ``source_datasource``.
+
+    Keying on the workbook RELATION NAME instead was tried and is wrong -- measured, not reasoned:
+    ``pmdm__ProgramEngagement__c`` exists in all four Salesforce islands, so the key collides, and
+    resolving the collision "first wins" bound an **Intake** pill to the **Service Delivery**
+    calendar. That is a cross-island rebind onto a calendar with no active join to the fact: every
+    bucket returns the grand total, which is precisely the flat series this split exists to remove.
+
+    The flat single-calendar keys are kept for the first island so a consumer reading ``date_table``
+    still sees something coherent, but the binder prefers ``by_island`` and DECLINES when a pill's
+    datasource is unknown -- binding it to an arbitrary island would reintroduce the same defect.
+    """
+    by_island = {}
+    first = None
+    for isl in dr.get("islands") or []:
+        if not (isl.get("mark_as_date") and isl.get("table")):
+            continue
+        one = _single_calendar_date_binding(isl)
+        if one is None:
+            continue
+        if first is None:
+            first = one
+        key = (isl.get("island") or "").strip().lower()
+        if key:
+            by_island[key] = one
+    if first is None:
+        return None
+    out = dict(first)
+    out["by_island"] = by_island
+    return out
+
+
+def _single_calendar_date_binding(dr):
+    """The original single-calendar derivation, unchanged, reused per island."""
     rels = [r for r in (dr.get("relationships") or []) if r.get("column")]
     active = [r["column"] for r in rels if r.get("active")]
     if not active:
@@ -2023,12 +2075,26 @@ def _date_binding_from_model(res_report):
     # cannot tell "the fact that owns the active relationship" from "a different fact with the same
     # column name". Rebinding the wrong one onto the calendar produces a flat time series, so they
     # are named here and declined there. Additive: absent when no name is contested.
+    #
+    # The contested population is EVERY table carrying the column, not just the tables that received
+    # a date relationship. A table the calendar SKIPPED -- a pure dimension, or one that never landed
+    # -- has no relationship at all, so it never appears in ``rels``; keying the guard on ``rels``
+    # alone therefore left invisible exactly the case the guard exists to catch, because "no
+    # relationship" is a stronger version of "inactive relationship", not an exemption from it.
+    # ``unrelated_date_columns`` (from ``assemble_model._build_date_dimension``) supplies them.
+    # Measured on Salesforce NPSP: ``caseman__Intake__c`` is a pure dim carrying ``CreatedDate``,
+    # which is active on three other tables, and its Month axis rebound to ``Date[Month Start]`` on a
+    # table the calendar cannot filter -- one visual rendering the grand total in every bucket.
     act_names = {(c or "").strip().lower() for c in active}
     inact_names = {(r["column"] or "").strip().lower()
                    for r in rels if not r.get("active")}
+    inact_names |= {(u.get("column") or "").strip().lower()
+                    for u in (dr.get("unrelated_date_columns") or ())
+                    if isinstance(u, dict) and u.get("column")}
+    contested = act_names & inact_names
     ambiguous = sorted(
         {r["column"] for r in rels
-         if (r["column"] or "").strip().lower() in act_names & inact_names})
+         if (r["column"] or "").strip().lower() in contested})
     out = {"date_table": dr["table"], "active_keys": active, "key_column": "Date"}
     if ambiguous:
         out["ambiguous_keys"] = ambiguous
@@ -3178,6 +3244,79 @@ _COLOUR_TWIN_SUFFIX = " (colour)"
 _COLOUR_TWIN_DECL_RE = re.compile(r"^\tmeasure '([^']+ \(colour\))'\s*=", re.M)
 
 
+def _visuals_projecting_stub_measures(model_parts, report_parts):
+    """Visuals that project a measure whose whole expression is an inert ``BLANK()`` stub.
+
+    THE FAMILY THIS BELONGS TO: structurally valid, semantically absent. When a calc cannot be
+    translated the model emits ``measure 'X' = BLANK()`` so the reference still resolves -- and it
+    resolves *perfectly*. The visual binds, `pbir_lint` is clean, `lint_visual_model_bindings` is
+    clean (the measure genuinely exists), `powerbi-report-author validate` returns 0 errors, and the
+    chart renders EMPTY. Measured on corpus workbook 0136 before 2.225.0: Sheet 3 projected
+    ``complex nested``, which was a stub, while ``viz_fidelity`` recorded
+    ``{"status": "rebuilt", "reason": null}``. The MODEL layer knew (the translation handoff lists
+    the calc as needs-review); the VISUAL layer never repeated it.
+
+    Every existing gate here asks "is this well-formed"; none asks "does it SAY anything". That is
+    why no structural check can find this and why it has to read the measure's EXPRESSION.
+
+    Fail-closed, and narrowly: only an expression that is EXACTLY the stub form counts. A measure
+    that returns blank conditionally -- ``IF(<cond>, 1)``, the shape every keep-flag uses -- is
+    doing its job, and flagging it would fire on correct output constantly. A stub is recognised by
+    ``= BLANK()`` alone, optionally parenthesised/whitespaced, never by "contains BLANK".
+
+    Returns ``[{"visual", "page", "measure"}]`` sorted, empty when nothing qualifies -- so a build
+    with no stubbed calc is unaffected.
+    """
+    if not isinstance(model_parts, dict) or not isinstance(report_parts, dict):
+        return []
+    stub_re = re.compile(r"(?m)^\s*measure\s+(?:'([^']+)'|(\S+))\s*=\s*\(?\s*BLANK\s*\(\s*\)\s*\)?\s*$")
+    stubs = set()
+    for path, text in model_parts.items():
+        if not (isinstance(path, str) and path.endswith(".tmdl") and isinstance(text, str)):
+            continue
+        for m in stub_re.finditer(text):
+            name = m.group(1) or m.group(2)
+            if name:
+                stubs.add(name)
+    if not stubs:
+        return []
+
+    out = []
+    for path, content in sorted(report_parts.items()):
+        if not (isinstance(path, str) and path.endswith("visual.json")
+                and isinstance(content, str)):
+            continue
+        try:
+            doc = json.loads(content)
+        except (TypeError, ValueError):
+            continue
+        norm = path.replace("\\", "/").split("/")
+        page = norm[-4] if len(norm) >= 4 else None
+        named = set()
+        for ref in _iter_measure_property_names(doc):
+            if ref in stubs:
+                named.add(ref)
+        for measure in sorted(named):
+            out.append({"visual": doc.get("name") or (norm[-2] if len(norm) >= 2 else None),
+                        "page": page, "measure": measure})
+    return out
+
+
+def _iter_measure_property_names(node):
+    """Every ``Measure.Property`` string anywhere in a visual document."""
+    if isinstance(node, dict):
+        meas = node.get("Measure")
+        if isinstance(meas, dict) and isinstance(meas.get("Property"), str):
+            yield meas["Property"]
+        for value in node.values():
+            for name in _iter_measure_property_names(value):
+                yield name
+    elif isinstance(node, list):
+        for value in node:
+            for name in _iter_measure_property_names(value):
+                yield name
+
+
 def _retire_unreferenced_colour_twins(model_parts, report_parts):
     """Drop colour twins the SHIPPING report does not reference -> ``(parts, [retired names])``.
 
@@ -3419,15 +3558,30 @@ def _build_datasource_pbip(entry, wb_detail, twb_text, result, ds, *, label, mod
         # estate already built the matching published datasource, rebuild the model from THAT real
         # schema -- carrying the workbook's own calculated fields so its view-local measures
         # translate -- and bind the report to it. Never guesses (a real datasource-name match is
-        # required); any failure keeps the honest skip below (warn-never-wrong). Skipped for a
-        # pre-combined descriptor (its islands are already real schemas -- a fallback there is a
-        # genuinely-undoable shape, so it stubs loud below).
-        if descriptor is None:
-            recovered = _rebuild_from_published_match(wb_detail, twb_text, model_safe, ds_catalog,
-                                                      approved_calc_dax=approved_calc_dax)
-            if recovered is not None:
-                res = recovered
-                res_report = res.get("report") or {}
+        # required); any failure keeps the honest skip below (warn-never-wrong).
+        #
+        # NO ``descriptor is None`` GATE (#155). It used to skip recovery whenever a combined /
+        # federated descriptor was present, on the rationale that "its islands are already real
+        # schemas -- a fallback there is a genuinely-undoable shape". A reader measured the
+        # counter-example: a published datasource PLUS one small embedded federated datasource is
+        # both things at once, and the workbook was skipped entirely with "co-migrate its published
+        # datasource" while the published rebuild was sitting there available -- 52 measures / 86.5%
+        # translated once the gate was bypassed.
+        #
+        # Removing it cannot loosen the safety model, and the reason is structural rather than a
+        # judgement call: this branch only runs when ``res_report["fallback"]`` is already set, i.e.
+        # the model HAS ALREADY FAILED. The gate therefore never protected a good model -- it only
+        # decided whether to attempt a recovery on a build that had nothing left to lose. The three
+        # guards that do the protecting live in the callee, which takes no ``descriptor`` at all: a
+        # catalog must exist, the binding signal must be ``published``, and the name must match
+        # exactly one non-ambiguous entry. It returns None otherwise and the honest skip below
+        # stands. A caller-side condition the callee never asked for is a second predicate that can
+        # disagree with the first -- the same shape as a gate keyed on a proxy.
+        recovered = _rebuild_from_published_match(wb_detail, twb_text, model_safe, ds_catalog,
+                                                  approved_calc_dax=approved_calc_dax)
+        if recovered is not None:
+            res = recovered
+            res_report = res.get("report") or {}
         if res_report.get("fallback"):
             _dec = res_report.get("storage_decision") or {}
             rationale = _dec.get("rationale") or "undoable shape"
@@ -3656,6 +3810,14 @@ def _build_datasource_pbip(entry, wb_detail, twb_text, result, ds, *, label, mod
     if _retired_twins:
         res["parts"] = _pruned_parts
         entry["colour_twins_retired"] = list(_retired_twins)
+    # DISCLOSE A VISUAL THAT PROJECTS AN INERT STUB. A `= BLANK()` measure resolves perfectly, so
+    # every structural gate above passes while the chart renders empty -- the model layer knows the
+    # calc could not be translated and the visual layer never repeated it. Read on the SHIPPING
+    # parts, after the cross-check and after twin retirement, so it describes the .pbip the user
+    # opens rather than an intermediate.
+    _stub_visuals = _visuals_projecting_stub_measures(res.get("parts"), report_parts)
+    if _stub_visuals:
+        entry["visuals_projecting_stub_measures"] = _stub_visuals
     # PROVE the cross-check above actually left nothing dangling, on the BYTES THAT SHIP.
     # ``_crosscheck_report_refs`` is supposed to drop or rebind every reference the model did not
     # emit; this asserts the result rather than trusting it. reference_gate proves the same invariant

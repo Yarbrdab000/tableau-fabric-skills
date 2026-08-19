@@ -108,12 +108,28 @@ DIRECT_CONNECTORS = {
 # this value"). Membership here therefore means "the DRILLED form is verified", never the root.
 #
 #   * databricks -- live-verified 2026-06 (Databricks.Catalogs -> Kind="Database" drill).
+#   * snowflake  -- promoted 2026-08 (#162). Verified against a live instance we do not own: a
+#     reader's SHIPPED, working model emits exactly this shape --
+#       Database = Snowflake.Databases(#"Server", #"Warehouse"){[Name="UDP_DB", Kind="Database"]}[Data],
+#       Source   = Value.NativeQuery(Database, "<sql>", null, [EnableFolding=true])
+#     confirmed across 2 workbooks / 10+ tables including ~90-line multi-join SQL, and derived
+#     independently a second time from the connector's own navigation semantics. Stated plainly
+#     because it matters for how much this claim is worth: the confirmation is somebody else's
+#     production estate, not our live probe. The three doubts this comment previously recorded are
+#     each answered rather than waived --
+#       * drilled-handle native-query capability: that IS the shipped shape, so it demonstrably works;
+#       * mandatory compute warehouse: already threaded, `_connect_expr` emits
+#         Snowflake.Databases(#"Server", #"Warehouse") on the table path today;
+#       * uppercase identifier folding: not touched by the drill. The custom SQL passes through
+#         VERBATIM as Tableau wrote it, against the same Snowflake it was authored against, so this
+#         path introduces no identifier rewriting that could fold differently.
+#     Measured before promoting: the Snowflake TABLE path already emits the identical drill
+#     (Source{[Name=<db>, Kind="Database"]}[Data]), so the custom-SQL branch was reaching the
+#     scaffold on set membership alone, not for want of an emitter.
 #
-# Snowflake shares the database_schema_table nav shape but is deliberately NOT included: its
-# drilled-handle native-query capability, mandatory compute warehouse, and uppercase identifier
-# folding are unverified against live, so it stays scaffolded (same charter as PARTIAL_LIVE_CONNECTORS).
-# Promotion is a one-line addition here once a connector's drilled native query is confirmed live.
-NATIVE_QUERY_CATALOG_DRILL = {"databricks"}
+# Snowflake shares the database_schema_table nav shape and IS now included (above). Promotion
+# remains a one-line addition here once a connector's drilled native query is confirmed live.
+NATIVE_QUERY_CATALOG_DRILL = {"databricks", "snowflake"}
 
 # Recognized live connectors that are deliberately NOT auto-emitted yet: their navigation
 # selector or required identifiers cannot be verified offline, so emitting a call body would be

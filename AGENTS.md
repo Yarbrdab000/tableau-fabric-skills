@@ -171,6 +171,27 @@ Two rules make it work:
   collision in the run that produced these rules traces to a number travelling in a message, which is
   the one artifact neither party can keep current — by the time it is read, the sender may already
   have consumed it. The integrator lands what arrives and objects only on an actual collision.
+* **Publish the block's whole EXTENT when you claim it, and claim it as LATE as possible.** Cut every
+  anchor in the block at the current tip the moment you claim, and move each to its real parent as
+  that release lands. Otherwise the block is only ever *partially* published while it is being built
+  — an anchor can only be cut once its predecessor exists — so a reader sees a block's low-water mark
+  and never its extent, and claims into the middle of it. That happened, and the anchors then
+  collided too (see below). The complement is timing: a block dies the instant the other party's tip
+  passes it, whatever its size, so **claim at the release step, not at the start of the lane.**
+  Blocks claimed early died four times in one day; blocks claimed seconds before committing survived.
+  The two rules are compatible — the block is fully published the instant it is claimed, that instant
+  is just moved later.
+* **`refs/tags` is SHARED across every worktree** (`git rev-parse --git-common-dir` is one `.git`), so
+  a version collision is also an ANCHOR collision: one name, one slot, last writer wins. **Never
+  `git tag -d` an anchor you did not create** — `git for-each-ref --format='%(taggername)
+  %(taggerdate)'` identifies the owner in one call, and a BATCH delete is where this happens, because
+  the batch reads as a single intent ("my old numbers") while acting on a global namespace. Leave a
+  dead block's anchors in place: an unused anchor is inert to every gate here, while a wrongly deleted
+  one destroys a rollback path and reads to the next person as "reported but absent". Deletion is the
+  only irreversible step in this ritual.
+* **An anchor tells you a version is CLAIMED, never that it is unlanded.** Three distinct anchor
+  failures showed up in one day and none was predictable from the others: pointing at an orphan,
+  absent because another session deleted it, and present-but-already-shipped.
 
 
 When several features shipped unversioned, catch up per feature: assign each its own MINOR version +

@@ -669,6 +669,23 @@ def dax_value(toks, resolve):
     if call:
         fn, args = call
         if fn in _VC_AGGREGATOR and args:
+            # NAMED IDIOM, checked before the generic aggregator lowering because it does not need
+            # to resolve its argument at all. ``WINDOW_COUNT(expr)`` counts the MARKS in the frame
+            # for which ``expr`` is non-null -- it does not sum or aggregate ``expr``. A ``COUNTD``
+            # of a dimension is never null at a mark, so ``WINDOW_COUNT(COUNTD([anything]))`` is
+            # exactly "how many marks are in this view", which is Tableau's standard way of writing
+            # it: ``RANK(SUM([m])) <= WINDOW_COUNT(COUNTD([<row dimension>])) * .25`` is "am I in
+            # the top quartile".
+            #
+            # Lowering it through the generic path instead would require resolving ``COUNTD([D])``
+            # to a projected column, which fails -- the visual groups BY that dimension rather than
+            # projecting a distinct count of it -- and the whole rule would decline. Same answer as
+            # Tableau's own ``SIZE()``, which already lowers to ``COUNTROWS`` below.
+            if fn == "WINDOW_COUNT":
+                inner_call = _call_args(args[0])
+                if inner_call and str(inner_call[0]).strip().upper() == "COUNTD":
+                    frame = _window_frame(args)
+                    return "COUNTROWS(%s)" % frame if frame else None
             aggregator, window = _VC_AGGREGATOR[fn]
             # Explicit bounds override the function's default frame. RUNNING_* has no bound form.
             if not fn.startswith("RUNNING_"):

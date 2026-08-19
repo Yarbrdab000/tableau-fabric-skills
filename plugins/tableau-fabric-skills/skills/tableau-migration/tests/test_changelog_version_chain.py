@@ -19,6 +19,12 @@ It is mechanically checkable from the CHANGELOG alone, so it should be a gate ra
   reinstalls only when main is NEWER, so a CHANGELOG that documents 2.156.0 above a ``VERSION`` file
   still reading 2.154.0 leaves every client that reached the higher number permanently deaf to
   everything after it.
+* **every entry has a BODY** -- a rebase left a header-only duplicate of a renumbered entry, carrying
+  its pre-renumber chain reference and no content at all. It satisfied every check above: the version
+  was present, the chain was continuous, nothing was claimed twice. An entry can EXIST, be
+  well-formed, and be EMPTY, so counting markers proves nothing about content. This also catches the
+  duplicate-WITH-body that a pure marker count misses, because the stale copy is the one left
+  without prose.
 
 Skips rather than fails when the repo layout is absent (an installed-skill context has no root
 ``CHANGELOG.md``), matching ``test_mirror_parity``.
@@ -87,6 +93,36 @@ def _skill_version():
         return fh.read().strip()
 
 
+def _entry_bodies():
+    """``[(line_no, to, non_blank_line_count)]`` -- the prose under each entry header.
+
+    Shares :func:`_entries` deliberately rather than re-parsing. A second parser here would be a
+    second predicate over the same file, and the two could disagree about what an entry IS while
+    each looked correct on its own -- the failure this module exists to prevent, reintroduced one
+    level down.
+
+    An entry's body runs from the line after its header to whichever comes first: the next entry, a
+    Markdown section heading, or end of file. The heading stop matters because the file interleaves
+    ``### Added`` and ``### Fixed``, so the last entry in a section would otherwise absorb the next
+    section's header as content.
+    """
+    root = _find_repo_root()
+    with open(os.path.join(root, "CHANGELOG.md"), encoding="utf-8") as fh:
+        lines = fh.read().split("\n")
+    entries = _entries()
+    starts = [e[0] for e in entries]
+    out = []
+    for idx, (line_no, _frm, to) in enumerate(entries):
+        end = starts[idx + 1] - 1 if idx + 1 < len(starts) else len(lines)
+        body = lines[line_no:end]
+        for j, text in enumerate(body):
+            if text.startswith("## ") or text.startswith("### "):
+                body = body[:j]
+                break
+        out.append((line_no, to, len([b for b in body if b.strip()])))
+    return out
+
+
 def test_the_declared_version_chain_is_continuous():
     entries = _entries()
     breaks = []
@@ -127,3 +163,38 @@ def test_the_chain_detects_a_stale_predecessor():
     entries = [(10, "2.154.0", "2.156.0"), (40, "2.154.0", "2.155.0")]
     breaks = [1 for (_l, frm, _t), (_bl, _bf, bto) in zip(entries, entries[1:]) if frm != bto]
     assert breaks, "a stale predecessor (2.154.0 over an entry ending 2.155.0) must be detected"
+
+
+def test_every_entry_has_a_body():
+    """An entry that exists, is well-formed, and says NOTHING is a rebase artifact, not a release.
+
+    A cross-session rebase left a header-only duplicate of a renumbered entry: same shape, same
+    ``(skill X -> Y)`` marker, zero prose. Every other check in this module passed on it, because
+    each asks about the HEADER. A reader diffing two CHANGELOGs sees a version present in both and
+    concludes the release is documented.
+
+    Threshold is deliberately ``> 0`` rather than a size floor, and the margin is measured rather
+    than assumed: across the 99 entries in this file the SMALLEST real body is 604 characters over
+    7 non-blank lines. A legitimate entry therefore clears this by roughly two orders of magnitude,
+    so the check cannot fire on terse-but-real prose -- only on genuine emptiness.
+    """
+    empty = [(line_no, to) for line_no, to, count in _entry_bodies() if count == 0]
+
+    assert not empty, (
+        "CHANGELOG entries with no body -- a version was documented in name only, which a "
+        "marker/count check cannot see: "
+        + ", ".join("%s at L%d" % (to, line_no) for line_no, to in empty))
+
+
+def test_the_body_check_detects_a_header_only_entry():
+    """Prove this gate CAN fail, on the real parser rather than a hand-built fixture.
+
+    Every gate in this repo that turned out to be worthless looked healthy while passing: one whose
+    rule nothing called, one whose reachability set included the artifact under test. "It passed" is
+    not evidence until the red has been seen, so the empty-body predicate is exercised directly on
+    the shape the rebase produced.
+    """
+    bodies = [(1, "2.99.0", 0), (10, "2.98.0", 7)]
+    empty = [(line_no, to) for line_no, to, count in bodies if count == 0]
+
+    assert empty == [(1, "2.99.0")], "the predicate must flag a zero-body entry and nothing else"

@@ -4089,6 +4089,47 @@ def test_date_binding_from_model_omits_ambiguous_when_uncontested():
     assert "ambiguous_keys" not in db
 
 
+def test_date_binding_contests_a_column_on_a_table_the_calendar_skipped():
+    # REGRESSION (Salesforce NPSP): a table the calendar SKIPS -- a pure dimension, or one that never
+    # landed -- gets NO date relationship, so it never appears in ``relationships``. Keying the guard
+    # on that list alone made it blind to the very shape it exists to catch: "no relationship" is a
+    # stronger version of "inactive relationship", not an exemption from it.
+    #
+    # Measured shape: ``caseman__Intake__c`` is only ever the ``one`` side of
+    # ``Case -> caseman__Intake__c.Id``, so it is a pure dim excluded from the calendar, yet it
+    # carries ``CreatedDate`` -- active on three OTHER tables. The binder matches a date pill by
+    # column name, so its Month axis rebound to ``Date[Month Start]`` on a table the calendar cannot
+    # filter, and every bucket returned the grand total: a flat line, unwarned, and validate-clean.
+    rr = {"date_table": {
+        "generated": True, "mark_as_date": True, "table": "Date",
+        "relationships": [
+            {"table": "Case", "column": "CreatedDate", "active": True},
+            {"table": "caseman__Goal__c", "column": "CreatedDate", "active": True},
+        ],
+        "unrelated_date_columns": [
+            {"table": "caseman__Intake__c", "column": "CreatedDate"},
+            {"table": "caseman__Intake__c", "column": "caseman__CloseDate__c"},
+        ]}}
+    db = me._date_binding_from_model(rr)
+    assert db["active_keys"] == ["CreatedDate", "CreatedDate"]
+    # CreatedDate is contested -> declined. CloseDate is active nowhere, so it was never a rebind
+    # candidate and naming it would block nothing.
+    assert db["ambiguous_keys"] == ["CreatedDate"]
+
+
+def test_date_binding_unrelated_columns_do_not_contest_an_unshared_name():
+    # The skipped table's date column has its own name, so no active key is contested and the
+    # legitimate rebind still proceeds -- the guard stays narrow rather than blocking every calendar
+    # binding as soon as any pure dimension carries a date.
+    rr = {"date_table": {
+        "generated": True, "mark_as_date": True, "table": "Date",
+        "relationships": [{"table": "Orders", "column": "Order_Date", "active": True}],
+        "unrelated_date_columns": [{"table": "Region", "column": "Last_Audit_Date"}]}}
+    db = me._date_binding_from_model(rr)
+    assert db["active_keys"] == ["Order_Date"]
+    assert "ambiguous_keys" not in db
+
+
 def test_scope_flag_visuals_attaches_worksheets(monkeypatch):
     # The flag's source calc_id is mapped, via workbook_calc_usage, to the worksheets that placed the
     # source Tableau filter calc; those names are written into the binding's ``visuals`` list.

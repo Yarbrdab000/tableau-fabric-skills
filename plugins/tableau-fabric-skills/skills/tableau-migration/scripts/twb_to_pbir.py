@@ -509,6 +509,27 @@ def _rebind_date_axis(field, deriv, date_binding, for_filter=False):
     """
     if not date_binding or field.get("role") == "measure":
         return None
+    # PER-ISLAND MODELS: several datasources -> one calendar each. A resolved field carries its own
+    # ``datasource`` (the island's caption), which is the one identifier the model build and the
+    # report share -- so a pill binds to ITS OWN island's calendar. Selecting the island first also
+    # repairs the name-based gates below: ``active_keys`` / ``ambiguous_keys`` become that island's,
+    # so a column name active in one island and not another stops contesting itself workbook-wide.
+    #
+    # Keyed on the datasource, NOT on the field's ``entity``: the same relation name
+    # (``pmdm__ProgramEngagement__c``) exists in all four Salesforce islands, so an entity key
+    # collides and picking one bound an Intake pill to the Service Delivery calendar -- a
+    # cross-island rebind onto a calendar with no active join, which is the flat series this split
+    # exists to remove.
+    #
+    # DECLINES when the pill's datasource names no island: binding it to an arbitrary calendar is
+    # exactly that defect. Falls through untouched for single-calendar models, so a
+    # single-datasource workbook is byte-for-byte unchanged.
+    by_island = date_binding.get("by_island")
+    if by_island:
+        scoped = by_island.get((field.get("datasource") or "").strip().lower())
+        if not scoped:
+            return None
+        date_binding = scoped
     table = date_binding.get("date_table")
     if not table:
         return None
@@ -1479,6 +1500,33 @@ def _resolve_field(ds, field_id, base_cols, instances, index, ds_caption,
         field["kind"] = "value" if role == "measure" else "category"
         return field
 
+    if deriv == "Attribute":
+        # Tableau's ATTR([x]): the value when it is unique across the mark's rows, and the literal
+        # ``*`` when it is not. Power BI has no such aggregate, and the previous behaviour was to
+        # DROP the pill -- which is why 0135's ``ATTR`` sheet emitted a table with only its row
+        # dimension and no value at all, and why its 3-pill trellis produced 2 charts instead of 3.
+        #
+        # ``Min`` is EXACT for the case the author is asking about. ATTR is written precisely when
+        # the value is expected to be constant within the mark, and where it is, MIN(x) IS x. The two
+        # differ only when the value is NOT unique -- Tableau prints ``*``, Power BI shows the
+        # minimum -- so the degradation is confined to the case the source itself flags as ambiguous,
+        # and it is warned rather than silent. Emitting the pill wrong-in-one-case beats dropping it
+        # in every case: a missing value cannot be noticed by a reader, a minimum can.
+        #
+        # Not routed through the ``Min`` branch above: that one refuses non-numeric/non-date columns,
+        # and ATTR is most often used on a STRING (``ATTR([Region])``), where a text Min is both
+        # valid in PBIR and exactly the intended answer. Restricting it the same way would drop
+        # precisely the commonest ATTR.
+        warnings.append(_warn(
+            "worksheet", worksheet,
+            f"ATTR('{caption}') rebuilt as MIN -- identical wherever the value is unique within the "
+            f"mark (which is what ATTR asserts); where it is not, Tableau shows '*' and this shows "
+            f"the minimum"))
+        field["aggregation"] = "Min"
+        field["binding"] = "aggregation"
+        field["kind"] = "value"
+        return field
+
     if deriv not in ("None", "", None):
         warnings.append(_warn(
             "worksheet", worksheet,
@@ -2243,16 +2291,78 @@ def _dedupe_str(values):
     return out
 
 
+def _shared_view_filter_index(root):
+    """Index the filters Tableau hoists OUT of worksheets into a workbook-level ``<shared-views>``.
+
+    ``Apply to -> All Worksheets Using This Data Source`` does **not** write a ``<filter>`` on each
+    participating worksheet. It writes ONE filter under
+    ``<shared-views><shared-view name='<datasource>'>`` and leaves every participating worksheet only
+    a ``<slices><column>`` naming the sliced field. Reading worksheet-local ``<filter>`` elements
+    alone therefore loses every filter authored in that scope -- and with them every dashboard filter
+    CARD, because a card resolves to its model column through the matching worksheet filter's token.
+
+    Measured on corpus `0133` against its sibling `0132`, which differ in this scope and almost
+    nothing else: `0132` keeps three filters on worksheet ``Profit`` and rebuilds all three slicers;
+    `0133` hoists the byte-identical three into ``<shared-views>`` and rebuilt NONE, on all three of
+    its dashboards -- nine cards, disclosed as "resolved to no model field" and otherwise silent.
+    The dashboard zone tokens are the SAME in both workbooks; only the resolver map differed
+    (3 entries vs 0), which is why the failure looked like a card problem and was a parse problem.
+
+    Returns ``{(datasource, field_instance): <filter element>}``. Built once per workbook rather than
+    per worksheet: the lookup walks the whole tree, and a 49-worksheet workbook would otherwise walk
+    it 49 times.
+    """
+    out = {}
+    for holder in _children_local(root, "shared-views"):
+        for sv in _children_local(holder, "shared-view"):
+            for filt in _findall_local(sv, "filter"):
+                tok = _split_token_attr(filt.get("column"))
+                if tok[1] is not None:
+                    out.setdefault(tok, filt)
+    return out
+
+
+def _worksheet_shared_filters(ws, shared_index):
+    """The shared-view filters that apply to THIS worksheet, via its own ``<slices>`` record.
+
+    ``<slices><column>`` is Tableau's per-sheet statement of which fields the sheet is sliced by, so
+    it is the exact participation signal: a sheet that opted out of a data-source-scoped filter does
+    not list it, and therefore is not handed a filter it does not have. Keying on the sheet's own
+    record rather than on "every sheet using this datasource" keeps the inference evidence-based.
+    """
+    if not shared_index:
+        return []
+    sliced = []
+    for sl in _findall_local(ws, "slices"):
+        for c in _children_local(sl, "column"):
+            tok = _split_token_attr((c.text or "").strip())
+            if tok[1] is not None and tok not in sliced:
+                sliced.append(tok)
+    return [shared_index[t] for t in sliced if t in shared_index]
+
+
 def _parse_filters(ws, ds_default, base_cols, instances, index, ds_caption,
                    worksheet, warnings, warn_special=True, internal_fields=None,
-                   date_binding=None, table_calc_filters=None, table_calc_peers=0):
+                   date_binding=None, table_calc_filters=None, table_calc_peers=0,
+                   extra_filters=()):
     """Returns ``(filters, swap_controls)``. ``swap_controls`` carries any parameter-driven
     sheet-swap visibility controls detected on this worksheet (a categorical filter pinned to a
     pure parameter-passthrough calc). Recognising them structurally keeps them from being
-    mis-warned as unmappable measure filters and lets :func:`parse_twb` group swap partners."""
+    mis-warned as unmappable measure filters and lets :func:`parse_twb` group swap partners.
+
+    ``extra_filters`` are filter elements that live OUTSIDE the worksheet but apply to it -- today,
+    the workbook-level ``<shared-views>`` filters written by *Apply to -> All Worksheets Using This
+    Data Source* (see :func:`_shared_view_filter_index`). They are appended AFTER the local ones and
+    skipped when the worksheet already carries a filter on the same token, so a sheet-level filter
+    always wins over the inherited one and a workbook with no shared views is byte-identical.
+    """
     filters = []
     swap_controls = []
-    for filt in _findall_local(ws, "filter"):
+    local = _findall_local(ws, "filter")
+    seen_tokens = {_split_token_attr(x.get("column")) for x in local}
+    inherited = [x for x in extra_filters
+                 if _split_token_attr(x.get("column")) not in seen_tokens]
+    for filt in local + inherited:
         cls = (filt.get("class") or "").lower()
         ds, fid = _split_token_attr(filt.get("column"))
         if fid is None:
@@ -2801,6 +2911,43 @@ def _route_measure_values(mark, locs, members, dummy_count, has_param_swap, stat
         vt = VT_CARD
     note = f"Measure Values -> {len(members)} measures; Measure Names implicit"
     return vt, "cols", note
+
+
+def _parse_row_labels_hidden(table, dims_rows):
+    """Did the author hide the ROW LABELS of this sheet? ``True`` / ``False``.
+
+    Deliberately separate from :func:`_parse_hidden_axes` rather than folded into it. That function
+    maps a hide onto a Power BI AXIS, which needs the shelf's role, and it resolves cleanly for a
+    cartesian chart but yields nothing for a crosstab -- a text table has no category axis to hide,
+    so the fact was computed and then dropped. This asks the narrower question the container-stitch
+    detector actually needs: is there a ``style-rule[element='label']`` carrying
+    ``format[@attr='display'][@value='false']`` that names a field on the ROWS shelf?
+
+    Kept additive and side-effect free so the chart path is untouched: nothing reads this except the
+    stitched-table detector, and a sheet with no such rule answers ``False`` exactly as before.
+    """
+    if table is None or not dims_rows:
+        return False
+    style = _first(table, "style")
+    if style is None:
+        return False
+    row_keys = set()
+    for f in dims_rows:
+        row_keys.update(_field_ref_keys(f))
+    if not row_keys:
+        return False
+    for rule in _children_local(style, "style-rule"):
+        if (rule.get("element") or "").strip().lower() != "label":
+            continue
+        for fmt in _children_local(rule, "format"):
+            if (fmt.get("attr") or "") != "display":
+                continue
+            if (fmt.get("value") or "").strip().lower() != "false":
+                continue
+            for key in _field_ref_keys_from_text(fmt.get("field")):
+                if key in row_keys:
+                    return True
+    return False
 
 
 def _parse_hidden_axes(table, dims_rows, dims_cols, meas_rows, meas_cols):
@@ -4560,9 +4707,33 @@ def _classify_reference_lines(all_panes, visual_type):
     return constants, deferred
 
 
+def _parse_shelf_totals(rows_el, cols_el):
+    """Whether Tableau shows a GRAND TOTAL on this view, from the shelf's own attributes.
+
+    Tableau writes it on the shelf element and never uses the word "grand":
+    ``<rows onTop='true' total='true'>``. ``total`` turns the grand total on; ``onTop`` puts the
+    total row at the TOP instead of the bottom.
+
+    This matters because **Power BI's table shows a Total row by DEFAULT**, so emitting nothing is
+    not neutral -- it is a decision, and it is the wrong one for almost every view. Measured across
+    the corpus of 34: **252 of 262 shelves declare no total at all**, while every one of the 42
+    emitted grid visuals set no toggle and therefore inherited Power BI's default. That is an extra
+    row of numbers on tables whose source never showed one -- a confidently-wrong addition rather
+    than a missing feature, which is the harder kind to notice because it looks like data.
+
+    Returns ``{"rows": bool, "rows_on_top": bool, "cols": bool, "cols_on_top": bool}``.
+    """
+    def _flag(el, attr):
+        return bool(el is not None and (el.get(attr) or "").strip().lower() == "true")
+
+    return {"rows": _flag(rows_el, "total"), "rows_on_top": _flag(rows_el, "onTop"),
+            "cols": _flag(cols_el, "total"), "cols_on_top": _flag(cols_el, "onTop")}
+
+
 def _parse_worksheet(ws, index, ds_caption, warnings, internal_fields=None, date_binding=None,
                      row_count_binding=None, measure_binding=None, column_binding=None,
-                     measure_palette=None, ds_color_palettes=None, workbook_root=None):
+                     measure_palette=None, ds_color_palettes=None, workbook_root=None,
+                     shared_filters=None):
     name = ws.get("name")
     table = _first(ws, "table")
     if table is None:
@@ -4599,6 +4770,7 @@ def _parse_worksheet(ws, index, ds_caption, warnings, internal_fields=None, date
     cols_el = _first(table, "cols")
     rows_text = (rows_el.text if rows_el is not None else "") or ""
     cols_text = (cols_el.text if cols_el is not None else "") or ""
+    shelf_totals = _parse_shelf_totals(rows_el, cols_el)
     uses_mv = _uses_measure_values(rows_text, cols_text, pane)
     warn_special = not uses_mv
     rows = _resolve_shelf(rows_text, ds_default, base_cols, instances, index,
@@ -4621,7 +4793,8 @@ def _parse_worksheet(ws, index, ds_caption, warnings, internal_fields=None, date
                                             ds_caption, name, warnings, warn_special=warn_special,
                                             internal_fields=internal_fields, date_binding=date_binding,
                                             table_calc_filters=_tc_filters,
-                                            table_calc_peers=_worksheet_table_calc_count(ws))
+                                            table_calc_peers=_worksheet_table_calc_count(ws),
+                                            extra_filters=_worksheet_shared_filters(ws, shared_filters))
     sort = _parse_sort(view, ds_default, base_cols, instances, index,
                        ds_caption, name, warnings, internal_fields=internal_fields)
 
@@ -5075,6 +5248,11 @@ def _parse_worksheet(ws, index, ds_caption, warnings, internal_fields=None, date
 
     axis_titles = {}
     axis_hidden = set()
+    # Computed UNCONDITIONALLY, unlike the axis parsing below. That block is gated on
+    # ``_AXIS_TITLE_TYPES``, which a text table is not a member of -- a crosstab has no axes -- so
+    # the author's row-label hide was parsed for charts and silently dropped for exactly the visual
+    # type the container-stitch idiom uses.
+    row_labels_hidden = _parse_row_labels_hidden(table, dims_rows)
     if visual_type in _AXIS_TITLE_TYPES:
         axis_titles = _parse_axis_titles(table, dims_rows, dims_cols, meas_rows, meas_cols)
         axis_hidden = _parse_hidden_axes(table, dims_rows, dims_cols, meas_rows, meas_cols)
@@ -5135,6 +5313,18 @@ def _parse_worksheet(ws, index, ds_caption, warnings, internal_fields=None, date
     # visual -- an unsupported worksheet is already wholly deferred, so no extra warning is added.
     reference_lines = []
     reference_line_constants = []
+    # Tableau can place the grand total at the TOP of the view (``<rows onTop='true' total='true'>``).
+    # Power BI cannot: the schema for a flat table (``tableEx``) exposes exactly one total control,
+    # ``total.totals`` (bool), with NO position property, and a matrix's ``rowSubtotalsPosition``
+    # governs per-group SUBTOTALS rather than the grand total. So the row is rebuilt in the only place
+    # Power BI will put it and the move is DISCLOSED -- the alternative is a silent relocation of the
+    # one row a reader is most likely to look at first.
+    if visual_type in (VT_TABLE, VT_MATRIX) and shelf_totals.get("rows") and \
+            shelf_totals.get("rows_on_top"):
+        warnings.append(_warn(
+            "worksheet", name,
+            "grand total is shown at the TOP in Tableau; Power BI's table/matrix has no total-position "
+            "control, so the total row is rebuilt at the BOTTOM (the values are unchanged)"))
     if visual_type != VT_UNSUPPORTED:
         reference_lines = _parse_reference_lines(all_panes)
         if reference_lines:
@@ -5184,6 +5374,11 @@ def _parse_worksheet(ws, index, ds_caption, warnings, internal_fields=None, date
         "continuous_axis": continuous_axis,
         "dual_axis": _pane_mark_map(table)[2],
         "axis_hidden": sorted(axis_hidden),
+        "row_labels_hidden": row_labels_hidden,
+        # Grand-total visibility, from the shelf's own ``total``/``onTop`` attributes. Power BI's
+        # table shows a Total row by DEFAULT, so this must be emitted explicitly in BOTH directions
+        # -- see _parse_shelf_totals.
+        "shelf_totals": shelf_totals,
         "color_gradient": color_gradient,
         "color_gradients": color_gradients,
         "mv_color_scales": mv_color_scales,
@@ -6377,6 +6572,9 @@ def parse_twb(xml_text, *, date_binding=None, row_count_binding=None, measure_bi
     ws_elems = []
     for h in ws_holder:
         ws_elems.extend(_children_local(h, "worksheet"))
+    # Built once for the workbook -- see _shared_view_filter_index: the lookup walks the tree, and a
+    # 49-worksheet workbook would otherwise walk it 49 times.
+    shared_filters = _shared_view_filter_index(root)
     worksheets = []
     for ws in ws_elems:
         parsed = _parse_worksheet(ws, index, ds_caption, warnings,
@@ -6386,7 +6584,8 @@ def parse_twb(xml_text, *, date_binding=None, row_count_binding=None, measure_bi
                                   column_binding=column_binding,
                                   measure_palette=measure_palette,
                                  ds_color_palettes=ds_color_palettes,
-                                 workbook_root=root)
+                                 workbook_root=root,
+                                 shared_filters=shared_filters)
         if parsed:
             worksheets.append(parsed)
     worksheet_names = {w["name"] for w in worksheets}
@@ -9726,6 +9925,10 @@ def _colour_rule_resolver(ws, model_table, field_map, param_values=None):
     return resolve
 
 
+# A backslash escape inside a serialised mark-colour member value (Tableau writes ``"Top 25\%"``).
+_MARK_COLOUR_ESCAPE_RE = re.compile(r"\\(.)")
+
+
 def _colour_member_palette(ws, members):
     """``{member: hex}`` for the string members of a colour calculation.
 
@@ -9737,7 +9940,17 @@ def _colour_member_palette(ws, members):
     authored = {}
     for m in ((ws.get("mark_colors") or {}).get("members") or []):
         if m.get("value") and m.get("color"):
-            authored[str(m["value"]).strip().casefold()] = m["color"]
+            raw = str(m["value"]).strip()
+            # Index BOTH the raw spelling and the unescaped one. Tableau backslash-escapes some
+            # characters inside a serialised colour-map member -- ``"Top 25\%"`` for a member the
+            # calc itself writes as ``"Top 25%"`` -- so a literal comparison silently misses and the
+            # member falls through to the default ramp. Measured on a dynamic-quartile workbook:
+            # ``middle`` matched while ``Top 25%`` and ``Bottom 25%`` did not, so the author's own
+            # green/red became two arbitrary palette hues, with no warning anywhere. Both forms are
+            # indexed rather than only the unescaped one, so a member whose real name contains a
+            # backslash keeps matching exactly as before.
+            for key in {raw, _MARK_COLOUR_ESCAPE_RE.sub(r"\1", raw)}:
+                authored.setdefault(key.casefold(), m["color"])
     out = {}
     for i, member in enumerate(sorted(members, key=lambda s: (s.casefold(), s))):
         out[member] = authored.get(member.strip().casefold()) or _TABLEAU_10[i % len(_TABLEAU_10)]
@@ -11035,7 +11248,17 @@ def _visual_json(name, vtype, position, query_state, sort_definition=None,
     if font_objects:
         for _fk, _fv in font_objects.items():
             visual.setdefault("objects", {}).setdefault(_fk, [{"properties": {}}])
-            visual["objects"][_fk][0]["properties"].update(_fv[0]["properties"])
+            _target = visual["objects"][_fk][0]["properties"]
+            # The cascade is a DEFAULT: it must not overwrite a property an earlier pass already
+            # set on this entry. Entry 0 may be a conditional-format rule bound to one column, and a
+            # blind ``update`` replaces that rule's own ``fontColor`` with the flat cascade colour --
+            # silently, and only for whichever rule happens to sort first. Measured on a merged
+            # container band: the leading column's quartile colouring was replaced by plain black
+            # while the other two columns painted correctly, which reads as "one column didn't work"
+            # rather than as a formatting collision. Keys the entry does NOT set are still applied,
+            # so a gradient entry keeps taking the cascade's font face exactly as before.
+            for _pk, _pv in _fv[0]["properties"].items():
+                _target.setdefault(_pk, _pv)
     # Faithful-mark overlay objects (Tier-1): a ready ``{object_name: [{"properties": {...}}]}`` block
     # a specific mark rule pre-built (e.g. the lollipop's categoryAxis/valueAxis/lineStyles/dataPoint/
     # legend). Merged LAST so it composes with anything an earlier pass added: when the object already
@@ -11180,6 +11403,19 @@ def _grid_font_objects(ws):
         _put("subTotals", gs.get("total"), gs.get("subtotal_fill"))
     else:
         _put("total", gs.get("total"), gs.get("subtotal_fill"))
+        # Grand-total VISIBILITY, emitted in both directions because Power BI's table defaults it ON.
+        # Leaving it unset is a decision, not a neutral act: measured across the corpus of 34, 252 of
+        # 262 Tableau shelves declare NO grand total, yet all 42 emitted grid visuals inherited the
+        # default and showed one. An extra row of plausible numbers is harder to notice than a
+        # missing feature, which is what makes it worth being explicit about.
+        #
+        # ``tableEx`` exposes exactly one control here -- ``total.totals`` (bool) -- confirmed
+        # against the visual-type schema rather than assumed. It has NO position property, so
+        # Tableau's ``onTop`` cannot be honoured on a table; the caller discloses that instead of
+        # silently placing the row at the bottom and calling it done.
+        st = ws.get("shelf_totals") or {}
+        fo.setdefault("total", [{"properties": {}}])
+        fo["total"][0]["properties"]["totals"] = _bool_literal(bool(st.get("rows")))
     return fo or None
 
 
@@ -12685,6 +12921,205 @@ def _filter_slicer_fields(ws_list, shown_tokens=None):
     return out
 
 
+# -- container-stitched pseudo-table -----------------------------------------------------------
+# Tableau cannot put several independently table-calculated measures in one view, so authors fake a
+# single table: N worksheets laid in a contiguous horizontal container, each contributing one
+# measure, with the row labels suppressed on every sheet but the leading one. The dashboard then
+# READS as one table. Power BI does this natively in one matrix, so the faithful rebuild is a MERGE.
+#
+# The signature is exact in the source and needs no heuristic:
+#   * the zones form a contiguous horizontal band -- same y, same h, and each zone's x continues
+#     where the previous one ended;
+#   * every member worksheet groups by the SAME row dimension;
+#   * the TRAILING members hide their row labels (Tableau's ``style-rule[element='label']`` ->
+#     ``display=false``, which the parser already resolves to a hidden ``categoryAxis``), while the
+#     leader keeps its labels. That asymmetry is what distinguishes a stitched pseudo-table from
+#     three unrelated tables that merely sit side by side, and it is the gate that keeps this from
+#     merging things the author meant to keep separate.
+_BAND_EDGE_TOLERANCE = 2          # Tableau's 100000-unit grid rounds; adjacent edges can differ by 1.
+
+
+def _band_row_signature(ws):
+    """The row dimension a table groups by, as a comparable key -- or ``None`` if it has none."""
+    rows = [f for f in (ws.get("rows") or []) if isinstance(f, dict)]
+    if len(rows) != 1:
+        return None
+    f = rows[0]
+    cap = str(f.get("caption") or f.get("property") or "").strip().casefold()
+    return cap or None
+
+
+def _band_hides_row_labels(ws):
+    """Did the author suppress this sheet's row labels? (``style-rule element='label'`` display=false)
+
+    The parser resolves that Tableau spelling to a hidden ``categoryAxis`` and records it on the
+    worksheet as ``axis_hidden`` (see :func:`_parse_hidden_axes`), so this reads the fact rather
+    than re-deriving it from the source.
+    """
+    return "categoryAxis" in set(ws.get("axis_hidden") or ()) or bool(ws.get("row_labels_hidden"))
+
+
+def detect_stitched_table_band(db, ws_by_name):
+    """Zones that together fake ONE table -> ``[{leader, members, zones}]`` (possibly empty).
+
+    Pure and side-effect free so it can be tested without emitting anything. Returns at most one
+    band per contiguous run; a dashboard may contain several.
+    """
+    tabular = []
+    for z in (db or {}).get("zones") or []:
+        ws = (ws_by_name or {}).get(z.get("worksheet"))
+        if not isinstance(ws, dict):
+            continue
+        if ws.get("visual_type") not in (VT_TABLE, VT_MATRIX):
+            continue
+        if _band_row_signature(ws) is None:
+            continue
+        tabular.append((z, ws))
+    if len(tabular) < 2:
+        return []
+
+    bands, run = [], []
+
+    def _flush():
+        if len(run) >= 2:
+            leader = run[0]
+            # The leader must SHOW its labels and every follower must HIDE them. Anything else is
+            # not a stitched table -- it is several tables that happen to be adjacent.
+            if (not _band_hides_row_labels(leader[1])
+                    and all(_band_hides_row_labels(w) for _z, w in run[1:])):
+                bands.append({
+                    "leader": leader[1]["name"],
+                    "members": [w["name"] for _z, w in run],
+                    "zones": [z for z, _w in run],
+                })
+        del run[:]
+
+    for z, ws in sorted(tabular, key=lambda t: (t[0].get("y") or 0, t[0].get("x") or 0)):
+        if run:
+            pz, pw = run[-1]
+            same_row = _band_row_signature(pw) == _band_row_signature(ws)
+            aligned = (abs((pz.get("y") or 0) - (z.get("y") or 0)) <= _BAND_EDGE_TOLERANCE
+                       and abs((pz.get("h") or 0) - (z.get("h") or 0)) <= _BAND_EDGE_TOLERANCE)
+            adjacent = abs(((pz.get("x") or 0) + (pz.get("w") or 0)) - (z.get("x") or 0)) \
+                <= _BAND_EDGE_TOLERANCE
+            if not (same_row and aligned and adjacent):
+                _flush()
+        run.append((z, ws))
+    _flush()
+    return bands
+
+
+def merge_stitched_band_state(state, leader_ws, follower_ws, model_table, field_map, warnings):
+    """Fold the followers' MEASURE columns into the leader's query state -> ``[(ws, state)]``.
+
+    The members all group by the same row dimension and each contributes one measure, so the merged
+    visual is the leader's state plus every follower's measure projections. The shared dimension is
+    contributed once, by the leader; a follower's copy is dropped -- that repeated column is exactly
+    what the author hid and what the un-merged rebuild puts back.
+
+    Returns EVERY member paired with the state its own conditional format must be computed against,
+    the leader included. The leader's is a pre-merge snapshot, because
+    :func:`_matrix_discrete_measure_colour` paints every value projection it is handed: run after the
+    merge it would apply the leader's quartile buckets to the other members' columns too
+    (render-confirmed).
+    """
+    values = (state.get("Values") or {}).get("projections")
+    if values is None:
+        return []
+    leader_own = {"Values": {"projections": list(values)}}
+    seen = {p.get("queryRef") for p in values}
+    shared = {_dumps(p.get("field")) for p in values if "Column" in (p.get("field") or {})}
+    member_states = [(leader_ws, leader_own)]
+    for fw in follower_ws:
+        fstate = _build_query_state(fw, model_table, field_map, warnings)
+        if not _query_state_complete(fw.get("visual_type"), fstate):
+            continue
+        member_states.append((fw, fstate))
+        for p in ((fstate.get("Values") or {}).get("projections") or []):
+            if _dumps(p.get("field")) in shared:
+                continue                      # the row dimension the leader already contributes
+            if p.get("queryRef") in seen:
+                continue
+            seen.add(p.get("queryRef"))
+            values.append(p)
+    return member_states
+
+
+def port_band_member_projections(state, member_state, objects):
+    """Move a member's hidden calculation onto the merged state -> that member's objects, rebound.
+
+    Two things have to happen for a member's conditional format to survive the merge.
+
+    SCOPE. A member's colour emitter paints every projection in the state it was given -- its
+    measure, the shared row dimension, and its own hidden calculation. In a merged visual only the
+    measure is that member's to paint; leaving the rest in would let the last member processed
+    colour the row-label column.
+
+    PORTING, WITH A RENAME. The calculation the member declared lives on the member's state, which
+    the merged visual never serialises, so it must be copied across or the ``SelectRef`` dangles.
+    The refs collide by construction: every member state starts empty, so
+    :func:`_colour_vc_query_ref` hands each the same first free name. Ported naively the last one
+    wins and every column paints from whichever DAX arrived first -- resolving cleanly, reporting
+    nothing. A colliding ref whose EXPRESSION differs is renamed and the member's own ``SelectRef``s
+    are rewritten to match.
+    """
+    values = (state.get("Values") or {}).get("projections")
+    if values is None:
+        return objects
+    own = {p.get("queryRef") for p in ((member_state.get("Values") or {}).get("projections") or [])
+           if not p.get("hidden") and "Column" not in (p.get("field") or {})}
+    objects = [o for o in (objects or [])
+               if ((o.get("selector") or {}).get("metadata") in own)]
+    if not objects:
+        return objects
+    declared = {p.get("queryRef"): _dumps(p.get("field")) for p in values}
+    rename = {}
+    for p in ((member_state.get("Values") or {}).get("projections") or []):
+        if not p.get("hidden"):
+            continue
+        ref, body = p.get("queryRef"), _dumps(p.get("field"))
+        if declared.get(ref) == body:
+            continue                                  # identical calculation already present
+        if ref in declared:
+            fresh, n = ref, 1
+            while fresh in declared:
+                n += 1
+                fresh = "%s%d" % (ref, n)
+            rename[ref] = fresh
+            p = dict(p, queryRef=fresh, nativeQueryRef=fresh)
+            ref = fresh
+        declared[ref] = body
+        values.append(p)
+    if not rename:
+        return objects
+
+    def _rebind(node):
+        if isinstance(node, dict):
+            sel = node.get("SelectRef")
+            if isinstance(sel, dict) and sel.get("ExpressionName") in rename:
+                sel["ExpressionName"] = rename[sel["ExpressionName"]]
+            for v in node.values():
+                _rebind(v)
+        elif isinstance(node, list):
+            for v in node:
+                _rebind(v)
+
+    objects = copy.deepcopy(objects)
+    _rebind(objects)
+    return objects
+
+
+def _stitched_band_zone(zones):
+    """One zone spanning the whole band -- the leader's origin, the band's full width."""
+    xs = [z.get("x") or 0 for z in zones]
+    rights = [(z.get("x") or 0) + (z.get("w") or 0) for z in zones]
+    lead = min(zones, key=lambda z: z.get("x") or 0)
+    merged = dict(lead)
+    merged["x"] = min(xs)
+    merged["w"] = max(rights) - min(xs)
+    return merged
+
+
 def emit_pbir(ir, *, dataset_name="Model", report_name="Report",
               model_table=None, field_map=None, table_calc_usages=None, resources=None):
     """Emit a PBIR report definition (a ``{relative_path: text}`` parts dict) from the IR.
@@ -12808,6 +13243,56 @@ def emit_pbir(ir, *, dataset_name="Model", report_name="Report",
         # idiom, so exactly the sheets that are all-filter were the ones contributing no filters.
         # Index every worksheet the dashboard references instead, so a card is dropped only when its
         # token genuinely resolves to nothing.
+        # A container-stitched pseudo-table is DISCLOSED rather than silently rebuilt as N separate
+        # tables. Tableau cannot put several independently table-calculated measures in one view, so
+        # the author lays N sheets in a contiguous band and hides the row labels on all but the
+        # first, making the dashboard read as ONE table. Power BI does that natively in a single
+        # matrix -- but the rebuild currently emits one table per sheet, which repeats the row-label
+        # column N times and breaks the illusion the author built.
+        #
+        # Detection is exact (see :func:`detect_stitched_table_band`) and is verified to fire on the
+        # stitched case while declining BOTH near-misses in the same workbook: a single-sheet measure
+        # trellis, and a bar-mark band whose category axes the engine already suppresses correctly.
+        # Until the merge lands, naming it is strictly better than a silently wrong layout -- the
+        # difference is visible on the page and invisible to every validator.
+        for _band in detect_stitched_table_band(db, ws_by_name):
+            warnings.append(_warn(
+                "dashboard", db["name"],
+                "container-stitched table: %d worksheets (%s) sit in one contiguous band sharing a "
+                "row dimension, with the row labels hidden on every sheet but %r -- in Tableau that "
+                "reads as ONE table. They are rebuilt as %d separate tables, so the row-label column "
+                "repeats %d times. Power BI expresses this natively as a single matrix with %d value "
+                "columns; merge them there to restore the source's appearance"
+                % (len(_band["members"]), ", ".join(repr(m) for m in _band["members"]),
+                   _band["leader"], len(_band["members"]), len(_band["members"]),
+                   len(_band["members"]))))
+        # A container-stitched pseudo-table is MERGED into one visual rather than rebuilt as N
+        # separate tables. Tableau cannot put several independently table-calculated measures in one
+        # view, so the author lays N sheets in a contiguous band and hides the row labels on all but
+        # the first, making the dashboard read as ONE table. Power BI does that natively, so the
+        # faithful rebuild is a merge: the leader's zone widens to the whole band, the followers'
+        # measures join its Values, and each member's conditional formatting comes with it, bound to
+        # its own column.
+        #
+        # Detection is exact (see :func:`detect_stitched_table_band`) and declines BOTH near-misses
+        # in the same source workbook: a single-sheet measure trellis, and a bar-mark band whose
+        # category axes the engine already suppresses correctly.
+        _band_leader, _band_follow, _band_zone = {}, {}, {}
+        for _band in detect_stitched_table_band(db, ws_by_name):
+            _lead = _band["leader"]
+            _band_leader[_lead] = [ws_by_name[m] for m in _band["members"][1:] if m in ws_by_name]
+            _band_zone[_lead] = _stitched_band_zone(_band["zones"])
+            for _m in _band["members"][1:]:
+                _band_follow[_m] = _lead
+            warnings.append(_warn(
+                "dashboard", db["name"],
+                "container-stitched table: %d worksheets (%s) sat in one contiguous band sharing a "
+                "row dimension with the row labels hidden on every sheet but %r -- in Tableau that "
+                "reads as ONE table. Rebuilt as a SINGLE visual with %d value columns, Power BI's "
+                "native form, so the row-label column appears once as the author intended rather "
+                "than %d times. Each column keeps its own conditional formatting"
+                % (len(_band["members"]), ", ".join(repr(m) for m in _band["members"]),
+                   _lead, len(_band["members"]), len(_band["members"]))))
         card_ws = []
         for i, zone in enumerate(zones):
             ws = ws_by_name.get(zone["worksheet"])
@@ -12860,12 +13345,23 @@ def emit_pbir(ir, *, dataset_name="Model", report_name="Report",
                     warnings.append(_warn("worksheet", ws["name"], _reason))
                 continue
             placed.add(ws["name"])
+            # A band FOLLOWER contributes its measure to the leader's merged visual and emits no
+            # visual of its own. Marked placed above, so it does not fall through to the
+            # standalone-worksheet pass and reappear as its own page.
+            if ws["name"] in _band_follow:
+                continue
+            _band_followers = _band_leader.get(ws["name"]) or []
+            if _band_followers:
+                zone = _band_zone.get(ws["name"], zone)
             state = _build_query_state(ws, model_table, field_map, warnings)
             if not _query_state_complete(ws["visual_type"], state):
                 warnings.append(_warn(
                     "worksheet", ws["name"],
                     f"{ws['visual_type']} visual has no usable field bindings (skipped)"))
                 continue
+            _band_states = merge_stitched_band_state(
+                state, ws, _band_followers, model_table, field_map, warnings) \
+                if _band_followers else []
             page_ws.append(ws)
             x, y, w, h = _scale_zone(zone, ref_w, ref_h)
             vname = _sanitize(f"v-{page_name}-{i}-{ws['name']}")
@@ -12907,10 +13403,21 @@ def emit_pbir(ir, *, dataset_name="Model", report_name="Report",
                     # the model's hex-returning colour twin instead -- font or background per the
                     # Tableau mark. Only consulted when the gradient path emitted nothing, so a
                     # heat table is byte-unchanged.
-                    _dc_objects, _dc_fact = _matrix_discrete_measure_colour(
-                        ws, state, model_table, field_map, warnings, _param_values)
-                    if _dc_objects:
-                        value_objects, cf_fact = _dc_objects, _dc_fact
+                    if not _band_states:
+                        _dc_objects, _dc_fact = _matrix_discrete_measure_colour(
+                            ws, state, model_table, field_map, warnings, _param_values)
+                        if _dc_objects:
+                            value_objects, cf_fact = _dc_objects, _dc_fact
+                # Each band member owns ONE column and ONE rule. Computed against that member's own
+                # state so its selector names only its own measure, then the calculation it declared
+                # is ported onto the merged state so the SelectRef resolves.
+                for _mw, _mstate in _band_states:
+                    _mo, _mf = _matrix_discrete_measure_colour(
+                        _mw, _mstate, model_table, field_map, warnings, _param_values)
+                    if _mo:
+                        _mo = port_band_member_projections(state, _mstate, _mo)
+                        value_objects = list(value_objects or []) + list(_mo)
+                        cf_fact = cf_fact or _mf
             data_point_objects, mc_fact = _data_point_colors(
                 ws, state, ws["visual_type"], model_table, field_map, warnings)
             cont_objects, cont_fact = _chart_discrete_measure_fill(

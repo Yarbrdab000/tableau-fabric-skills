@@ -181,6 +181,128 @@ The same rule applies to the measuring apparatus, not just the artifact:
   input unchanged on no match. Both silently no-op. Assert the match count, and read back what you
   wrote.
 
+### Read every confirmation at the artifact, never at the mechanism
+
+The single rule the ones above are instances of. A gate going red, a trace firing, a test passing, a
+validator returning zero errors — **all four confirm only that something you built responded.** None
+of them says the file a user opens changed. Four ways this bit us in one day, in four different
+lanes:
+
+* a **gate** keyed on a proxy passed forever, because its input set included the artifact under test
+  (`git rev-list --all` counts `refs/tags`, so every rollback anchor vouched for itself);
+* a **trace** confirmed a helper firing exactly as designed — 4 calcs in, 2 aliases matched, 1
+  rewritten — while the emitted measure stayed `= BLANK()`, because the consumer read a different
+  list;
+* **eighteen tests** passed on a feature that was completely inert, because the facts it read did not
+  exist at the moment it ran;
+* an **isolated emitter** returned three correct objects, and the page was still wrong, because a
+  later pass overwrote them.
+
+Every one of those was a true statement about the mechanism and a false impression about the output.
+
+So the proving sequence is: **(1)** it passed → no evidence until you have seen it red; **(2)** it
+went red → no evidence until the defect is one its *neighbours* do not already catch; **(3)** (2) is
+only measurable on the **full** suite, with an injection that is valid in every *other* respect —
+otherwise the failure count is uninterpretable. In this repo a source-level injection is a **two-tree
+edit**: patch canonical only and mirror parity fails too, and you cannot tell your sloppiness from
+the finding.
+
+Clause 3 is the one that gets broken, and not by carelessness: running the single file is *correct*
+while you are iterating, and the moment of proving is exactly when you are deepest in that file. The
+habit and the requirement point in opposite directions, so attach the discipline to the **proof
+step** — "I am about to claim this is proved" triggers a full-suite run, the way "I am about to claim
+this is green" already does.
+
+**(4) A per-commit gate is structurally blind to a defect that lives in the RELATION between two
+artifacts.** Clauses 1–3 ask whether a gate can detect a defect *in* something. This is a different
+axis: a defect where each artifact is individually valid and only the arrangement is wrong. Observed
+live — two parallel sessions, one CHANGELOG entry declaring `2.227.0 → 2.230.0` and another declaring
+`2.227.0 → 2.228.0`. Each commit passed the chain gate in isolation, because the gate checks
+*predecessor equality*, not increment-by-one; the chain was broken only at the seam where the two
+branches met. `git rebase --exec` proves every commit green independently and says **nothing** about
+the order they land in, so "green at every commit" is a weaker claim than it sounds. This one is not
+fixable inside the gate — it needs the integration step to look at both sides — but knowing it is
+what stops the claim being overstated.
+
+### Prefer the failure mode a reader can detect
+When a faithful translation is unavailable, the choice is not between right and wrong but between two
+wrongs, and the tiebreak is **which one is legible to the person looking at the report**. Two
+decisions reached this from opposite directions on the same day:
+
+* `ATTR()` had no Power BI equivalent, so the pill was being **dropped**. Rebuilding it as `MIN` is
+  exact wherever the value is unique (which is what `ATTR` asserts) and differs only where Tableau
+  itself prints `*`. Wrong-in-one-case beats absent-in-every-case: *a reader cannot notice a missing
+  value, but can notice a minimum.*
+* A date axis on a table the generated calendar had skipped was being **bound anyway**, producing a
+  flat line at the grand total. Declining the calendar binding gives a plainer axis with no
+  hierarchy. Plainer-but-correct beats confidently-wrong: *a flat series looks like data.*
+
+One prefers the visible-but-imperfect over the absent; the other prefers the plain over the
+plausible. Both pick the outcome whose wrongness is **detectable**, which is the rule underneath.
+
+### When you find a defect, record the nearest artifact that does NOT have it
+
+The pair outlives the theory. A defect was filed against corpus workbook `0133` with the note *"the
+sibling `0132` rebuilds all four correctly, so the difference is something about the multi-dashboard
+workbook"*. **That explanation was wrong** — it had nothing to do with multiple dashboards; the two
+workbooks differ in one Tableau menu choice, *Apply to → All Worksheets Using This Data Source*,
+which hoists the filter out of the worksheet into a workbook-level `<shared-views>` element the
+parser never read.
+
+The mistaken theory cost nothing, because what had been written down was the **pair**. Instrumenting
+both at the same seam gave the answer in one probe: the dashboard zone tokens were byte-identical and
+only the resolver map differed, 3 entries against 0. That converted *"filter cards are flaky on this
+workbook"* into *"the parse never produced the filters"*.
+
+So when something is wrong on one artifact, the highest-value thing to write beside it is the
+**nearest artifact where it is right** — even when your account of why is mistaken, and even when you
+are not going to fix it now. A control you already have is worth more than an explanation you might
+have to retract, and it is the cheapest form of the *"vary one thing"* discipline: you are not
+building a control, you are noticing one.
+
+### A keyword search can only disprove the word you chose
+
+A parked note read: *"grand total at TOP and whole numbers — neither is in the `.twb` XML; searched:
+`grand` appears only in product names."* Both halves were wrong, and the investigation stayed closed
+for days on the strength of them. Tableau writes:
+
+```xml
+<rows onTop='true' total='true'>
+```
+
+`total` is the on/off and `onTop` is the position. One parse found both instantly.
+
+The failure mode is specific and worth naming separately from the other inference errors: the search
+term came from the **target** system's vocabulary (Power BI says *"grand total"*) and was run against
+the **source** system's serialisation, which uses different words for the same concept. A negative
+keyword result is therefore evidence about your guess, never about the artifact. Parsing has no such
+mode, because it enumerates what is present instead of asking whether one guess is.
+
+Two habits follow. **Enumerate before concluding absent** — list the attributes actually on the
+elements you care about, and read them. And **look the target property up rather than infer it**:
+`powerbi-report-author formatting describe-object <visualType> <object>` is a real schema oracle, and
+it also answers *"does this visual type even HAVE this object"*, which is the question behind a
+`PBIR_FORMATTING_OBJECT_UNKNOWN`.
+
+**Emitting nothing is a decision, not neutrality.** The same release found Power BI's table showing a
+total row *by default*, so 42 emitted grids inherited a row their Tableau source never displayed —
+an addition, which is harder to notice than an omission because it looks like data. Whenever a
+platform default exists, "we did not set it" and "we chose the default" are the same artifact.
+
+### Structurally valid, semantically absent
+
+The defect family that no structural gate can see, because the artifact is *well-formed and says
+nothing*. Three sightings from three unrelated lanes, all found only by reading content:
+
+* a calc that stubs to `= BLANK()` — it **binds normally**, so every binding check passes while the
+  visual renders empty and fidelity reports `{"status": "rebuilt", "reason": null}`;
+* a CHANGELOG entry that is a header with no body — unique version, continuous chain, correct stamp,
+  and it documents nothing;
+* a visual whose `SelectRef` names a projection that no longer resolves.
+
+Ask *"does this emitted artifact say anything"*, not *"is it well-formed"*. The two questions have
+different answers far more often than they look like they should.
+
 ---
 
 ## Security

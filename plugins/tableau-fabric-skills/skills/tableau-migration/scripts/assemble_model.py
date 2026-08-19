@@ -1167,6 +1167,162 @@ def _param_predicate_flags(calcs, resolve, param_resolver, *, known_tables,
     return flag_measures, filter_bindings
 
 
+def _apply_relationship_column_aliases(calcs, aliases):
+    """Rewrite each calc's qualified field references onto the plain captions declared equal to them.
+
+    ``aliases`` is ``{qualified_caption: plain_caption}`` from
+    :func:`connection_to_m.relationship_column_aliases`, which records a pair ONLY when the
+    workbook's object-graph declares a single-column ``=`` between them.
+
+    Returns the list unchanged (same objects) when there is nothing to do, so a workbook without this
+    shape stays byte-for-byte identical. A rewritten calc is a COPY carrying ``formula_original``, so
+    the authored text survives for annotation and reporting -- the model should still show what the
+    author wrote, not what we translated.
+
+    Substitution is bracket-delimited (``[<caption>]``), never a bare-token replace: a bare replace of
+    ``Region`` would corrupt ``Region (Custom SQL Query2)`` itself, and any caption containing it.
+    Longest captions are substituted FIRST so a qualified name is never partially rewritten by a
+    shorter alias that happens to be its prefix.
+    """
+    if not aliases or not calcs:
+        return calcs
+    ordered = sorted(aliases.items(), key=lambda kv: len(kv[0]), reverse=True)
+    out, changed = [], False
+    for calc in calcs:
+        formula = (calc or {}).get("formula") or ""
+        new = formula
+        for far, near in ordered:
+            new = new.replace("[%s]" % far, "[%s]" % near)
+        if new != formula:
+            calc = dict(calc)
+            calc["formula_original"] = formula
+            calc["formula"] = new
+            changed = True
+        out.append(calc)
+    return out if changed else calcs
+
+
+def _aggregate_predicate_flags(calcs, resolve, param_resolver, *, known_tables,
+                               reserved_names=None, skip_lower=None, resolve_for=None):
+    """Recognize an AGGREGATE boolean calc of parameter(s) used as a keep-filter.
+
+    The third sibling of :func:`build_date_window_flags` / :func:`_param_predicate_flags`, for the
+    shape neither of those can see: a boolean whose predicate is an AGGREGATE, e.g.
+    ``IF SUM([Sales]) > [Parameters].[Sales Param] THEN TRUE ELSE FALSE END`` dropped on the filter
+    shelf with ``member='true'`` -- "keep only the customers whose total sales clear the parameter".
+
+    Why it needs its own pipeline rather than a widened gate on ``_param_predicate_flags``: that one
+    is ROW-level by construction (it asks the *column* translator for a pure boolean and wraps the
+    result in ``COUNTROWS(FILTER(...))``), and an aggregate cannot be evaluated per row. The faithful
+    Power BI shape is the opposite one -- a keep-flag MEASURE filtered at the visual's own grain::
+
+        ``<Calc> Flag = IF(<measure-mode boolean>, 1)``   (1 keep / BLANK drop)
+
+    which is exactly Tableau's semantics: the aggregate is computed at the viz level of detail, so a
+    bar chart grouped by customer keeps the customers whose own ``SUM([Sales])`` clears the parameter.
+    Consequently the binding deliberately carries **no** ``row_filter``: the downstream
+    ``_apply_row_predicate_wrapped_measures`` pass must NOT rewrite this into
+    ``CALCULATE(<agg>, FILTER(<table>, <pred>))``, because pushing an aggregate predicate to row grain
+    changes the answer.
+
+    Fail-closed and PROVABLY DISJOINT from the row-level pipeline: a calc qualifies only when it
+    references a parameter, the COLUMN translator does **not** yield a boolean (so the row-level path
+    could never have claimed it), and the MEASURE translator does (``dtype == "bool"``). ``skip_lower``
+    excludes calcs an earlier flag pipeline already consumed. Returns ``(flag_measures,
+    filter_bindings)`` in the shape the other two return, so all three merge directly. Empty when
+    nothing matched, so a workbook without this shape stays byte-for-byte identical.
+    """
+    flag_measures, filter_bindings = [], {}
+    if not param_resolver:
+        return flag_measures, filter_bindings
+    reserved_lower = {(r or "").lower() for r in (reserved_names or set())}
+    skip_lower = {(s or "").lower() for s in (skip_lower or set())}
+    _island_dss = {(c or {}).get("datasource") for c in (calcs or [])}
+    _island_dss = {d for d in _island_dss if d}
+
+    def _rc(calc):
+        if not resolve_for:
+            return resolve
+        return _best_scoped_resolver(
+            (calc or {}).get("formula", ""), (calc or {}).get("datasource"),
+            resolve_for, _island_dss, resolve)
+
+    for calc in calcs or []:
+        name = calc.get("name")
+        formula = calc.get("formula")
+        if not name or not formula or not formula.strip():
+            continue
+        cid = _calc_id_key(calc)
+        if name.lower() in skip_lower or (cid and cid in skip_lower):
+            continue
+        if "[parameters]" not in formula.lower():
+            continue
+        rc = _rc(calc)
+        # DISJOINTNESS, asserted rather than assumed: if the column translator can render this as a
+        # boolean it belongs to the row-level pipeline, which runs first and owns it.
+        _cpred, _cr, _ct, cdtype = translate_tableau_calc_to_column_dax_typed(
+            formula, rc, known_tables=known_tables, param_resolver=param_resolver)
+        if _cpred and cdtype == "bool":
+            continue
+        cond, _reason, _tables, dtype = translate_tableau_calc_to_dax_typed(
+            formula, rc, param_resolver=param_resolver, known_tables=known_tables)
+        if not cond or dtype != "bool":
+            continue
+        raw_cid = str(calc.get("internal_name") or "").strip().strip("[]").strip()
+        src_id = raw_cid or name
+        base_name = name if name.lower() not in reserved_lower else f"{name} Flag"
+        measure_name, i = base_name, 2
+        while measure_name.lower() in reserved_lower:
+            measure_name = f"{base_name} {i}"
+            i += 1
+        reserved_lower.add(measure_name.lower())
+        # The translated boolean is INLINED rather than referenced as ``IF([<calc>], 1)``: the sibling
+        # measure's name/home table is decided by a later pass, so a reference would be a proxy for a
+        # fact this function cannot yet observe. Inlining keeps the flag self-contained and correct.
+        dax = f"IF({cond}, 1)"
+        translated_by = "deterministic (parameter-driven aggregate filter)"
+        param_internal = None
+        m = _PARAM_REF_RE.search(formula)
+        if m:
+            param_internal = m.group(1).strip()
+        report_row = {
+            "measure": measure_name,
+            "status": "translated",
+            "reason": None,
+            "dax": dax,
+            "tableau_formula": formula,
+            "translated_by": translated_by,
+            "source": {
+                "kind": "calc_column",
+                "model_table": "_Measures",
+                "field_caption": name,
+                "calc_instance_token": src_id,
+                "intent": "measure",
+            },
+        }
+        flag_measures.append({
+            "measure": measure_name,
+            "dax": dax,
+            "tableau_formula": formula,
+            "translated_by": translated_by,
+            "source_calc_name": name,
+            "source_calc_id": src_id,
+            "report_row": report_row,
+        })
+        filter_bindings[name] = {
+            "model_table": "_Measures",
+            "measure_name": measure_name,
+            "status": "translated",
+            "predicate": {"op": "==", "value": 1},
+            "value": 1,
+            "calc_id": src_id,
+            "param_internal": param_internal,
+            # No ``row_filter``: an aggregate predicate must stay a visual-grain keep-flag.
+            "aggregate": True,
+        }
+    return flag_measures, filter_bindings
+
+
 def _measures_part(calcs, resolve, consumed=None, param_resolver=None, *,
                    calc_lookup=None, approved_calc_dax=None, synth_measures=None,
                    known_tables=None, table_calc_usages=None, order_resolver=None,
@@ -2706,7 +2862,7 @@ def _select_primary_date(date_cols):
 # to NO table while `pmdm__Stage__c` binds to the Intake island's copy of ProgramEngagement, and a
 # calc spanning two tables is refused. The proper fix is ISLAND-SCOPED FIELD RESOLUTION -- a calc
 # binds within its own datasource no matter how many calendars exist -- which keeps both wins.
-PER_ISLAND_DATE_ENABLED = False
+PER_ISLAND_DATE_ENABLED = True
 
 
 # The placeholder partition an untranslatable connector emits: ``#table(type table [], {})``. This
@@ -2816,6 +2972,13 @@ def _build_date_dimensions(tables, emitted_names, relationships, *, mark_as_date
         built.append((name, part))
         taken.append(name)
         all_rels.extend(rels)
+        # ``island`` is the datasource CAPTION, which is also what a resolved report field carries as
+        # its own ``datasource``. That pairing is what lets the report binder send each date pill to
+        # ITS island's calendar. Deliberately NOT keyed on relation names: the same relation
+        # (``pmdm__ProgramEngagement__c``) exists in all four Salesforce islands, so a relation-name
+        # key is ambiguous and resolving it "first wins" bound an Intake pill to the Service Delivery
+        # calendar -- a cross-island rebind with no active join, i.e. the flat series this split
+        # exists to prevent.
         reports.append(dict(report, island=ds))
     return built, all_rels, {"generated": bool(built), "per_island": True,
                              "tables": [n for n, _ in built], "islands": reports}
@@ -2854,14 +3017,27 @@ def _build_date_dimension(tables, emitted_names, relationships, *, mark_as_date=
     pure_dims = {t for t in to_tables if t and t not in from_tables}
 
     by_table = []  # (display_name, [date col model_name, ...]) for eligible tables, in order
+    # Date columns on tables the calendar deliberately SKIPS (a pure dimension, or a table that never
+    # landed). They get no relationship, so nothing can propagate a calendar filter to them -- and the
+    # report binder identifies a date pill by COLUMN NAME alone, so a skipped table whose date column
+    # shares a name with some other table's ACTIVE date is rebound onto the calendar anyway and every
+    # bucket returns the grand total (a flat line / solid block, confidently wrong and unwarned).
+    # Reported so ``migrate_estate._date_binding_from_model`` can contest those names. Measured on
+    # Salesforce NPSP: ``caseman__Intake__c`` is only ever the ``one`` side of ``Case ->
+    # caseman__Intake__c.Id``, so it is a pure dim with no calendar join, yet it carries
+    # ``CreatedDate`` -- which IS active on Case / caseman__Goal__c / ProgramEngagement (Intake) --
+    # and its Month axis rebound to ``Date[Month Start]`` and flattened.
+    unrelated = []
     for rel in tables:
         disp = _table_display(rel)
-        if not disp or disp.lower() not in emitted or disp.lower() in pure_dims:
-            continue
         date_cols = [c["model_name"] for c in (rel.get("columns") or [])
                      if c.get("tmdl_type") == "dateTime"]
-        if date_cols:
-            by_table.append((disp, date_cols))
+        if not date_cols:
+            continue
+        if not disp or disp.lower() not in emitted or disp.lower() in pure_dims:
+            unrelated.extend({"table": disp or "", "column": c} for c in date_cols)
+            continue
+        by_table.append((disp, date_cols))
 
     if not by_table:
         return None, None, [], {"generated": False, "reason": "no fact date columns"}
@@ -2993,6 +3169,10 @@ def _build_date_dimension(tables, emitted_names, relationships, *, mark_as_date=
     part = T.generate_date_table_tmdl(date_name, mark_as_date=mark_as_date, source_expr=source_expr)
     report = {"generated": True, "table": date_name, "mark_as_date": mark_as_date,
               "relationships": details, "warnings": warnings}
+    if unrelated:
+        # Additive: present only when a skipped table actually carries a date column, so every
+        # model without one keeps its report byte-for-byte.
+        report["unrelated_date_columns"] = unrelated
     return date_name, part, rels, report
 
 
@@ -4125,6 +4305,7 @@ def assemble_import_model(descriptor, *, model_name, calcs=None, dim_calcs=None,
                     else (descriptor.get("relationships") or []))
     date_report = {"generated": False, "reason": "date_table disabled"}
     date_name = None
+    date_table_names = []
     active_date_cols = set()
     if date_table:
         _date_built, date_rels, date_report = _build_date_dimensions(
@@ -4138,6 +4319,11 @@ def assemble_import_model(descriptor, *, model_name, calcs=None, dim_calcs=None,
             # single one (date-hierarchy wiring, the model manifest). With one island -- every
             # single-datasource workbook -- that is the only calendar, exactly as before.
             date_name = _date_built[0][0]
+            # ...but the CONFORMED-HUB set must name EVERY calendar (see the conformed_hubs
+            # assignment below). A calendar is a degenerate hub whether or not it happens to be the
+            # first one built, and any hub left un-excluded manufactures spurious co-occurrence
+            # paths that force a false-ambiguity stub in _unique_countd_path.
+            date_table_names = [n for n, _ in _date_built]
             all_rels = all_rels + date_rels
             active_date_cols = {(r["from_table"], r["from_col"])
                                 for r in date_rels if r.get("is_active")}
@@ -4159,6 +4345,13 @@ def assemble_import_model(descriptor, *, model_name, calcs=None, dim_calcs=None,
     # measure-calc + dim-calc names) so emitted objects never collide. With no parameters and no
     # detectable swaps this whole block is inert: consumed is empty and param_resolver is None, so
     # the calc/measure output below is byte-for-byte identical to the no-parameter path.
+    # ``calcs``/``dim_calcs`` are rewritten (not just the merged ``all_calcs``) because measure and
+    # column emission read those lists DIRECTLY -- rewriting only the merged copy left the alias
+    # visible to the flag pipelines and invisible to ``_measures_part``, so the calc still stubbed.
+    calcs = _apply_relationship_column_aliases(
+        calcs, (descriptor or {}).get("column_aliases"))
+    dim_calcs = _apply_relationship_column_aliases(
+        dim_calcs, (descriptor or {}).get("column_aliases"))
     all_calcs = list(calcs or []) + list(dim_calcs or [])
     measure_names = [c.get("name") for c in (calcs or []) if c.get("name")]
     # Home table for each CALCULATED COLUMN this build will emit, so a swap branch can bind to one.
@@ -4280,6 +4473,23 @@ def assemble_import_model(descriptor, *, model_name, calcs=None, dim_calcs=None,
         skip_lower=_band_flag_sources, resolve_for=_raw_scoped_resolver)
     flag_measures.extend(_pred_flags)
     for _tok, _spec in _pred_bindings.items():
+        filter_bindings.setdefault(_tok, _spec)
+    # AGGREGATE parameter boolean filter -> keep-flag measure + binding (the peer of the row-level
+    # pipeline above for e.g. ``IF SUM([Sales]) > [Parameters].[X] THEN TRUE ...`` used as a
+    # member='true' filter). Runs LAST and skips every calc the two earlier pipelines consumed, and
+    # additionally refuses any calc the column translator can render as a boolean -- so the row-level
+    # and aggregate paths are disjoint by construction rather than by ordering luck.
+    _row_flag_sources = set(_band_flag_sources)
+    for _fm in _pred_flags:
+        for _k in (_fm.get("source_calc_name"), _fm.get("source_calc_id")):
+            if _k:
+                _row_flag_sources.add(_k)
+    _agg_flags, _agg_bindings = _aggregate_predicate_flags(
+        all_calcs, resolve, param_resolver, known_tables=set(table_names),
+        reserved_names=reserved | {(fm.get("measure") or "").lower() for fm in flag_measures},
+        skip_lower=_row_flag_sources, resolve_for=_raw_scoped_resolver)
+    flag_measures.extend(_agg_flags)
+    for _tok, _spec in _agg_bindings.items():
         filter_bindings.setdefault(_tok, _spec)
     flag_source_names = set()
     for _fm in flag_measures:
@@ -4443,7 +4653,7 @@ def assemble_import_model(descriptor, *, model_name, calcs=None, dim_calcs=None,
     # collapses those spurious paths, leaving the real FK path. C/F in a COUNTD-IF are always entity
     # tables (never Date), so this can only remove co-occurrence paths, never a genuine FK path
     # (fail-closed: a pair with no real FK path still correctly stubs).
-    conformed_hubs = {date_name} if date_name else None
+    conformed_hubs = set(date_table_names) if date_table_names else None
     measures_table, measure_report, assisted_suggestions = _measures_part(
         calcs, measure_resolve, consumed=consumed, param_resolver=param_resolver,
         calc_lookup=calc_lookup if calc_lookup is not None else _calc_lookup_from(calcs),

@@ -12,7 +12,775 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ## [Unreleased]
 
+### Fixed
+
+- **`tableau-migration` (skill `2.258.0` → `2.260.0`): separate Tableau datasources now get separate
+  calendars — the months-old blocker, root-caused.** A Tableau workbook can hold several
+  datasources, and Tableau never lets one datasource's filters reach another's marks. Power BI has no
+  such boundary and *requires* a marked date table, so the rebuild fabricated **one** calendar and
+  wired it to facts in every datasource — silently giving a date slicer reach the source never had.
+  Measured on Salesforce NPSP: one `Date` table related to **10 facts across all four** datasources.
+
+  The per-datasource fix was written months ago and switched **off**, because enabling it cost three
+  calculations (119 → 116 translated). The recorded suspicion was calc *field-resolution
+  tie-breaking*. **That was the wrong mechanism.** The emitted table sets are identical apart from the
+  calendars, and `Record ID` — the field blamed for it — resolves to no table in *either* build.
+
+  The real cause is one line:
+
+  ```python
+  conformed_hubs = {date_name} if date_name else None      # date_name = _date_built[0][0]
+  ```
+
+  A generated calendar is a **degenerate hub**: every fact joins its dates into the shared key, so any
+  two facts look "connected" by same-calendar co-occurrence. `_unique_countd_path` therefore excludes
+  calendars as transit nodes — but the exclusion set was built from **one** name. With four calendars
+  it named the first and left three live hubs, so the spurious paths returned, `COUNTD(IF ...)` saw
+  false ambiguity, and three calcs stubbed. Naming **every** calendar as a hub restores **119/158**,
+  with a `needs_review` set byte-identical to the single-calendar build — the same three calcs, not
+  merely the same total.
+
+  Enabling the split then exposed a second defect: `_date_binding_from_model` gated on `table`
+  (singular), which a per-island report does not carry, so date binding switched **off** for the whole
+  workbook — `0073` 6 → 0, `0088` 5 → 0, `0079` 1 → 0 calendar-bound refs. Per-island reports now emit
+  `by_island`, and the binder sends each pill to its own island's calendar.
+
+  **Keyed on the DATASOURCE — the first attempt keyed on the relation name and was wrong.**
+  `pmdm__ProgramEngagement__c` is a table in all four Salesforce islands, so an entity key collides;
+  resolving it "first wins" bound an **Intake** pill to the **Service Delivery** calendar — a calendar
+  with no active join to that fact, i.e. the flat series this split exists to remove. It presented as
+  an *improvement* (the corpus count read 6, up from 5). A resolved field carries its own
+  `datasource`, and the model tags each relation with `source_datasource`; that pair is the only
+  identifier both sides genuinely share. An unattributable pill now **declines** rather than binding
+  to an arbitrary calendar.
+
+  **Corpus of 34:** 1606 → 1612 files, 11 added / 5 removed (each `Date.tmdl` → one calendar per
+  datasource), 24 differing — confined to the **5** multi-datasource workbooks plus 3 metadata files.
+  **29 workbooks untouched.** Calc coverage identical at **216/287**; calendar-bound refs identical at
+  **59**; cross-island flat series on `0088`: **0**. Injecting the one-calendar hub set fails exactly
+  one test out of 4,989 — the new one — so no neighbour already catches it.
+
+  Still open, and deliberately not claimed as fixed: this restores **isolation**, not the inactive
+  date joins. `0088` keeps 5 active / 11 inactive, because a table with two date columns (`StartDate`
+  *and* `EndDate`) can still have only one active relationship to a given calendar.
+
+- **`tableau-migration` (skill `2.257.0` → `2.258.0`): Snowflake custom SQL emits the drilled native
+  query instead of an empty-table scaffold (#162).** A Snowflake `custom_sql` relation landed as
+  `Source = #table(type table [], {})` — a model that opens, validates, and returns nothing. In one
+  reader's 46-asset estate that literal marker appeared in **40 tables across 33 of 46 assets
+  (~72%)**, making it the largest single source of manual completion on a Snowflake migration.
+
+  **Measured before changing anything, at the artifact rather than the gate:** emitting both
+  partitions for a synthetic Snowflake descriptor showed the TABLE path *already* producing the exact
+  drill (`Source{[Name=<db>, Kind="Database"]}[Data]`) while the custom-SQL path scaffolded. So the
+  branch was reaching the scaffold on `cls in NATIVE_QUERY_CATALOG_DRILL` alone, not for want of an
+  emitter — one set membership.
+
+  **The exclusion was deliberate and its promotion bar was written down**: *"unverified against live
+  … promotion is a one-line addition once a connector's drilled native query is confirmed live."*
+  #162 supplies exactly that, and the comment now records **whose** live instance, because it changes
+  what the claim is worth: a reader's SHIPPED model emits this shape across 2 workbooks / 10+ tables
+  including ~90-line multi-join SQL, and the same shape was derived independently from the
+  connector's navigation semantics. The three recorded doubts are each answered rather than waived —
+  the drilled-handle capability *is* the shipped shape; the mandatory warehouse is already threaded
+  (`Snowflake.Databases(#"Server", #"Warehouse")` on the table path today); and uppercase identifier
+  folding is untouched, because the SQL passes through verbatim apart from M string escaping.
+
+  Emitted output is shape-identical to the reader's shipped model, and the native query runs against
+  the **drilled** handle — the root collection rejects native queries outright.
+
+  **Fail-closed preserved:** a custom-SQL relation has no three-part name, so it can only take the
+  connection's database; when that is absent the partition still scaffolds with a specific reason
+  rather than inventing a catalog. Pinned by test.
+
+  **Two existing tests asserted the opposite and were rewritten, not deleted** —
+  `test_emit_snowflake_custom_sql_still_scaffolds` and
+  `test_snowflake_custom_sql_is_flagged_needs_review`. Both were *correct when written*; the
+  assertion changed because the evidence changed, and each now says so in place. Their real intent —
+  *an unverified connector fails loud at build time* — is preserved against **Oracle**, which still
+  hits the same branch. That exemplar was itself chosen by measurement: the first attempt used
+  Redshift and failed, because Redshift is a `server_database` connector reaching an
+  already-verified branch and proving nothing about this gate.
+
+  **Inert on the corpus by construction, not by diff:** parsing every `<connection class=…>` across
+  the 34 staged workbooks gives **0 using Snowflake** (29 excel-direct, 9 federated, 1 databricks…).
+  A change that cannot fire is a stronger statement than a diff that happens to show nothing — and it
+  names the real gap: this path has no corpus coverage at all, exactly like Custom SQL before `0136`.
+
+  Suite 4988 → **4995**.
+
 ### Added
+
+- **`tableau-migration` (skill `2.254.0` → `2.257.0`): a keyword search can only disprove the word you
+  chose, and the block protocol gains a timing rule.** Docs-only; no code, no corpus change.
+
+  **The search that closed an investigation.** A parked note read *"grand total at TOP and whole
+  numbers — neither is in the `.twb` XML; searched: `grand` appears only in product names"*, and the
+  work stayed closed for days on it. Tableau writes `<rows onTop='true' total='true'>` — `total` is
+  the on/off, `onTop` is the position — and one parse found both instantly. The failure mode is
+  specific enough to name separately from the other inference errors already recorded: **the search
+  term came from the TARGET system's vocabulary** (Power BI says *"grand total"*) **and was run
+  against the SOURCE system's serialisation**, which uses different words for the same concept. A
+  negative keyword result is evidence about your guess, never about the artifact. Parsing has no such
+  mode because it enumerates what is present rather than asking whether one guess is.
+
+  Two habits recorded with it: enumerate the attributes actually on the elements you care about
+  before concluding absent, and **look the target property up** —
+  `powerbi-report-author formatting describe-object <visualType> <object>` is a real schema oracle
+  that also answers *"does this visual type even have this object"*.
+
+  **Emitting nothing is a decision, not neutrality.** Power BI's table shows a total row by default,
+  so 42 emitted grids inherited a row their Tableau source never displayed. An addition is harder to
+  notice than an omission because it looks like data. Wherever a platform default exists, "we did not
+  set it" and "we chose the default" are the same artifact.
+
+  **Block timing (`AGENTS.md`).** Publishing a block's whole extent up front made its size visible;
+  it did not stop blocks dying, because a block dies the instant the other party's tip passes it
+  whatever its size. The complement is *when*: blocks claimed at the start of a lane died **four
+  times in one day**; a block claimed seconds before committing survived. So **publish fully when you
+  claim, and claim at the release step.** Also recorded there: `refs/tags` is shared across every
+  worktree, so a version collision is also an anchor collision — never `git tag -d` an anchor you did
+  not create, leave a dead block's anchors alone (deletion is the only irreversible step in the
+  ritual), and remember an anchor tells you a version is *claimed*, never that it is unlanded.
+
+  Suite 4988, unchanged (docs-only).
+
+### Fixed
+
+- **`tableau-migration` (skill `2.251.0` → `2.254.0`): a rebuilt table no longer invents a grand total
+  the workbook never showed.** Tableau writes the grand total on the shelf element and never uses the
+  word "grand": `<rows onTop='true' total='true'>`. `total` turns it on; `onTop` puts the row at the
+  TOP. Searching a `.twb` for "grand" finds product names — which is exactly how both facts had been
+  recorded as *"not in the .twb XML"*. That note was an inference from a keyword Tableau does not use;
+  parsing the shelf attributes found both immediately.
+
+  The asymmetry is what makes this matter: **Power BI's table shows a Total row by DEFAULT**, so
+  emitting no toggle is not neutrality, it is a decision — and the wrong one for nearly every view.
+  Measured: **11 of 162 `<rows>` elements across the corpus of 34 declare a grand total** (3
+  workbooks), while **all 42 emitted grid visuals set no toggle** and inherited the default. An extra
+  row of plausible numbers is harder to spot than a missing feature, because it looks like data.
+
+  `total.totals` is now written in **both directions** from the shelf: 61 tables suppress a total
+  their source never declared, 8 keep one it did. The property was looked up in the visual-type
+  schema rather than assumed — a flat `tableEx` exposes exactly one total control, `total.totals`
+  (bool).
+
+  **Position is a platform limit, so it is disclosed rather than silently applied.** `tableEx` has no
+  total-position property at all, and a matrix's `rowSubtotalsPosition` governs per-group *subtotals*,
+  not the grand total. A view that asked for the total on top is rebuilt with it at the bottom and
+  warned, because quietly relocating the one row a reader looks at first is the failure this avoids.
+
+  **Verified by render, as a one-variable A/B** — the same built report, byte-identical but for that
+  one property:
+
+  | `totals` | last row of the table |
+  |---|---|
+  | `true` | `Total  292,296.81  2,326,534.35  38,654` |
+  | `false` | `Tables  -17,753.21  208,020.18  1,261` — no Total row |
+
+  Everything else identical: 17 rows, same values, same conditional colours, same slicers. That is
+  what wrong would have looked like, recorded so the choice is defensible later. A first attempt at
+  this render was worthless and nearly misread — the model was unrefreshed, so the table was empty and
+  "no total" was indistinguishable from "no data"; the A/B only became evidence after a refresh +
+  `reload`.
+
+  **Corpus of 34:** 1606 → 1606 files, 0 added, 0 removed, 72 differing — 69 `tableEx` visuals across
+  the `pbip` and `reports` trees whose only delta is the `totals` property, plus 3 metadata files.
+  Matrices deliberately untouched: their grand-total visibility has no documented toggle, so guessing
+  one would be the confidently-wrong move this release exists to stop.
+
+### Added
+
+- **`tableau-migration` (skill `2.241.0` → `2.251.0`): when you find a defect, record the nearest
+  artifact that does NOT have it.** Docs-only; no code, no corpus change.
+
+  2.241.0 fixed a whole Tableau filter scope that was being dropped, and it was diagnosed in **one
+  probe** because the corpus already held the control: `0132` and `0133` differ in that scope and
+  almost nothing else. Instrumenting both at the same seam showed the dashboard zone tokens
+  byte-identical and only the resolver map differing — 3 entries against 0 — which converted *"filter
+  cards are flaky on this workbook"* into *"the parse never produced the filters"*.
+
+  The reusable part is that **the note filed weeks earlier was wrong about the cause** — it blamed
+  the multi-dashboard structure, when the real difference was one Tableau menu choice (*Apply to →
+  All Worksheets Using This Data Source*, which hoists the filter into a workbook-level
+  `<shared-views>` element). The mistaken theory cost nothing because what had been written down was
+  the **pair**. A control you already have outlives an explanation you may have to retract, and it is
+  the cheapest form of "vary one thing": you are not building a control, you are noticing one.
+
+  **Reach independently re-measured** rather than quoted, and with a better denominator: parsing
+  every `<shared-view>` across the 34 staged workbooks gives **1** using this scope (`0133`, 3 shared
+  filters, 0 worksheet-local). But **18 of 34 carry no filters at all**, so among workbooks that
+  actually filter it is 1 of 16 — thin either way, and worth a purpose-built workbook, since `0133`
+  is currently the only thing standing between this path and a silent regression.
+
+  Suite 4980, unchanged (docs-only).
+
+### Fixed
+
+- **`tableau-migration` (skill `2.236.0` → `2.241.0`): a filter scoped to *All Worksheets Using This
+  Data Source* is no longer lost, and its dashboard cards rebuild.** Tableau serialises filter scope
+  **structurally**, and the two shapes live in different places: *Only This Worksheet* writes
+  `<filter>` inside the worksheet's own `<view>`, while *All Worksheets Using This Data Source*
+  **hoists** the filter out to a workbook-level `<shared-views><shared-view name='<datasource>'>` and
+  leaves each participating sheet only a `<slices><column>` naming the sliced field.
+
+  The parser read worksheet-local `<filter>` elements only. Every filter authored in the second
+  (entirely ordinary) scope therefore vanished — and with it every dashboard filter **card**, because
+  a card is little more than a `(datasource, field-instance)` token that has to resolve through a
+  matching worksheet filter.
+
+  **The control is what makes this provable.** Corpus workbooks `0132` and `0133` differ in this
+  scope and almost nothing else. `0132` keeps three filters on worksheet `Profit` and rebuilt all
+  three slicers; `0133` hoists the byte-identical three into `<shared-views>` and rebuilt **none** —
+  nine cards across three dashboards. Instrumenting both showed the dashboard zone tokens are
+  **identical**; only the resolver map differed, **3 entries against 0**. That is why the failure
+  presented as a filter-card problem and was really a parse problem, and why the fix belongs at the
+  parse seam rather than at the card.
+
+  A sheet inherits a hoisted filter exactly when its own `<slices>` names the column — Tableau's
+  per-sheet record of what it is sliced by — so a sheet that opted out is never handed a filter it
+  does not have, and the inference stays evidence-based rather than "every sheet on this datasource".
+  A worksheet-level filter on the same token always **wins**, so the specific beats the inherited and
+  no column yields two slicers.
+
+  **Corpus of 34:** 1588 → 1606 files, **18 added** (9 cards × the `pbip` and `reports` trees), 0
+  removed, 3 differing (timestamps + the warning count). Thirty-three workbooks untouched. Warned
+  visuals **118 → 109**, exactly the nine. The `added > 0, removed == 0` shape is normally this
+  project's enumeration-failure signature; here the roots were equal-length and the additions are
+  named slicer visuals, so it is genuine codegen.
+
+  Verified at the artifact: each of `0133`'s three dashboards now emits Category + Segment +
+  `Date.Year` beside its existing parameter slicer, laid out non-overlapping — and the date filter
+  correctly rebinds to the calendar's `Year` column rather than the raw datetime.
+
+  **Reach, stated honestly:** only **1 of 34** corpus workbooks uses this scope, so coverage here is
+  thin — but it is a single menu choice in Tableau's filter card, so its real-world frequency is far
+  higher than the corpus implies. What wrong looks like: the broken form does not render a broken
+  slicer, it renders **no** slicer on a page that otherwise looks complete, so the reader never learns
+  an interaction was authored.
+
+### Added
+
+- **`tableau-migration` (skill `2.230.0` → `2.236.0`): two verification rules that only became
+  visible by working in parallel.** Docs-only; no code, no corpus change.
+
+  **A per-commit gate is structurally blind to a defect that lives in the RELATION between two
+  artifacts.** The three clauses recorded in 2.226.0 all ask whether a gate can detect a defect *in*
+  something. This is a different axis. Observed live: two parallel sessions produced CHANGELOG
+  entries declaring `2.227.0 → 2.230.0` and `2.227.0 → 2.228.0`. **Each passed the chain gate in
+  isolation** — it checks predecessor *equality*, not increment-by-one — and the chain was broken
+  only at the seam where the branches met. So `git rebase --exec` proves every commit green
+  independently and says nothing about the order they land in; *"green at every commit"* is a weaker
+  claim than it sounds. Not fixable inside the gate, which can only ever see one commit's copy of the
+  file — it needs the integration step to look at both sides. Recorded so the claim stops being
+  overstated.
+
+  **Prefer the failure mode a reader can detect.** When no faithful translation exists the choice is
+  between two wrongs, and the tiebreak is which one is legible to the person looking at the report.
+  Two decisions reached this from opposite directions in one day: `ATTR()` was being *dropped*, and
+  rebuilding it as `MIN` is wrong only where Tableau itself prints `*` — *a reader cannot notice a
+  missing value, but can notice a minimum*. A date axis on a table the calendar had skipped was being
+  *bound anyway*, producing a flat line at the grand total; declining the binding gives a plainer
+  axis — *a flat series looks like data*. One prefers visible-but-imperfect over absent, the other
+  plain over plausible; both pick the outcome whose wrongness is **detectable**.
+
+  Suite 4971, unchanged (docs-only).
+
+### Fixed
+
+- **`tableau-migration` (skill `2.229.0` → `2.230.0`): a date axis on a table the calendar SKIPPED no
+  longer rebinds to the calendar and flatten.** The report binder identifies a date pill by COLUMN
+  NAME — at that point the field's entity is still the workbook's relation name, not the model's table
+  — so `migrate_estate._date_binding_from_model` publishes `ambiguous_keys`: date columns that are
+  active on one table and not on another that also carries them. The binder declines those, because
+  rebinding the wrong fact onto a calendar that cannot filter it returns the grand total in every
+  bucket: a flat line, unwarned and validate-clean.
+
+  That guard computed its contested population from the date RELATIONSHIPS, so it could only ever see
+  tables that received one. A table the calendar deliberately **skips** — a pure dimension, or one
+  that never landed — has no relationship at all, so it never appeared, and the guard was blind to
+  exactly the shape it exists to catch. *No relationship* is a stronger version of *inactive
+  relationship*, not an exemption from it.
+
+  Measured on Salesforce NPSP: `caseman__Intake__c` is only ever the `one` side of
+  `Case → caseman__Intake__c.Id`, so `_build_date_dimension` excludes it as a pure dimension — yet it
+  carries `CreatedDate`, which is ACTIVE on `Case`, `caseman__Goal__c` and
+  `pmdm__ProgramEngagement__c (Intake)`. Its Month axis rebound to `Date[Month Start]` on a table the
+  calendar cannot filter. Before: 9 calendar-bound visuals, 7 correct, **1 flat series**. After: 5
+  calendar-bound, 4 correct, **0 flat**. The 4 that gave up their calendar binding fall back to the
+  fact's own date column — correct values without the calendar hierarchy, which is the guard's
+  existing miss-over-wrong tradeoff applied consistently rather than a new policy.
+
+  `assemble_model._build_date_dimension` now reports `unrelated_date_columns` (table + column for
+  every date column on a table it skipped); `_date_binding_from_model` folds those into the contested
+  set. Both keys are additive and absent when nothing was skipped, so every model whose date-bearing
+  tables all joined the calendar keeps its report byte-for-byte.
+
+  Same shape as 2.226.0 one layer down: the guard was keyed on a PROXY population (relationships)
+  instead of the real one (every table carrying the column name). What wrong looks like, so this is
+  defensible later: the failing visual rendered a *solid block at the grand total* across all months
+  rather than a monthly series — visibly different from the correct render, not merely absent.
+
+- **`tableau-migration` (skill `2.228.0` → `2.229.0`): `ATTR()` rebuilds as `MIN` instead of being
+  dropped.** Tableau's `ATTR([x])` returns the value when it is unique across the mark's rows and the
+  literal `*` when it is not. Power BI has no such aggregate, and the pill fell through to the
+  unsupported-derivation branch — which **drops it**. Measured on corpus workbook
+  `0135_aggregation_types`: its `ATTR` worksheet emitted a table with only its row dimension and **no
+  value at all**, and `Bar chart Example` — three pills of the same field at three aggregations on
+  one shelf — fanned into **2** side-by-side charts instead of 3.
+
+  **`MIN` is the faithful choice, not the convenient one.** `ATTR` is written precisely when the
+  author expects the value to be constant within the mark, and wherever it *is* constant `MIN(x)`
+  **is** `x` — identical, not approximate. The two differ only when the value is not unique, which is
+  exactly the case Tableau itself flags with `*`. So the degradation is confined to the case the
+  source already calls ambiguous, and it is warned with what changes. Emitting a pill that is wrong
+  in one case beats dropping it in every case: a reader cannot notice a missing value, but can
+  notice a minimum.
+
+  Deliberately **not** added to `_AGG_FUNC`, which would have been the tempting one-liner: that path
+  inherits the `Min`/`Max` type restriction refusing non-numeric columns, and would have dropped
+  precisely the commonest `ATTR` — the one over a string (`ATTR([Region])`), where a text `Min` is
+  both valid in PBIR and exactly the intended answer.
+
+  **The pill count is the proof, which is why `0135` is in the corpus.** After: the `ATTR` sheet
+  carries `Min(Orders.Sales)`, and the trellis emits **3** charts — Sum, disaggregated Column, and
+  Min. A dropped aggregation was a missing chart, not a subtly wrong one, so the gap was countable in
+  the output rather than a matter of judgement.
+
+  **Corpus of 34:** 1586 → 1588 files, **2 added** (the third trellis chart, in both the `pbip` and
+  `reports` trees), 0 removed, 9 differing — every one inside `0135`. Thirty-three workbooks
+  untouched. Roots equal-length (209/209), so the one-sided add is genuine codegen rather than the
+  enumeration artifact that shape usually signals.
+
+  Suite 4963 → **4966**.
+
+- **`tableau-migration` (skill `2.227.0` → `2.228.0`): a caller-side gate stricter than the callee it
+  guards no longer discards whole workbooks (#155).** `_build_datasource_pbip` wrapped the
+  published-datasource recovery in `if descriptor is None:`, skipping it whenever a combined /
+  federated descriptor was present. The reader measured the counter-example: **a published datasource
+  PLUS one small embedded federated datasource is both things at once**, and such a workbook was
+  skipped entirely — *"published-datasource workbook — co-migrate its published datasource"* — while
+  the published rebuild sat there available. Bypassing the gate and changing nothing else produced
+  **52 measures / 86.5% translated, 16 calculated columns / 93.8%**.
+
+  Verified against current code before acting, not taken from the report (it was filed against
+  2.151.0): the gate is still at the call site, and `_rebuild_from_published_match` still takes no
+  `descriptor` parameter at all.
+
+  **Removing it cannot loosen the safety model, and the argument is structural rather than a
+  judgement call.** That branch only runs when `res_report["fallback"]` is already set — *the model
+  has already failed*. The gate therefore never protected a good model; it only decided whether to
+  attempt a recovery on a build with nothing left to lose. All the protection lives in the callee,
+  which is fail-closed three ways: a catalog must exist, the binding signal must be `published`, and
+  the name must match exactly one non-ambiguous entry. Anything else returns `None` and the honest
+  skip stands.
+
+  The general shape is the one this repo keeps rediscovering: **a caller-side condition the callee
+  never asked for is a second predicate that can disagree with the first**, and it will be the one
+  nobody re-derives. Its stated rationale — *"its islands are already real schemas, so a fallback
+  there is a genuinely-undoable shape"* — was a plausible inference that a single real workbook
+  falsified.
+
+  Tests pin the safety where it actually lives: the callee's signature carries no `descriptor`, each
+  of its three guards refuses independently, and the caller no longer gates on `descriptor`. That
+  last one reads the calling function's source and **says so** — a behavioural test would need a
+  published + federated workbook and the corpus has none, so it asserts the narrower thing it can
+  prove rather than implying more.
+
+  **Clause 3 clean on the first attempt** (both trees patched from the start): reintroducing the gate
+  gives `1 failed, 4962 passed` — the single failure is the new test, so nothing else in the suite
+  notices.
+
+  Suite 4957 → **4963**.
+
+### Added
+
+- **`tableau-migration` (skill `2.226.0` → `2.227.0`): a visual that projects an inert `BLANK()` stub
+  is now disclosed.** The first instrument built for the *structurally valid, semantically absent*
+  family named in 2.226.0.
+
+  When a calc cannot be translated the model emits `measure 'X' = BLANK()` so the reference still
+  resolves — and it resolves **perfectly**. The visual binds, `pbir_lint` is clean,
+  `lint_visual_model_bindings` is clean (the measure genuinely exists),
+  `powerbi-report-author validate` returns 0 errors, and the chart renders **empty**. Measured on
+  corpus workbook `0136` before 2.225.0: Sheet 3 projected `complex nested`, a stub, while
+  `viz_fidelity` recorded `{"status": "rebuilt", "reason": null}`. The MODEL layer knew — the
+  translation handoff listed the calc as needs-review — and the VISUAL layer never repeated it.
+
+  Every other gate here asks *is this well-formed*; this one asks *does it say anything*, which is
+  why it reads the measure's EXPRESSION rather than its existence. Reported as
+  `visuals_projecting_stub_measures` (visual, page, measure) on the SHIPPING parts, after the
+  cross-check and after twin retirement, so it describes the `.pbip` the user opens.
+
+  **The narrowness is the feature.** Only an expression that is exactly the stub form counts. A
+  measure that returns blank *conditionally* — `IF(<cond>, 1)`, the shape every keep-flag in this
+  project emits — is doing its job; matching "contains BLANK" would fire on correct output
+  constantly and the finding would be worthless within one release.
+
+  **Proved by control and injection on the same real workbook**, not a fixture: the 2.225.0 build
+  reports `null`, and disabling the alias fix — which restores `complex nested` as a projected stub —
+  makes it emit
+  `[{"measure": "complex nested", "page": "page-ws-Sheet3…", "visual": "v-Sheet38c3a8a7b"}]`.
+  Same data, same build, only the defect differing.
+
+  **Clause 3 run properly, after getting it wrong twice.** Disabling the detector in **both** trees
+  gives `3 failed, 4954 passed` — every failure one of the new tests, so nothing else in the suite
+  catches this. The first two attempts patched canonical only, and mirror parity failed alongside,
+  making the count uninterpretable. Same rider, learned twice: in this repo a source-level injection
+  is a two-tree edit whether you want it to be or not.
+
+  Suite 4950 → **4957**.
+
+- **`tableau-migration` (skill `2.225.0` → `2.226.0`): the day's verification findings collapse into
+  one rule, recorded where the next person will read it.** Docs-only; no code, no corpus change.
+
+  **Read every confirmation at the artifact, never at the mechanism.** A gate going red, a trace
+  firing, a test passing, a validator returning zero errors — all four confirm only that *something
+  you built responded*. None says the file a user opens changed. Four instances, one day, four lanes:
+  a gate keyed on a proxy that passed forever because its input set included the artifact under test
+  (`git rev-list --all` counts `refs/tags`, so every anchor vouched for itself); a trace confirming a
+  helper firing exactly as designed while the emitted measure stayed `= BLANK()`, because the
+  consumer read a different list; eighteen green tests on a feature that was completely inert; an
+  isolated emitter returning three correct objects onto a page that was still wrong.
+
+  The proving sequence, with the clause that actually gets broken: **(1)** it passed → no evidence
+  until seen red; **(2)** it went red → no evidence until the defect is one its *neighbours* do not
+  already catch; **(3)** (2) is only measurable on the **full** suite, with an injection valid in
+  every *other* respect. Both parallel sessions violated clause 3 independently, in the same hour,
+  while stating clauses 1 and 2 — because running the single file is *correct* while iterating and
+  wrong only at the moment of claiming. The discipline attaches to the proof step, not the person.
+  A rider learned by getting it wrong: in this repo a source-level injection is a **two-tree edit**,
+  so patching canonical alone fails mirror parity too and the count stops being interpretable.
+
+  **Structurally valid, semantically absent** — the defect family no structural gate can see, named
+  from three sightings in three unrelated lanes: a calc stubbing to `= BLANK()` (it *binds*, so every
+  binding check passes while the visual renders empty), a CHANGELOG entry that is a header with no
+  body, and a visual whose `SelectRef` names a projection that no longer resolves. Ask whether the
+  emitted artifact **says** anything, not whether it is well-formed.
+
+- **`tableau-migration` (skill `2.215.0` → `2.225.0`): a calc that reaches across a declared join no
+  longer stubs to `BLANK()` and renders an empty chart.** In corpus workbook
+  `0136_custom_sql_prefix_and_params`, the calc `complex nested` mixes a relation-qualified reference
+  (`[Region (Custom SQL Query2)]`) with plain ones (`[Sales]`, `[Sub-Category]`). That spans two
+  tables, so the translator refuses it — *"SUM(expr) must reference exactly one table"* — correctly,
+  because a row expression cannot be evaluated across an unjoined pair. The calc then stubs to
+  `= BLANK()`, **which binds normally**, so Sheet 3 rendered an empty bar chart while `viz_fidelity`
+  recorded `{"status": "rebuilt", "reason": null}`. Loudly refused in the model, silently wrong in
+  the report.
+
+  **The workbook itself declares the way out.** Its object-graph relationship predicate is literally
+  `[Region] = [Region (Custom SQL Query2)]`, so on every row the join produces the two hold the same
+  value — by the author's declaration, not by inference. Substituting the plain caption is therefore
+  faithful *and* makes the expression single-table. Measured through the real translator, same
+  inputs, only the aliased reference differing:
+
+  | | result | tables |
+  |---|---|---|
+  | before | `None` — *"SUM(expr) must reference exactly one table"* | 2 |
+  | after | `CALCULATE(SUMX('Custom SQL Query', IF(EXACT(…) && EXACT(…), …[Sales])), ALLEXCEPT(…))` | 1 |
+
+  **Why not `RELATED()`**, which is the obvious answer: it needs a many-to-one direction to traverse,
+  and an authored object-graph relationship is emitted **many-to-many on purpose** (see
+  `generate_relationships_tmdl` — it is uniqueness-agnostic, so an m:m join cannot be rejected for a
+  non-unique target and cancel the batch). There is no ONE side, so the reach would have to invent a
+  cardinality the source never stated.
+
+  **Keyed on the declaration, never on the name.** An alias is recorded only when a relationship's
+  single-column `=` predicate names both captions. Two plain captions, two differently-qualified
+  captions, and any non-`=` predicate all yield nothing — collapsing columns the workbook has not
+  declared equal would silently change the answer, and a look-alike name is exactly what that would
+  look like. Substitution is bracket-delimited and longest-first, so `[Regional Manager]` survives an
+  alias on `Region`.
+
+  Workbook calc coverage on 0136: **1/4 → 2/4**. The two that remain are the defensible ones — on no
+  worksheet, so no aggregation is observable anywhere in the artifact, and Tableau records no default
+  aggregation on a calc column; inventing `SUM` would be a guess.
+
+  **Measured, both operands and the count named.** `corpus_b216` (built at `d0f16e7`) vs
+  `corpus_v216`, same **34**-workbook input: 1586 files vs 1586, **0 added, 0 removed, 3 differing** —
+  the one `_Measures.tmdl` that gained the measure, plus `report.json`/`summary.md`. Thirty-three
+  workbooks byte-identical.
+
+  **A wiring bug worth recording, because the trace lied by omission.** The first attempt rewrote the
+  merged `all_calcs`, and an instrumented run confirmed the helper firing exactly as designed —
+  4 calcs in, 2 aliases, 1 rewritten. The measure still emitted `BLANK()`: measure emission reads
+  `calcs` **directly**, so the alias was visible to the flag pipelines and invisible to
+  `_measures_part`. A trace proving your own function ran is not evidence that its effect reached the
+  output; only the emitted artifact is.
+
+  Suite 4938 → **4950**.
+
+- **`tableau-migration` (skill `2.214.0` → `2.215.0`): a CHANGELOG entry that exists but says
+  nothing fails the suite.** A cross-session rebase left a header-only duplicate of a renumbered
+  entry -- same shape, same `(skill X → Y)` marker, zero prose. Every existing check passed on it,
+  because each asks about the HEADER: the version was present, the chain was continuous, nothing was
+  claimed twice. An entry can EXIST, be WELL-FORMED, and be EMPTY.
+
+  * **Shares the existing parser rather than re-parsing.** A second parser over the same file would
+    be a second predicate, and the two could disagree about what an entry IS while each looked
+    correct alone -- the exact failure this module exists to prevent, reintroduced one level down.
+    An entry's body runs from its header to the next entry, the next Markdown heading, or EOF; the
+    heading stop matters because the file interleaves `### Added` and `### Fixed`, so the last entry
+    in a section would otherwise absorb the next section's header as content.
+
+  * **The threshold is measured, not assumed.** `> 0` rather than a size floor, because across the
+    99 entries in this file the smallest real body is **604 characters over 7 non-blank lines**. A
+    legitimate entry clears the check by roughly two orders of magnitude, so it cannot fire on
+    terse-but-real prose -- only on genuine emptiness.
+
+  * **Proved RED, and proved to catch what the others cannot.** First injection reproduced the rebase
+    artifact exactly and fired three checks at once -- correct, but not evidence that this one adds
+    anything, since a duplicate also breaks the chain. Second injection was a header-only entry that
+    is otherwise PERFECT: unique version, continuous chain (`2.214.0 → 2.215.0` above
+    `2.213.0 → 2.214.0`), and matching the shipped stamp. Chain, duplicate and stamp checks all
+    PASSED; only the body check fired, naming `2.215.0 at L17`. That is the discriminating result --
+    a gate proved only against a defect its neighbours also catch has not been shown to be worth
+    anything.
+
+- **`tableau-migration` (skill `2.213.0` → `2.214.0`): a released version with no rollback anchor now
+  fails the suite.** The 2.205.0 gate proves every anchor that EXISTS names a reachable commit. It
+  cannot prove one exists — and absence turned out to be the live failure, with a cause neither
+  parallel session had named.
+
+  `git rev-parse --git-common-dir` is the **same `.git` for every worktree**, so `refs/tags` is a
+  single GLOBAL namespace shared by all parallel sessions. Two sessions colliding on a version number
+  therefore also collide on its anchor name: one slot, last writer wins. Reconstructed from tagger
+  dates: session A cut `rollback/pre-v2.211.0`; session B's identical `git tag -a` failed with
+  *"already exists"*, B read it as leftover from its own discarded renumber, deleted it and re-cut at
+  B's commit; A later renumbered away from 2.211.0 and deleted that tag during cleanup — by then B's.
+  **Each session destroyed the other's anchor while truthfully reporting its own as verified**, and
+  each then read the other's as "reported but absent".
+
+  `test_every_released_version_has_an_anchor` reads the CHANGELOG's own `(skill A → B)` chain as the
+  roster of shipped versions — so the roster cannot drift from what was actually released — and
+  asserts each has a matching `rollback/pre-v` tag. **Proved it can fail** by deleting a real anchor
+  and watching it name the exact version, then restoring it; a gate that has never been seen to fail
+  is indistinguishable from one that cannot.
+
+  The two rules this makes enforceable rather than remembered: never `git tag -d` an anchor you did
+  not create (`%(taggerdate)` identifies the owner in one call), and a version with no anchor is a
+  release with no rollback.
+
+- **`tableau-migration` (skill `2.212.0` → `2.213.0`): a Tableau parameter inside Custom SQL no
+  longer ships a query the source cannot parse.** Corpus workbook
+  **`0136_custom_sql_prefix_and_params`** — built to spec by the tool's own user against a live
+  **Databricks** warehouse — is added, and with it the first Custom SQL coverage this project has
+  ever had: **0 of 31** corpus workbooks contained a `<relation type='text'>` before it landed,
+  measured by parsing every relation rather than by regex. The engine's whole Custom SQL path
+  (`Value.NativeQuery`, `Odbc.Query`, the DirectQuery storage-forcing rule, parameter detection, the
+  2.155.0 stub gate) had never run against a real workbook. It is also the first corpus workbook on
+  Databricks and the first to emit `mode: directQuery` partitions.
+
+  Its relation 3 embedded a parameter the way Tableau authors do, because Custom SQL is Tableau's
+  only way to push a predicate to the source:
+
+  ```sql
+  SELECT `Region`, SUM(`Sales`) AS REGION_SALES FROM orders
+  WHERE `Region` = <[Parameters].[Parameter 3357119534784517]> GROUP BY `Region`
+  ```
+
+  That token reached the emitted `Value.NativeQuery` verbatim, so Spark rejects the query at parse
+  and the DirectQuery table cannot answer at all.
+
+  **The fix is a classification, not a translation.** Power BI *does* have a direct equivalent —
+  Dynamic M Query Parameters — and it is deliberately NOT used here. When the filtered column is in
+  the query's result set, the idiomatic rebuild is to drop the predicate and let an ordinary slicer
+  on that column filter; in DirectQuery the slicer folds back into a `WHERE` at the source, so
+  nothing is lost. Reaching for a dynamic M binding in that case would ship an exotic construct
+  (strictly 1:1, no RLS, no aggregations, not in Report Server, banned Top-N/contains/exclude/
+  cross-highlight/drill-down slicer operations, and no spaces permitted in the parameter OR table
+  name) to answer a native question. The genuine dynamic-M case — a filtered column absent from the
+  result set, which no model filter can reach — stays warned, but the warning now names the exact
+  Desktop step (*Properties → Advanced → Bind to parameter*) plus its preconditions, because
+  research could not confirm that binding's on-disk form from any Microsoft primary source and a
+  guessed annotation breaks a model at OPEN time, silently.
+
+  The oracle for "is the column in the result set" is the relation's own metadata records — Tableau's
+  account of what the query returns — not a parse of the SELECT list. `SELECT *` then needs no
+  special case, and a hand-parsed projection cannot disagree with the columns the model emits.
+
+  **The refusals are the feature.** Left alone entirely: an `OR` anywhere in the `WHERE`, a parameter
+  inside a subquery, a non-equality comparison, a parameter outside a `WHERE`, and any query with
+  more than one `WHERE`. The rewrite is also **disclosed** rather than silent: stripping the
+  predicate widens what comes back until a slicer narrows it, and trading a loud failure for a quiet
+  difference would be strictly worse than the bug.
+
+  **Measured, both operands named.** Corpus `corpus_b212` (built at `63b34c3`) vs `corpus_v212`,
+  same 32-workbook input: 1504 files vs 1504, **0 added, 0 removed, 2 differing** — the one table
+  that carried the parameter, and `report.json`. Thirty-one workbooks byte-identical.
+
+  **A second tautological guard was found and fixed before shipping**, the same way 2.211.0's was.
+  Disabling the `OR`/subquery guard left the entire new test file green: every case was refused by
+  some *other* check (the exact-conjunct match, or the two-`WHERE` test). The input that
+  distinguishes it is `WHERE A AND B OR C`, where SQL precedence means `(A AND B) OR C` — splitting
+  on `AND` makes `A` look like a clean parameter predicate, and dropping it silently yields
+  `WHERE x = 1 OR y = 2`. That is not the benign widening the whole rewrite relies on: the surviving
+  `C` rows were never constrained by the parameter's column, so no slicer can put them back. Both
+  operand orders are now pinned, and the weaker `OR` test is explicitly labelled as NOT exercising
+  the guard so no future reader cites it as evidence.
+
+  Suite 4896 → **4908**.
+
+- **`tableau-migration` (skill `2.211.0` → `2.212.0`): a parameter filter whose predicate is an
+  AGGREGATE now actually filters.** Two workbooks supplied by the tool's own user, built to carry
+  shapes a customer field trial reported, are added to the corpus as
+  **`0134_parameter_filters`** and **`0135_aggregation_types`** — closing a hole worth stating
+  plainly: the corpus previously contained **zero** workbooks that filter on a parameter, measured
+  two ways (a parameter directly on the filter shelf: 0 of 29; a `member='true'` filter on a calc
+  that references a parameter: 0 of 29). Every parameter-to-filter seam in the engine was untested
+  against real output.
+
+  `0134` filters five worksheets on five differently-shaped boolean calcs. Four already migrated
+  correctly and are kept as **controls**; the fifth,
+  `IF SUM([Sales]) > [Parameters].[Sales Param] THEN TRUE ELSE FALSE END`, emitted a chart with no
+  `filterConfig` and no wrapper measure — entirely unfiltered. It was warned, so it was visible
+  rather than silent, but the chart was wrong.
+
+  The cause is that `_param_predicate_flags` is **row-level by construction**: it asks the *column*
+  translator for a pure boolean and wraps the result in `COUNTROWS(FILTER(...))`. An aggregate cannot
+  be evaluated per row, so it can never pass that gate. Widening the gate would have been the wrong
+  repair — the faithful Power BI shape for an aggregate is the *opposite* one, a keep-flag measure
+  evaluated at the visual's own grain, which is exactly Tableau's semantics (the aggregate is
+  computed at the viz level of detail, so a chart grouped by customer keeps the customers whose own
+  `SUM([Sales])` clears the parameter). So `_aggregate_predicate_flags` ships as a third sibling of
+  the date-window and row-level pipelines, emitting `IF(<measure-mode boolean>, 1)`.
+
+  Its binding deliberately carries **no** `row_filter`, and that absence is load-bearing:
+  `_apply_row_predicate_wrapped_measures` keys on exactly that field, and rewriting an aggregate into
+  `CALCULATE(<agg>, FILTER(<table>, <pred>))` would push it to row grain and quietly answer a
+  different question. A missing filter is visibly wrong; a row-wrapped aggregate would be
+  *invisibly* wrong, so the two failure modes are not equally bad and the tests say so.
+
+  Disjointness is asserted rather than assumed: a calc the column translator can render as a boolean
+  is refused here even with an empty skip set, so the row-level and aggregate paths cannot both claim
+  one calc regardless of call order.
+
+  **Measured, both operands named.** Corpus `corpus_b209` (built at `ac4f925`) vs `corpus_v209`
+  (built at this change), same 31-workbook input: 1466 files vs 1466, **0 added, 0 removed, 4
+  differing** — the one visual that gained the filter, the one `_Measures.tmdl` that gained the flag
+  measure, and `report.json`/`summary.md` (visuals warned 100 → 99). Nothing changed in the other 30
+  workbooks.
+
+  **A test that could not fail was found and fixed before shipping.** The disjointness test first
+  used `[Param] = [Segment]` as its row-level exemplar and passed with the guard deleted — the
+  *measure* gate refuses that calc outright, so the guard was never reached. Measuring both
+  translators across ten shapes showed only a parameter-only comparison (`[Param] > 5`) types as
+  `bool` in **both** modes, and it is now the exemplar. Both load-bearing assertions were then
+  proven to go red when their guard is removed, per "prove a gate CAN fail, not merely that it runs".
+
+  Suite 4885 → **4896**.
+
+- **`tableau-migration` (skill `2.210.0` → `2.211.0`): a container-stitched pseudo-table is MERGED
+  into one visual, and the style cascade stops overwriting conditional formats.** N worksheets in a
+  contiguous band, each contributing one measure, with the row labels hidden on all but the leading
+  sheet, is Tableau faking a single table. Power BI has the real thing, so the rebuild now emits ONE
+  visual with N value columns -- the row-label column appears once, as the author intended, instead
+  of N times.
+
+  * **Each column keeps its OWN conditional format.** Every member's rule is computed against that
+    member's own state so its selector names only its own measure, and the Visual Calculation it
+    declares is ported onto the merged state so the `SelectRef` resolves. The refs collide by
+    construction -- every member state starts empty, so each claims the same first free name -- and
+    a colliding ref whose EXPRESSION differs is renamed with the member's own references rewritten.
+    Ported naively, the last member would win and every column would paint from whichever DAX
+    arrived first, resolving cleanly and reporting nothing.
+
+  * **A LATENT DEFECT THIS EXPOSED: the style cascade was overwriting conditional formats.** The
+    font pass did `objects[k][0]["properties"].update(...)`, replacing whatever the first entry
+    already set. Where entry 0 was a rule bound to a column, its `fontColor` was silently replaced
+    by the flat cascade colour. It went unnoticed because entry 0 was normally the row-dimension
+    entry, which has no rule to lose; merging promoted a real rule into that slot and one column
+    came back uncoloured while the others painted correctly -- reading as "one column didn't work"
+    rather than as a collision. The cascade is now a DEFAULT: keys the entry already sets are left
+    alone, keys it does not set are still applied, so a gradient entry takes the cascade's font
+    exactly as before.
+
+  * **Render-verified against the author's Tableau screenshot.** One table, `Sub-Category` once,
+    Profit / Sales / Quantity as three columns, one Total row, and each column bucketing
+    INDEPENDENTLY -- green on Copiers/Phones/Accessories/Paper in Profit, red on Art in Sales, green
+    on Binders in Quantity, matching the oracle cell for cell.
+
+  * **Corpus, operands named.** `corpus/b212` (built from `1f12c94`) vs `corpus/v212`: 1468 files vs
+    1460, **0 added, 8 removed, 6 differing**. The removals are the follower tables the merge
+    absorbs (two per workbook, in both the pre-rebind and the final tree); the differences are the
+    merged leader plus `report.json`/`summary.md`. **No workbook outside `0132`/`0133` changed.**
+
+- **`tableau-migration` (skill `2.209.0` → `2.210.0`): a container-stitched pseudo-table is
+  detected from the source and disclosed.** Tableau cannot put several independently
+  table-calculated measures in one view, so authors fake a single table: N worksheets in a
+  contiguous horizontal container, each contributing one measure, with the row labels hidden on
+  every sheet but the leading one. The dashboard then READS as one table. The rebuild emits one
+  table per sheet, so the row-label column repeats N times and the illusion breaks -- visibly on the
+  page, and invisibly to every validator.
+
+  * **The signature is exact in the source; no image, heuristic or model call.** Contiguous
+    horizontal band (same `y`, same `h`, each `x` continuing where the previous ended), the same row
+    dimension on every member, and the row labels hidden on the TRAILING members while the leader
+    keeps its own. That asymmetry is the whole gate: it separates a stitched pseudo-table from
+    tables that merely sit side by side.
+
+  * **The negatives are what make it trustworthy, and the source workbook supplies both.** A
+    single-sheet MEASURE TRELLIS renders an almost identical picture from completely different
+    source, and a BAR-mark band is already rebuilt correctly because the engine suppresses its
+    category axes. Detection fires on the stitched case and declines both -- verified on the real
+    workbook, not a fixture. This is also the concrete argument for classifying from XML rather than
+    from a rendered image: the image cannot separate cases that look the same.
+
+  * **`row_labels_hidden` exists because the axis path drops the fact for a crosstab.**
+    `_parse_hidden_axes` maps a hide onto a Power BI AXIS, which needs the shelf's role; it resolves
+    for a cartesian chart and yields nothing for a table, because a table has no category axis. The
+    author's hide was therefore parsed and then discarded for exactly the visual type this idiom
+    uses. Added as a separate, additive signal rather than by widening the axis function, so the
+    chart path is untouched.
+
+  * **Disclosed, not silently rebuilt, and NOT shipped as inert plumbing.** The detector feeds a
+    remediation-worklist item naming the sheets, the leader, and the native Power BI answer (one
+    matrix with N value columns). A detector with no consumer is the same shape as a gate nothing
+    calls, so it is wired on arrival rather than left for later.
+
+  * **Corpus, operands named.** `corpus/b210` (built from `5e6d921`) vs `corpus/v210`: 1468 files
+    vs 1468, 0 added, 0 removed, **2 differing -- `report.json` and `summary.md` only.** No
+    `visual.json` and no `.tmdl` changed, which is the correct blast radius for a disclosure.
+
+  * **Still open:** the merge itself. The measure on these crosstabs is not a plain shelf field, so
+    building the merged matrix needs work this increment deliberately does not guess at.
+
+- **`tableau-migration` (skill `2.208.0` → `2.209.0`): Tableau's "how many marks are in this
+  view" idiom, and its escaped colour-map members.** Two independent defects from one real dashboard
+  -- a dynamic-quartile view that ranks rows into Top 25% / middle / Bottom 25% and colours them.
+  Either one alone lost the whole encoding, and neither produced an error anywhere.
+
+  * **`WINDOW_COUNT(COUNTD([<dimension>]))` is now recognised as the view's mark count.**
+    `WINDOW_COUNT` counts the MARKS in its frame for which the argument is non-null -- it does not
+    aggregate the argument -- and a `COUNTD` of a dimension is never null at a mark. Lowering it
+    through the generic aggregator path required resolving `COUNTD([D])` to a projected column,
+    which cannot succeed: the visual GROUPS BY that dimension rather than projecting a distinct
+    count of it. So the operand returned nothing, the whole colour rule declined, and the dashboard
+    rendered with no colour at all. Lowered to the same `COUNTROWS(<frame>)` that Tableau's own
+    `SIZE()` already produced, with the frame taken from the call so explicit bounds are honoured.
+    Gated to `COUNTD` only -- `WINDOW_SUM(COUNTD(x))` is a real sum and still needs its operand.
+
+  * **An escaped colour-map member no longer loses the author's palette.** Tableau serialises the
+    member as `"Top 25\%"` while the calculation writes `"Top 25%"`, so a literal comparison
+    missed and the member fell through to the default categorical ramp. Measured on the source
+    workbook: `middle` matched and kept `#000000`, while `Top 25%` and `Bottom 25%` silently became
+    `#E15759` and `#4E79A7` -- the author's green and red replaced by two arbitrary hues, with no
+    warning. Both the raw and the unescaped spelling are now indexed, so a member whose real name
+    contains a backslash still matches exactly as before.
+
+  * **Corpus: 31 workbooks, and the blast radius is exactly the two that exercise it.** Two new
+    workbooks were added to the corpus for this pattern (`0132_container-formatting-hidden-headers`,
+    `0133_container-formatting-variations`), each with the Tableau oracle image and a verified
+    `lessons.json`. Masked diff, `corpus/b206` (built from `ac4f925`) vs `corpus/v206`: 1468 files
+    vs 1468, 0 added, 0 removed, 19 differing -- **every one of them inside `0132`/`0133` plus
+    `report.json`. None of the original 29 workbooks changed.**
+
+  * **Render-verified against the author's own Tableau screenshot.** Ground truth was computed
+    independently from the emitted values (17 members; Top 25% = rank <= 4.25, Bottom 25% = rank >
+    12.75) and matched the oracle cell for cell: green = Copiers / Phones / Accessories / Paper, red
+    = Machines / Fasteners / Supplies / Bookcases / Tables. Confirmed on BOTH mark types -- font
+    colour on the text tables, bar fill on the bar variants -- and each measure column buckets
+    independently, so a member is black in Profit and red in Sales exactly as the source does it.
 
 - **`tableau-migration` (skill `2.207.0` → `2.208.0`): the remedy we tell the user to run is one they
   can actually run.** `2.207.0` shipped detection of the Newtonsoft/GAC blocker together with a
