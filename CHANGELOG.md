@@ -14,6 +14,56 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ### Fixed
 
+- **`tableau-migration` (skill `2.260.0` → `2.261.0`): the calendar's ACTIVE date is chosen from what
+  the workbook CHARTS, not from what its columns are called.** Power BI allows one active
+  relationship between a fact and a calendar, so the model build must pick each fact's business date.
+  It picked by naming convention — literally `Date`, an `order`-date, or a `created`-date — and
+  refused when nothing matched, emitting **every** date relationship inactive.
+
+  Refusing is not neutral. A fact with no active date cannot be filtered by the calendar at all, so
+  every date-axis visual over it returns the grand total in every bucket and renders as a flat line.
+  And real schemas do not follow the convention: Salesforce writes `pmdm__StartDate__c`,
+  `pmdm__EndDate__c`, `SystemModstamp`, `caseman__AssessmentCompletedDate__c`. Nothing matched, so
+  those facts lost their time axis entirely — `Date (Client Enrollment and participation)` had **four
+  date joins and zero active**.
+
+  The workbook already answers the question the convention was approximating: **the author put the
+  business date on a shelf.** `twb_to_pbir.date_field_usage` counts, per date column, how many
+  rows/cols/filters shelves place it; `_select_primary_date` prefers the clear winner and falls back
+  to the conventions when usage cannot decide. It travels the same report → model channel that
+  `scatter_keys` and `colour_palettes` already use.
+
+  **Measured on Salesforce NPSP** — of the 10 facts the calendars relate, 5 already had an active
+  date and usage resolves the other **5**, each with exactly one of its date columns used anywhere
+  (`pmdm__StartDate__c` ×2 while `pmdm__EndDate__c` is charted nowhere), leaving **0** unresolved:
+
+  | calendar | before | after |
+  |---|---|---|
+  | Assessments | 1 active / 4 inactive | **3 / 2** |
+  | Client Enrollment and participation | **0** / 4 | **2 / 2** |
+  | Intake | 2 / 1 | 2 / 1 |
+  | Service Delivery | 2 / 2 | **3 / 1** |
+  | **total** | **5 / 11** | **10 / 6** |
+
+  Every fact now has an active date; the 6 that remain inactive are the genuine role-playing
+  secondaries (`EndDate`, `SystemModstamp`, `ClosedDate`) — correct, since only one can be active.
+  Calendar-bound field refs on that report rise 5 → **8**, with **0** cross-island flat series.
+
+  **Fail-closed where the evidence is genuinely absent.** A usage TIE does not break the tie by
+  position — it falls through to the conventions, and if those cannot decide either, every
+  relationship stays inactive. Breaking a tie arbitrarily is exactly the "silently picking the wrong
+  business date" this has always refused to do.
+
+  **Corpus of 34:** 1612 → 1612 files, 0 added, 0 removed, **7 differing** — 4 in `0088` plus 3
+  metadata. **33 workbooks untouched**, calc coverage identical at 216/287. Corpus-wide date
+  relationships go 28 active / 22 inactive → **33 / 17**, the entire delta inside `0088`.
+
+  One trap worth recording: `migrate_datasource` forwards `**kwargs`, so adding the parameter to
+  `assemble_import_model` alone made `migrate_tds_to_semantic_model` (explicit signature, no
+  `**kwargs`) raise `TypeError` — which the caller catches, marking the whole `.pbip` **skipped**
+  rather than failing loudly. 22 tests caught it; without them a threading mistake would have
+  presented as workbooks quietly not building.
+
 - **`tableau-migration` (skill `2.258.0` → `2.260.0`): separate Tableau datasources now get separate
   calendars — the months-old blocker, root-caused.** A Tableau workbook can hold several
   datasources, and Tableau never lets one datasource's filters reach another's marks. Power BI has no

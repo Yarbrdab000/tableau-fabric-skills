@@ -9691,6 +9691,43 @@ def scatter_composite_key_name(dims):
     return SCATTER_KEY_PREFIX + " (" + " + ".join(p for p in parts if p) + ")"
 
 
+def date_field_usage(ir):
+    """``{date column name (lowered): times the workbook puts it on a shelf}``.
+
+    The model build has to pick ONE date column per fact as the calendar's ACTIVE relationship --
+    Power BI allows a single active path between two tables. ``_select_primary_date`` used to choose
+    by NAME CONVENTION (literally ``Date``, or an ``order``/``created`` date) and refuse when no
+    convention matched, which is right in spirit and blind on real schemas: Salesforce writes
+    ``pmdm__StartDate__c``, ``pmdm__EndDate__c``, ``SystemModstamp``,
+    ``caseman__AssessmentCompletedDate__c``. Nothing matched, so every one of those facts got NO
+    active date and lost its calendar hierarchy.
+
+    The workbook already answers the question the naming convention was guessing at: the author put
+    the business date on a SHELF. Measured on Salesforce NPSP, over the 10 facts the calendar
+    relates: 5 already had an active date, and shelf evidence resolves the other **5** -- each with
+    exactly ONE of its date columns used anywhere (``pmdm__StartDate__c`` x2 while
+    ``pmdm__EndDate__c`` is used nowhere) -- leaving **0** unresolved.
+
+    Counted across rows / cols / filters of every worksheet, keyed by COLUMN NAME because that is
+    what the model build has when it ranks a fact's own date columns (the field's ``entity`` is still
+    the workbook's relation name, not the model's table display name). Ranking is only ever used
+    WITHIN one table's own columns, so a shared name cannot promote a column its table does not have.
+    Empty -> the model build keeps the pure naming-convention behaviour, byte-for-byte.
+    """
+    out = {}
+    for ws in (ir or {}).get("worksheets") or []:
+        for shelf in ("rows", "cols", "filters"):
+            for f in (ws.get(shelf) or []):
+                if not isinstance(f, dict):
+                    continue
+                if (f.get("datatype") or "").lower() not in _DATE_TYPES:
+                    continue
+                key = (f.get("property") or "").strip().lower()
+                if key:
+                    out[key] = out.get(key, 0) + 1
+    return out
+
+
 def discrete_colour_palettes(ir):
     """``{measure caption: [(member, "#rrggbb"), ...]}`` -- AUTHORED colours for each discrete
     colour measure this report paints with.

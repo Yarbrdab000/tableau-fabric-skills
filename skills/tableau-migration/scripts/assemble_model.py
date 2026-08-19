@@ -2809,25 +2809,42 @@ def _inject_field_param_tables(parts, table_names, fp_parts, fp_names):
         table_names.extend(fp_names)
 
 
-def _select_primary_date(date_cols):
+def _select_primary_date(date_cols, usage=None):
     """Pick the primary (active-relationship) date column, or None when it's ambiguous.
 
-    A single date column is always primary. With several, prefer a column carrying one of the
-    explicit primary-date naming conventions -- literally ``Date``, an ORDER_DATE-like name, or a
-    record-CREATION date (``CreatedDate`` / ``Created Date`` / ``Date Created``, the canonical event
-    date in essentially every CRM / case / ticketing schema). If exactly one convention matches it is
-    primary; otherwise the choice is ambiguous and we return None so EVERY date relationship is
-    emitted inactive -- never silently picking the wrong business date (e.g. defaulting the calendar
-    to Ship Date over Order Date).
+    A single date column is always primary. With several, the workbook's OWN USAGE decides first:
+    ``usage`` maps a date column name to the number of shelves the author placed it on (see
+    ``twb_to_pbir.date_field_usage``). The column the workbook actually charts IS its business date,
+    which is the fact a naming convention was only ever approximating.
 
-    Recognising the creation-date convention matters because leaving them ALL inactive is not a
-    neutral outcome: the calendar then cannot filter that fact at all, so every date-axis visual over
-    it returns the grand total in every bucket and renders as a flat line / solid block. A fact whose
-    dates are ``CreatedDate`` + ``ClosedDate`` (no ``Date``/``Order Date`` anywhere) previously hit
-    exactly that, losing its whole time axis.
+    Falls back to the naming conventions when usage cannot decide -- literally ``Date``, an
+    ORDER_DATE-like name, or a record-CREATION date (``CreatedDate`` / ``Created Date`` /
+    ``Date Created``, the canonical event date in essentially every CRM / case / ticketing schema).
+    If exactly one convention matches it is primary; otherwise the choice is ambiguous and we return
+    None so EVERY date relationship is emitted inactive -- never silently picking the wrong business
+    date (e.g. defaulting the calendar to Ship Date over Order Date).
+
+    Leaving them ALL inactive is not a neutral outcome: the calendar then cannot filter that fact at
+    all, so every date-axis visual over it returns the grand total in every bucket and renders as a
+    flat line / solid block. Recognising the creation-date convention fixed one shape of that; usage
+    fixes the rest. Measured on Salesforce NPSP, whose schema matches NO convention
+    (``pmdm__StartDate__c``, ``SystemModstamp``, ``caseman__AssessmentCompletedDate__c``): of the 10
+    facts the calendar relates, 5 already had an active date and usage resolves the other **5**, each
+    with exactly one of its date columns used anywhere. ``pmdm__EndDate__c`` is used on no shelf and
+    correctly stays the inactive role-playing secondary.
     """
     if len(date_cols) == 1:
         return date_cols[0]
+
+    # 1. The workbook's own usage. A single clear winner is the author's business date; a TIE is a
+    #    genuine ambiguity and falls through rather than being broken arbitrarily.
+    if usage:
+        scored = [(c, usage.get((c or "").strip().lower(), 0)) for c in date_cols]
+        best = max((n for _c, n in scored), default=0)
+        if best > 0:
+            winners = [c for c, n in scored if n == best]
+            if len(winners) == 1:
+                return winners[0]
 
     def _norm(s):
         return (s or "").strip().lower().replace("_", " ").replace("-", " ")
@@ -2925,7 +2942,7 @@ def _stub_backed_tables(tables):
 
 
 def _build_date_dimensions(tables, emitted_names, relationships, *, mark_as_date=True,
-                           mode="import", date_range=None):
+                           mode="import", date_range=None, date_usage=None):
     """One Date dimension PER DATASOURCE ISLAND -> ``([(name, part)], rels, report)``.
 
     A workbook with several datasources keeps them as ISLANDS: Tableau never lets one datasource's
@@ -2955,7 +2972,7 @@ def _build_date_dimensions(tables, emitted_names, relationships, *, mark_as_date
     if not PER_ISLAND_DATE_ENABLED or len(islands) < 2:
         name, part, rels, report = _build_date_dimension(
             tables, emitted_names, relationships, mark_as_date=mark_as_date, mode=mode,
-            date_range=date_range)
+            date_range=date_range, date_usage=date_usage)
         return ([(name, part)] if part is not None else []), rels, report
 
     built, all_rels, reports = [], [], []
@@ -2966,7 +2983,8 @@ def _build_date_dimensions(tables, emitted_names, relationships, *, mark_as_date
             continue
         name, part, rels, report = _build_date_dimension(
             own, taken, relationships, mark_as_date=mark_as_date,
-            name_pref="Date (%s)" % ds, mode=mode, date_range=date_range)
+            name_pref="Date (%s)" % ds, mode=mode, date_range=date_range,
+            date_usage=date_usage)
         if part is None:
             continue
         built.append((name, part))
@@ -2985,7 +3003,7 @@ def _build_date_dimensions(tables, emitted_names, relationships, *, mark_as_date
 
 
 def _build_date_dimension(tables, emitted_names, relationships, *, mark_as_date=True,
-                          name_pref="Date", mode="import", date_range=None):
+                          name_pref="Date", mode="import", date_range=None, date_usage=None):
     """Detect fact date columns and build a shared Date dimension + its relationships.
 
     Returns ``(date_table_name|None, date_table_tmdl|None, date_relationships, report)``. Only
@@ -3053,7 +3071,7 @@ def _build_date_dimension(tables, emitted_names, relationships, *, mark_as_date=
 
     rels, warnings, details = [], [], []
     for disp, date_cols in by_table:
-        primary = _select_primary_date(date_cols)
+        primary = _select_primary_date(date_cols, usage=date_usage)
         if primary is None:
             warnings.append(
                 f"table '{disp}' has multiple date columns with no clearly primary one "
@@ -4161,7 +4179,7 @@ def assemble_import_model(descriptor, *, model_name, calcs=None, dim_calcs=None,
                           calc_lookup=None, approved_calc_dax=None, date_range=None,
                           parameters=None, table_calc_usages=None, calc_outer_aggs=None,
                           scatter_keys=None, storage_decision=None,
-                          colour_palettes=None, semantic_colours=False):
+                          colour_palettes=None, semantic_colours=False, date_usage=None):
     """Assemble the Import/DirectQuery semantic model definition for a parsed descriptor.
 
     Returns ``{"parts": {path: text}, "report": {...}}``. Raises ``ValueError`` if the
@@ -4310,7 +4328,7 @@ def assemble_import_model(descriptor, *, model_name, calcs=None, dim_calcs=None,
     if date_table:
         _date_built, date_rels, date_report = _build_date_dimensions(
             tables, table_names, all_rels, mark_as_date=mark_as_date, mode=mode,
-            date_range=date_range)
+            date_range=date_range, date_usage=date_usage)
         for _dn, _dp in _date_built:
             parts[f"definition/tables/{_dn}.tmdl"] = _dp
             table_names.append(_dn)
@@ -5273,7 +5291,8 @@ def migrate_tds_to_semantic_model(tds_text, *, model_name, calcs=None, dim_calcs
                                   parameters=None, table_calc_usages=None, descriptor=None,
                                   emit_linguistic=False, calc_outer_aggs=None,
                                   scatter_keys=None, storage_decision=None,
-                                  colour_palettes=None, semantic_colours=False):
+                                  colour_palettes=None, semantic_colours=False,
+                                  date_usage=None):
     """One-call convenience: parse ``.tds``/``.twb`` text and assemble the Import/DirectQuery model.
 
     ``calcs`` are the MEASURE-role calculated fields and ``dim_calcs`` the DIMENSION/row-level ones
@@ -5383,7 +5402,8 @@ def migrate_tds_to_semantic_model(tds_text, *, model_name, calcs=None, dim_calcs
                                    calc_outer_aggs=calc_outer_aggs,
                                    scatter_keys=scatter_keys, storage_decision=storage_decision,
                                    colour_palettes=colour_palettes,
-                                   semantic_colours=semantic_colours)
+                                   semantic_colours=semantic_colours,
+                                   date_usage=date_usage)
     # Splice harvested Group/Bin calc columns onto their resolved home tables -- the same additive
     # pre-partition injection as dim_calcs (byte-for-byte unchanged when there are no groups/bins).
     harvest_parts = result.get("parts") if isinstance(result, dict) else None

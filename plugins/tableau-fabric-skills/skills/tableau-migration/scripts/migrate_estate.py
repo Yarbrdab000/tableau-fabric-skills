@@ -3218,6 +3218,30 @@ def _scatter_keys_from_ir(result):
         return []
 
 
+def _date_usage_from_ir(result):
+    """``{date column (lowered): shelf uses}`` this workbook's IR reports, or ``{}``.
+
+    Pure reader of the first viz pass, mirroring ``_scatter_keys_from_ir`` / ``_colour_palettes_from_ir``:
+    only the report layer can see which date field the author actually put on a shelf, and only the
+    model can choose the calendar's ACTIVE relationship, so the fact travels report -> model.
+
+    This is what lets ``assemble_model._select_primary_date`` stop guessing from naming conventions.
+    Never raises: an IR that cannot be read supplies no usage, and the model build falls back to the
+    conventions exactly as before.
+    """
+    try:
+        ir = (result or {}).get("ir") if isinstance(result, dict) else None
+        if not ir:
+            return {}
+        try:
+            from . import twb_to_pbir as _tp
+        except ImportError:
+            import twb_to_pbir as _tp
+        return _tp.date_field_usage(ir) or {}
+    except Exception:
+        return {}
+
+
 def _colour_palettes_from_ir(result):
     """The AUTHORED discrete-colour palettes this workbook's IR carries, or ``{}``.
 
@@ -3526,6 +3550,14 @@ def _build_datasource_pbip(entry, wb_detail, twb_text, result, ds, *, label, mod
                                  # default categorical ramp, which is what an unauthored worksheet
                                  # renders.
                                  colour_palettes=_colour_palettes_from_ir(result),
+                                 # Which date field the author actually put on a SHELF, read from the
+                                 # first viz pass. The model build uses it to pick each fact's ACTIVE
+                                 # calendar relationship instead of guessing from a naming
+                                 # convention -- Salesforce writes pmdm__StartDate__c /
+                                 # SystemModstamp, which match no convention, so those facts got NO
+                                 # active date and lost their whole calendar hierarchy. Empty -> the
+                                 # naming conventions, byte-for-byte as before.
+                                 date_usage=_date_usage_from_ir(result),
                                  semantic_colours=semantic_colours)
     except Exception as exc:
         warns.append(_PBIP_WARN + f"could not rebuild embedded datasource {label!r} "
