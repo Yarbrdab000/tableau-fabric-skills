@@ -3284,6 +3284,65 @@ _COLOUR_TWIN_SUFFIX = " (colour)"
 _COLOUR_TWIN_DECL_RE = re.compile(r"^\tmeasure '([^']+ \(colour\))'\s*=", re.M)
 
 
+def _annotate_fidelity_evidence(fidelity, lint_problems, candidate_records, linted):
+    """Stamp each per-worksheet fidelity row with WHAT WAS ACTUALLY CHECKED (#173).
+
+    ``status: "rebuilt"`` asserts only that the visual emitter completed without raising and without
+    attaching a warning. It is a statement about OUR CODE, not about the emitted artifact -- so a
+    visual can be reported ``rebuilt`` and still fail to render, which is a false green at the source
+    and silently defeats any downstream gate keyed on that field. Reported from the field as a
+    scatter marked ``rebuilt`` carrying a live ``DataViewMappingError_ScatterGroupingValues``.
+
+    The honest answer was already being computed and discarded: ``lint_pbir_parts`` runs on the
+    SHIPPED report bytes a few lines below where ``viz_fidelity`` is built, and its problems are
+    prefixed with the part path, so they are attributable. ``rebuilt`` could not see them purely
+    because of ORDERING. This closes that by adding evidence AFTER the lint:
+
+      * ``"emitted"``        -- the emitter ran cleanly. All ``rebuilt`` used to mean.
+      * ``"emitted+linted"`` -- additionally: the shipped bytes were structurally linted and no
+                                finding names this worksheet's visual.
+      * ``"lint_failed"``    -- a lint finding DOES name it. The false-green case, now visible even
+                                though ``status`` still reads ``rebuilt``.
+
+    ADDITIVE, in the same spirit as ``tier``: ``status`` is not narrowed and no existing key changes,
+    so a consumer reading ``status`` is byte-identical. Narrowing ``rebuilt`` would be the more
+    honest end state but it is a breaking change to a field other teams consume, so it is theirs to
+    opt into rather than ours to impose.
+
+    FAIL-CLOSED ON THE CLAIM, which is the whole point: when the lint did not run (``linted`` false)
+    every row stays ``"emitted"``. Claiming ``"emitted+linted"`` because no problems were found, when
+    the reason no problems were found is that nothing looked, would recreate exactly the defect this
+    fixes one level up.
+    """
+    rows = fidelity if isinstance(fidelity, list) else []
+    if not rows:
+        return rows
+    if not linted:
+        for row in rows:
+            if isinstance(row, dict):
+                row.setdefault("evidence", "emitted")
+        return rows
+
+    # visual name -> worksheet, from the viz stage's own record of what it emitted for what.
+    ws_by_visual = {}
+    for rec in (candidate_records or []):
+        if isinstance(rec, dict) and rec.get("visual") and rec.get("worksheet"):
+            ws_by_visual[str(rec["visual"])] = str(rec["worksheet"])
+
+    # A lint problem is prefixed with the part PATH; the visual name is its parent directory.
+    flagged = set()
+    for problem in (lint_problems or []):
+        text = str(problem)
+        for visual, worksheet in ws_by_visual.items():
+            if visual and visual in text:
+                flagged.add(worksheet)
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        row["evidence"] = "lint_failed" if row.get("worksheet") in flagged else "emitted+linted"
+    return rows
+
+
 def _phantom_published_proxy_tables(model_parts):
     """Emitted tables bound to a published datasource's ``sqlproxy`` proxy rather than to real data.
 
@@ -3977,6 +4036,13 @@ def _build_datasource_pbip(entry, wb_detail, twb_text, result, ds, *, label, mod
         entry["viz_lint"] = {"count": len(_lint), "problems": _lint[:20]}
         warns.append(_PBIP_WARN + f"{len(_lint)} PBIR validity violation(s) in the emitted report "
                      f"(pbir_lint R3-R9); first: {_lint[0]}")
+    # Now that the SHIPPED bytes have been linted, say so per worksheet (#173). ``status: rebuilt``
+    # is a claim about the emitter; this records what was actually checked, so a visual that lints
+    # dirty is visible even while ``status`` still reads ``rebuilt``. ``linted`` is keyed on there
+    # being report bytes to lint -- never on the absence of findings.
+    _annotate_fidelity_evidence(entry.get("viz_fidelity"), _lint,
+                                (result or {}).get("candidate_records"),
+                                bool(report_parts))
     projected = _longest_projected_path(dest, model_safe, res.get("parts"), report_base, report_parts)
     if os.name == "nt" and len(projected) >= MAX_PATH:
         # 1a (long-path era): the writer lifts MAX_PATH via ``\\?\`` so the build no longer FAILS on a
