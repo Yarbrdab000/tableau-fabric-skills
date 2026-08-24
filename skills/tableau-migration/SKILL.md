@@ -607,6 +607,7 @@ This skill is **self-contained** — the bundled scripts cover the full migratio
 | Connection → M Partition & Binding | [connection-binding.md](resources/connection-binding.md) |
 | Validation & Reconciliation (ExecuteQuery vs VDS) | [validation-reconciliation.md](resources/validation-reconciliation.md) |
 | Migration Gotchas | [migration-gotchas.md](resources/migration-gotchas.md) |
+| PBIR Property Discovery (ask Desktop what JSON a feature writes) | [pbir-property-discovery.md](resources/pbir-property-discovery.md) |
 | Troubleshooting — "I need help" (guided menu) | [troubleshooting.md](resources/troubleshooting.md) |
 | Security & Governance | [security-governance.md](resources/security-governance.md) |
 | Migration Report | [migration-report.md](resources/migration-report.md) |

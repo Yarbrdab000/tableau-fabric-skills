@@ -12,6 +12,22 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ## [Unreleased]
 
+### Added
+
+- **`tableau-migration` (skill `2.262.0` → `2.264.0`): a repeatable way to ask Power BI Desktop
+  which JSON a formatting feature actually writes, instead of guessing the property name.**
+  PBIR `visual.objects` resolves to `DataViewObjectDefinitions`, which permits **arbitrary**
+  property names — so `powerbi-report-author validate` can never catch a wrong formatting property,
+  and a misspelled or invented name validates clean and renders nothing. Every published schema also
+  lags Desktop by at least a month, so a new feature is unnameable from the catalog on the day it
+  ships. `scripts/pbir_property_probe.py` closes that gap by treating Desktop as the oracle:
+  `snapshot` a report, toggle the feature in the UI, `snapshot` again, and `diff` names the exact
+  JSON path that changed. `schema` cross-checks a candidate name against the release-tagged theme
+  schema, which is the richer of the two oracles — it knew `outerPadding`, `accentBar` and the real
+  `centerValue` shape that the npm catalog behind `validate` did not. Stdlib only, offline.
+  Runbook: `resources/pbir-property-discovery.md`. Verified end-to-end by recovering
+  `centerValue.show` from an injected edit.
+
 ### Fixed
 
 - **`tableau-migration` (skill `2.261.0` → `2.262.0`): a workbook federating TWO bundled files now
