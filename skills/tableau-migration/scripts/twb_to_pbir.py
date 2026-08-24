@@ -12686,6 +12686,49 @@ def _derive_brand_color(ir):
     return sorted(h for h, c in counts.items() if c == top)[0]
 
 
+def _contrast_ratio(a, b):
+    """WCAG 2.x contrast ratio between two ``#rrggbb`` colours, 1.0 (identical) .. 21.0.
+
+    Used only to decide whether a colour is INDISTINGUISHABLE from the page, so the absolute scale
+    matters less than the bottom of it. WCAG's own minimum for non-text contrast is 3.0; the
+    threshold here is far below that deliberately -- the goal is to drop colours that cannot be seen
+    at all, not to enforce accessible contrast on the author's palette.
+    """
+    def _lum(hex6):
+        h = hex6.lstrip("#")
+        chans = (int(h[i:i + 2], 16) / 255.0 for i in (0, 2, 4))
+        lin = [(c / 12.92 if c <= 0.04045 else ((c + 0.055) / 1.055) ** 2.4) for c in chans]
+        return 0.2126 * lin[0] + 0.7152 * lin[1] + 0.0722 * lin[2]
+
+    la, lb = _lum(a), _lum(b)
+    return (max(la, lb) + 0.05) / (min(la, lb) + 0.05)
+
+
+# Below this ratio two colours are the same colour to the eye. 1.0 is exact equality; #ffffff on
+# #f5f5f5 is 1.09. Set just above that so an "invisible" mark is caught whether the canvas is pure
+# white or the near-white a Tableau dashboard usually paints, while anything a viewer could actually
+# distinguish is left alone.
+_INVISIBLE_CONTRAST = 1.2
+
+
+def _visible_against(hex_color, background):
+    """Would a mark painted ``hex_color`` be visible on ``background``?
+
+    A Tableau workbook legitimately contains mark colours that exist in order to be INVISIBLE: the
+    classic donut is a pie with a white circle punched through its middle, and spacer/halo marks are
+    painted in the canvas colour on purpose. Those are overlay geometry, not series colours -- but
+    ``_harvest_workbook_palette`` sees them as ordinary mark colours and, because harvested colours
+    LEAD ``dataColors``, one of them can land at position 0 and become the default series colour for
+    the whole report.
+
+    Measured 2026-08-24 on ``0090_small_multiples``, whose donut hack paints ``#ffffff``: that white
+    reached ``dataColors[0]`` and silently erased FIVE bar charts entirely, the donut's own fourth
+    slice, and one of the two series in all four time-series panels -- while the report validated
+    clean and every gate passed. Recovered by setting that one entry to a visible colour and looking.
+    """
+    return _contrast_ratio(hex_color, background) >= _INVISIBLE_CONTRAST
+
+
 def tableau_theme_dict(brand=None, extra_palette=None, canvas=None):
     """The custom-theme JSON: a minimal, always-valid Power BI theme (``name`` + ``dataColors``).
 
@@ -12705,18 +12748,49 @@ def tableau_theme_dict(brand=None, extra_palette=None, canvas=None):
     given, so a single-series / auto-coloured chart rebuilds in the workbook's brand colour instead of
     Power BI's blue-first default, while the full Tableau 10/20 sequence still trails as the fallback
     for multi-category charts (the brand is de-duplicated out of that tail, case-insensitively, so it
-    never appears twice). ``extra_palette`` (an optional ordered list of ``#rrggbb`` -- reserved for a
-    later per-member-palette lever) is inserted after the brand, ahead of the Tableau tail, likewise
-    de-duplicated. With no ``brand`` and no ``extra_palette`` the return is byte-identical to the prior
-    default apart from the corrected ``name`` (the never-regress contract for ``dataColors``)."""
+    never appears twice). ``extra_palette`` (the workbook's own harvested mark colours) is inserted
+    after the brand, ahead of the Tableau tail, likewise de-duplicated. With no ``brand`` and no
+    ``extra_palette`` the return is byte-identical to the prior default apart from the corrected
+    ``name`` (the never-regress contract for ``dataColors``).
+
+    LEAD COLOURS ARE FILTERED FOR VISIBILITY, the Tableau tail is not. A harvested colour that is
+    indistinguishable from the page background is dropped (see ``_visible_against``), because such a
+    mark is overlay geometry in the source -- a donut's punched hole, a spacer -- and promoting it to
+    a series colour paints real data in the canvas colour. The curated Tableau tail is left exactly
+    as-is: it is a known-visible palette and filtering it would put the never-regress contract at the
+    mercy of whatever canvas a workbook happens to declare.
+    """
     base = list(_TABLEAU_10 + _TABLEAU_EXTRA)
-    lead = []
-    if brand and _HEX6_RE.match(brand):
-        lead.append(brand)
-    for hex_color in (extra_palette or []):
-        if hex_color and _HEX6_RE.match(hex_color):
+    # Power BI's own default report canvas is white, so that is the background a mark competes with
+    # when the workbook declares none.
+    background = (canvas[0] if canvas and canvas[0] and _HEX6_RE.match(canvas[0]) else "#ffffff")
+    lead, dropped = [], []
+    for hex_color in ([brand] if brand else []) + list(extra_palette or []):
+        if not (hex_color and _HEX6_RE.match(hex_color)):
+            continue
+        if _visible_against(hex_color, background):
             lead.append(hex_color)
+        else:
+            dropped.append(hex_color)
     ordered, seen = [], set()
+    for hex_color in (lead + base if lead else base):
+        low = hex_color.lower()
+        if low not in seen:
+            seen.add(low)
+            ordered.append(hex_color)
+    theme = {"name": _TABLEAU_THEME_FILE, "dataColors": ordered}
+    # ``canvas`` = the dashboards' own (background, foreground). The theme has to carry it, not
+    # just the page object: every visual inherits its default label/axis/legend colour from the
+    # theme, so a dark canvas without it renders near-black text on a near-black page -- present
+    # in the file, invisible on screen. Matches the adjudicated rebuild, which pairs
+    # ``background: #1b1b1b`` with ``foreground: #ffffff``.
+    if canvas:
+        background_fill, foreground = canvas
+        theme["background"] = background_fill
+        theme["foreground"] = foreground
+        if ordered:
+            theme["tableAccent"] = ordered[0]
+    return theme
     for hex_color in (lead + base if lead else base):
         low = hex_color.lower()
         if low not in seen:

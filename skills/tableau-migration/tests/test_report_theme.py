@@ -115,3 +115,85 @@ def test_thin_shell_report_stays_base_theme_only():
     report = json.loads(parts["definition/report.json"])
     assert set(report["themeCollection"]) == {"baseTheme"}
     assert not any(k.startswith("StaticResources/") for k in parts)
+
+
+# --- invisible lead colours -------------------------------------------------------------
+# A Tableau workbook legitimately contains mark colours whose PURPOSE is to be invisible: the
+# classic donut is a pie with a white circle punched through its middle. `_harvest_workbook_palette`
+# sees those as ordinary mark colours, and harvested colours LEAD dataColors -- so one can land at
+# position 0 and become the default series colour for the entire report.
+#
+# Measured 2026-08-24 on 0090_small_multiples: its donut hack's #ffffff reached dataColors[0] and
+# silently erased FIVE bar charts, the donut's own fourth slice, and one of two series in all four
+# time-series panels. The report validated clean and every gate passed; it was found by looking.
+
+
+def test_invisible_harvested_colour_is_dropped_from_dataColors():
+    """The measured defect: white harvested on a white page must not lead the palette."""
+    dc = R.tableau_theme_dict(extra_palette=["#ffffff", "#4E79A7"])["dataColors"]
+    assert "#ffffff" not in [c.lower() for c in dc]
+    assert dc[0] == "#4E79A7"
+
+
+def test_white_is_KEPT_when_the_canvas_is_dark():
+    """The rule is about contrast, not about the colour white.
+
+    This is the test that stops the fix degrading into "strip #ffffff": on a dark dashboard a white
+    mark is the author's most visible colour, and dropping it would be the same defect inverted.
+    """
+    dc = R.tableau_theme_dict(extra_palette=["#ffffff"],
+                              canvas=("#1b1b1b", "#ffffff"))["dataColors"]
+    assert dc[0] == "#ffffff"
+
+
+def test_a_dark_lead_colour_is_dropped_on_a_dark_canvas():
+    dc = R.tableau_theme_dict(extra_palette=["#1b1b1b", "#ffffff"],
+                              canvas=("#1b1b1b", "#ffffff"))["dataColors"]
+    assert dc[0] == "#ffffff"
+    assert "#1b1b1b" not in [c.lower() for c in dc]
+
+
+def test_near_white_on_a_near_white_canvas_is_dropped():
+    """Exact equality is not the invariant -- indistinguishability is. #ffffff on #f5f5f5 is a
+    contrast ratio of 1.09, i.e. the same colour to a viewer."""
+    dc = R.tableau_theme_dict(extra_palette=["#ffffff", "#4E79A7"],
+                              canvas=("#f5f5f5", "#252423"))["dataColors"]
+    assert dc[0] == "#4E79A7"
+
+
+def test_an_invisible_brand_colour_is_dropped_too():
+    dc = R.tableau_theme_dict(brand="#ffffff", extra_palette=["#F28E2B"])["dataColors"]
+    assert dc[0] == "#F28E2B"
+
+
+def test_the_curated_tableau_tail_is_never_filtered():
+    """Only LEAD colours are filtered. The Tableau tail is a known-visible curated palette, and
+    filtering it would make the never-regress contract depend on whatever canvas a workbook
+    happens to declare."""
+    dc = R.tableau_theme_dict(canvas=("#1b1b1b", "#ffffff"))["dataColors"]
+    assert dc == list(R._TABLEAU_10 + R._TABLEAU_EXTRA)
+
+
+def test_no_argument_theme_is_unchanged_by_the_visibility_filter():
+    """The never-regress contract: a workbook with no brand and no harvested colours is byte-
+    identical to before this change."""
+    assert R.tableau_theme_dict()["dataColors"] == list(R._TABLEAU_10 + R._TABLEAU_EXTRA)
+
+
+def test_a_pale_but_visible_colour_survives():
+    """The threshold must not eat legitimate light palette entries -- Tableau's #EDC948 is a
+    contrast of 1.61 on white, which a viewer can plainly see."""
+    dc = R.tableau_theme_dict(extra_palette=["#EDC948"])["dataColors"]
+    assert dc[0] == "#EDC948"
+
+
+def test_contrast_ratio_matches_the_wcag_definition_at_its_extremes():
+    assert round(R._contrast_ratio("#000000", "#ffffff"), 1) == 21.0
+    assert R._contrast_ratio("#ffffff", "#ffffff") == 1.0
+
+
+def test_tableau_accent_never_becomes_an_invisible_colour():
+    """`tableAccent` is taken from dataColors[0], so an unfiltered lead colour would have made
+    table accents invisible as well as marks."""
+    theme = R.tableau_theme_dict(extra_palette=["#ffffff"], canvas=("#ffffff", "#252423"))
+    assert theme["tableAccent"] != "#ffffff"
