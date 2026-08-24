@@ -14,6 +14,33 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ### Added
 
+- **`tableau-migration` (skill `2.264.0` → `2.265.0`): an edited PBIP now reaches a running Power BI
+  Desktop in about a second, instead of costing a ~115 s restart.** The repo's recorded wisdom was
+  that `powerbi-desktop reload` "does NOT re-read edited TMDL" — it returns `{"success": true}` and
+  the old measure expressions stay live — so only closing and reopening picks up a model change.
+  That observation was accurate; the conclusion drawn from it, that Desktop cannot do this, was not.
+  The Bridge's `file.reload/v1` takes a `reloadModelDefinition` parameter Microsoft documents as
+  defaulting to **true**, and the packaged CLI
+  (`@microsoft/powerbi-desktop-bridge-cli` 0.1.2, `dist/index.js` line 561) hard-codes it **false**.
+  One flag in a wrapper hid the capability for a release. `scripts/pbip_desktop_reload.py` sends
+  `true` over the same named pipe, stdlib only and offline.
+
+  Measured 2026-08-24 on a real migrated model: the **same** measure edit, reloaded two ways, read at
+  the artifact (`INFO.MEASURES()`) rather than at the return value — this script landed it, the stock
+  CLI left the old expression live, and **both printed `success: true`**. Neither run could be told
+  apart by its own output, which is precisely why the defect went unnoticed. Loaded data survives
+  (`COUNTROWS` read 9,994 before and after), so no re-refresh is needed to keep querying. Elapsed
+  3.9 s with a definition change, 0.6 s without.
+
+  It **does not** replace the cold open, which is the only thing that proves a file opens from
+  nothing — the class that produced the `pageOrder: []` crash. It speeds up the iterations between
+  cold opens. It also refreshes no data and persists no cache; `pbip-model-refresh` still owns both.
+  Refuses to guess between multiple Desktop instances, and `--require-saved` refuses to overwrite a
+  human's unsaved edits. Runbook: `resources/desktop-bridge-reload.md`; the now-corrected
+  close-and-reopen advice is in `resources/migration-gotchas.md`.
+
+### Fixed
+
 - **`tableau-migration` (skill `2.262.0` → `2.264.0`): a repeatable way to ask Power BI Desktop
   which JSON a formatting feature actually writes, instead of guessing the property name.**
   PBIR `visual.objects` resolves to `DataViewObjectDefinitions`, which permits **arbitrary**

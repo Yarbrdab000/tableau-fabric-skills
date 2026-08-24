@@ -85,7 +85,8 @@ output**.
 
 | Symptom | Cause | Response |
 |---|---|---|
-| Edited a `.tmdl`/`.m` file but Power BI Desktop still runs the old (broken) query | Desktop compiles the `.pbip` **once at open** and does **not** watch the files for changes; the live session keeps the compiled in-memory model | **Close and reopen** the `.pbip` to force a fresh read from disk (Tabular Editor, which writes into the live model, is the exception) |
+| Edited a `.tmdl`/`.m` file but Power BI Desktop still runs the old (broken) query | Desktop compiles the `.pbip` **once at open** and does **not** watch the files for changes; the live session keeps the compiled in-memory model | Push the edit in with `py -3.11 scripts/pbip_desktop_reload.py` (~1 s, keeps loaded data) — see [desktop-bridge-reload.md](desktop-bridge-reload.md). Close-and-reopen (~115 s) still works and is what you use to prove a **cold** open |
+| `powerbi-desktop reload` returned `{"success": true}` and the old measure expressions are still live | The packaged CLI hard-codes `reloadModelDefinition: false`; the Bridge API itself defaults it to **true**. Measured 2026-08-24: same edit, same instant — the CLI left the old expression live, `scripts/pbip_desktop_reload.py` landed the new one, and **both printed `success: true`** | Use `scripts/pbip_desktop_reload.py`. And never read a reload's success flag as evidence the edit landed — confirm at the artifact with `EVALUATE SELECTCOLUMNS(INFO.MEASURES(), "Name", [Name], "Expr", [Expression])` |
 | A Fabric (Service) redeploy worked but the local Desktop copy didn't change | The published model and the local `.pbip` are **separate artifacts** that drift | Reload the `.pbip` after any out-of-band edit/redeploy; don't assume one reflects the other |
 
 ---

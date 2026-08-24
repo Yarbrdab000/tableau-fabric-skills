@@ -608,6 +608,7 @@ This skill is **self-contained** — the bundled scripts cover the full migratio
 | Validation & Reconciliation (ExecuteQuery vs VDS) | [validation-reconciliation.md](resources/validation-reconciliation.md) |
 | Migration Gotchas | [migration-gotchas.md](resources/migration-gotchas.md) |
 | PBIR Property Discovery (ask Desktop what JSON a feature writes) | [pbir-property-discovery.md](resources/pbir-property-discovery.md) |
+| Desktop Bridge Reload (re-read an edited PBIP in ~1 s, no restart) | [desktop-bridge-reload.md](resources/desktop-bridge-reload.md) |
 | Troubleshooting — "I need help" (guided menu) | [troubleshooting.md](resources/troubleshooting.md) |
 | Security & Governance | [security-governance.md](resources/security-governance.md) |
 | Migration Report | [migration-report.md](resources/migration-report.md) |
