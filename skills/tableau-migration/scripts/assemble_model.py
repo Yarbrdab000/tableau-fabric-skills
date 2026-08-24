@@ -6000,6 +6000,101 @@ def _extract_csv_paths_by_relation(hr, arc_path, descriptor, hyper_members, out_
     return out
 
 
+def _materialize_connection_flatfiles(packaged_source, descriptor, dest_dir):
+    """``{normalised bundled filename: absolute path}`` for every flat file this datasource carries.
+
+    A FEDERATED datasource joins tables from several connections, and each connection carries its own
+    bundled file. The datasource-level ``flatfile_filename`` names only ONE of them, so lifting that
+    alone leaves every other connection's tables pointing at their in-archive RELATIVE path -- and
+    Power BI refuses a relative ``File.Contents`` outright (*"The supplied file path must be a valid
+    absolute path"*), so the model opens and loads nothing at all.
+
+    Measured on a user's ``Date Joins.twbx``: two ``excel-direct`` connections
+    (``Sample - Superstore.xlsx`` and ``Book1.xlsx``), only the first landed, and every one of the
+    five tables emitted a relative path. The single-connection case never showed it because
+    ``_effective_connection`` returns the DESCRIPTOR when there is one connection, and the descriptor
+    is exactly where the one absolute path was written.
+
+    Keyed by FILENAME rather than by connection key, because the emitter does not read
+    ``descriptor["connections"]`` at all: for a multi-connection source ``_effective_connection``
+    hands it ``relation["connection"]``, an inline facts dict. The filename is the one field both
+    carry, so it is what the two sides can actually be joined on.
+
+    Fail-closed and never raises: a file that cannot be lifted is simply absent from the map and its
+    tables keep their previous (relative) path.
+    """
+    out = {}
+
+    def _add(fn, directory):
+        if not fn:
+            return
+        key = str(fn).replace("\\", "/").strip().lower()
+        if key in out:
+            return
+        try:
+            p = extract_bundled_flatfile(packaged_source, descriptor, dest_dir,
+                                         filename=fn, directory=directory or "")
+        except Exception:
+            p = None
+        if p:
+            out[key] = p
+
+    conns = (descriptor or {}).get("connections") or {}
+    for _k, conn in (conns.items() if isinstance(conns, dict) else enumerate(conns)):
+        if isinstance(conn, dict):
+            _add(conn.get("flatfile_filename") or conn.get("filename"),
+                 conn.get("flatfile_directory") or conn.get("directory"))
+    # A relation can carry its own inline connection facts that never appear in ``connections``.
+    for rel in (descriptor or {}).get("relations") or []:
+        rc = rel.get("connection") if isinstance(rel, dict) else None
+        if isinstance(rc, dict):
+            _add(rc.get("flatfile_filename") or rc.get("filename"),
+                 rc.get("flatfile_directory") or rc.get("directory"))
+    return out
+
+
+def _descriptor_with_connection_flatfile_paths(descriptor, connection_paths):
+    """A COPY of ``descriptor`` whose connection facts carry their materialised absolute paths.
+
+    Stamps BOTH ``descriptor["connections"]`` and each ``relation["connection"]`` inline dict, matched
+    on the bundled filename. The relation-level stamp is the one that does the work:
+    ``_effective_connection`` hands the emitter ``relation["connection"]`` whenever the datasource has
+    more than one named connection, so a stamp confined to ``descriptor["connections"]`` is never
+    read on exactly the federated shape this exists for.
+
+    Copied rather than mutated because the caller's descriptor is shared with the estate's own
+    reporting; stamping in place would leak an absolute build path into records that outlive it.
+    """
+    if not connection_paths:
+        return descriptor
+
+    def _key(d):
+        fn = d.get("flatfile_filename") or d.get("filename")
+        return str(fn).replace("\\", "/").strip().lower() if fn else None
+
+    def _stamp(d):
+        k = _key(d) if isinstance(d, dict) else None
+        return dict(d, flatfile_path=connection_paths[k]) if k in connection_paths else d
+
+    out = dict(descriptor)
+    conns = descriptor.get("connections") or {}
+    if isinstance(conns, dict):
+        out["connections"] = {k: _stamp(v) for k, v in conns.items()}
+    elif conns:
+        out["connections"] = [_stamp(v) for v in conns]
+    rels = descriptor.get("relations") or []
+    if rels:
+        new_rels = []
+        for rel in rels:
+            rc = rel.get("connection") if isinstance(rel, dict) else None
+            if isinstance(rc, dict):
+                stamped = _stamp(rc)
+                rel = dict(rel, connection=stamped) if stamped is not rc else rel
+            new_rels.append(rel)
+        out["relations"] = new_rels
+    return out
+
+
 def materialize_bundled_flatfile_data(packaged_source, descriptor, dest_dir, *, model_name="model"):
     """Land a flat-file datasource's BUNDLED data to ABSOLUTE on-disk paths so the emitted Import
     model loads in Power BI Desktop -- a relative ``File.Contents`` path opens but loads nothing
@@ -6025,7 +6120,7 @@ def materialize_bundled_flatfile_data(packaged_source, descriptor, dest_dir, *, 
     import os as _os
     import tempfile as _tf
     result = {"kind": None, "reason": None, "hyper_present": False,
-              "flatfile_path": None, "table_csv_paths": None}
+              "flatfile_path": None, "table_csv_paths": None, "connection_paths": {}}
     # A flat-file source is identified by its bundled filename; an extract-backed source (including a
     # SaaS connector such as Salesforce that has no first-party Power BI rebuild) carries only a
     # .hyper and no named file, so ``is_extract`` also engages the materializer -- step 1 no-ops (no
@@ -6045,7 +6140,9 @@ def materialize_bundled_flatfile_data(packaged_source, descriptor, dest_dir, *, 
     except Exception:
         ff = None
     if ff:
-        result.update(kind="flatfile", flatfile_path=ff)
+        result.update(kind="flatfile", flatfile_path=ff,
+                      connection_paths=_materialize_connection_flatfiles(
+                          effective_source, descriptor, dest_dir))
         return result
 
     # 2. Extract case: the named flat file is not packaged, but a .hyper may be. Resolve a usable
@@ -6214,6 +6311,13 @@ def migrate_datasource(source, *, model_name, write_to=None, as_pbip=False, data
                 packaged_source or source, descriptor, _ff_dest, model_name=model_name)
             if _ff_mat.get("kind") == "flatfile":
                 kwargs["flatfile_path"] = _ff_mat.get("flatfile_path")
+                # A FEDERATED datasource bundles one file PER CONNECTION; the datasource-level path
+                # above names only one of them. Stamp each connection's own materialised absolute
+                # path so ``_flatfile_path_for(conn)`` resolves it -- without this, every table from
+                # any other connection keeps its in-archive RELATIVE path and Power BI loads nothing
+                # ("The supplied file path must be a valid absolute path").
+                descriptor = _descriptor_with_connection_flatfile_paths(
+                    descriptor, _ff_mat.get("connection_paths"))
             elif _ff_mat.get("kind") == "csv":
                 local_data = _ff_mat.get("table_csv_paths")
 

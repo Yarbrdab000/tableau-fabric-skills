@@ -3216,7 +3216,8 @@ def _flatfile_path_for(conn):
         conn.get("flatfile_filename") or conn.get("filename"))
 
 
-def extract_bundled_flatfile(packaged_source, descriptor, dest_dir):
+def extract_bundled_flatfile(packaged_source, descriptor, dest_dir, *,
+                             filename=None, directory=None):
     """Lift a packaged datasource's BUNDLED flat-file (Excel/CSV) out to an ABSOLUTE on-disk path.
 
     A Tableau ``.tdsx``/``.twbx`` is a zip that bundles its flat-file data under ``Data/`` while the
@@ -3225,6 +3226,10 @@ def extract_bundled_flatfile(packaged_source, descriptor, dest_dir):
     path -- *"The supplied file path must be a valid absolute path"* -- so an Import model emitted
     straight from that relative path OPENS but loads NO data. This copies the bundled member to an
     absolute location the emitted M can read, so the ``.pbip`` opens AND loads.
+
+    ``filename`` / ``directory`` override the descriptor's own pair, so a FEDERATED datasource can
+    lift each of its connections' files rather than only the datasource-level one. Absent, the
+    descriptor's values are used and behaviour is unchanged.
 
     Returns the absolute path of the extracted file, or ``None`` -- in which case the caller keeps the
     existing (relative) path, i.e. behavior is UNCHANGED. ``None`` is returned whenever there is
@@ -3237,7 +3242,7 @@ def extract_bundled_flatfile(packaged_source, descriptor, dest_dir):
     import os as _os
     import zipfile as _zip
 
-    filename = (descriptor or {}).get("flatfile_filename")
+    filename = filename or (descriptor or {}).get("flatfile_filename")
     if not filename:  # not a flat-file source (live DB / federated SQL) -> nothing to extract
         return None
 
@@ -3259,7 +3264,8 @@ def extract_bundled_flatfile(packaged_source, descriptor, dest_dir):
     if not raw or raw[:2] != b"PK":  # not a zip archive (.tdsx/.twbx) -> keep the relative path
         return None
 
-    directory = (descriptor or {}).get("flatfile_directory") or ""
+    directory = directory if directory is not None else (
+        (descriptor or {}).get("flatfile_directory") or "")
     rel = (directory.rstrip("/\\") + "/" + filename) if directory else filename
     rel_norm = rel.replace("\\", "/").lstrip("./").lower()
     base_norm = _os.path.basename(filename.replace("\\", "/")).lower()
@@ -3283,7 +3289,23 @@ def extract_bundled_flatfile(packaged_source, descriptor, dest_dir):
 
     try:
         _os.makedirs(dest_dir, exist_ok=True)
-        out_path = _os.path.join(dest_dir, _os.path.basename(filename.replace("\\", "/")))
+        base = _os.path.basename(filename.replace("\\", "/"))
+        out_path = _os.path.join(dest_dir, base)
+        # A FEDERATED datasource can bundle two different files that share a basename (they differ
+        # only by archive directory). Landing both on the same name would silently give one table the
+        # other's data -- a model that loads, refreshes and is wrong. Disambiguate only on a real
+        # collision, so the single-file case keeps its exact filename.
+        if _os.path.exists(out_path):
+            try:
+                with open(out_path, "rb") as fh:
+                    same = fh.read() == data
+            except OSError:
+                same = False
+            if not same:
+                import hashlib as _hl
+                stem, ext = _os.path.splitext(base)
+                tag = _hl.sha1(rel_norm.encode("utf-8", "replace")).hexdigest()[:8]
+                out_path = _os.path.join(dest_dir, "%s__%s%s" % (stem, tag, ext))
         with open(out_path, "wb") as fh:
             fh.write(data)
     except OSError:

@@ -14,6 +14,53 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ### Fixed
 
+- **`tableau-migration` (skill `2.261.0` → `2.262.0`): a workbook federating TWO bundled files now
+  loads data instead of none.** Power BI refuses a relative `File.Contents` path outright — *"The
+  supplied file path must be a valid absolute path"* — so a model emitted from Tableau's in-archive
+  path opens and loads **nothing**. `materialize_bundled_flatfile_data` exists precisely to prevent
+  that, by lifting the bundled file to an absolute location.
+
+  It lifted **one**: the datasource-level `flatfile_filename`. A **federated** datasource joins tables
+  from several connections, each carrying its own bundled file, so every table belonging to any other
+  connection kept its relative path — and one unresolvable partition is enough to fail the refresh.
+
+  **Why the corpus never caught it.** `_effective_connection` returns the **descriptor** when a
+  datasource has a single named connection, and the descriptor is exactly where that one absolute
+  path was written. All 34 corpus workbooks are single-connection, so the whole corpus passed while
+  the federated shape was broken. The corpus diff for this fix is **byte-identical apart from
+  timestamps** — real evidence of no regression, and equally that the corpus gives this path **zero**
+  coverage.
+
+  Measured on a user-supplied `Date Joins.twbx` — two `excel-direct` connections
+  (`Sample - Superstore.xlsx` joined to `Book1.xlsx` **on a date column**):
+
+  | | before | after |
+  |---|---|---|
+  | bundled files landed | 1 of 2 | **2 of 2** |
+  | partitions with an absolute path | **0 of 5** | **5 of 5** |
+  | refresh | `DataFormat.Error` | **`DATA_OK + PERSISTED`**, 10,194 rows |
+
+  And the join works end to end. Filtering `Orders` directly to 30 Dec 2026 gives **8** rows;
+  filtering `Sheet11` and propagating **through the date join** gives **8** — against 10,194
+  unfiltered, so a broken relationship would look visibly different rather than merely absent.
+
+  Per-connection paths are keyed by FILENAME and stamped onto each `relation["connection"]`, because
+  that inline dict is what `_effective_connection` hands the emitter on a multi-connection source; a
+  stamp confined to `descriptor["connections"]` is never read on the one shape this exists for. Two
+  bundled files sharing a basename land on distinct paths — overwriting would give one table the
+  other's data, a model that loads, refreshes, and is wrong.
+
+  **The tests initially did not catch this.** They called the helpers directly, so disabling the call
+  site left the suite green at 5013 passed with the bug injected — proving a helper works is not
+  proving anything reads it. A test against the public `materialize_bundled_flatfile_data` was added;
+  the injection then fails exactly 2 tests, both new.
+
+  Note the Tableau join was `full` outer. A Power BI relationship is filter propagation rather than a
+  join, so unmatched rows survive on both sides — closer to Tableau's full outer than an inner join
+  would be, but not identical, and not yet disclosed.
+
+### Added
+
 - **`tableau-migration` (skill `2.260.0` → `2.261.0`): the calendar's ACTIVE date is chosen from what
   the workbook CHARTS, not from what its columns are called.** Power BI allows one active
   relationship between a fact and a calendar, so the model build must pick each fact's business date.
