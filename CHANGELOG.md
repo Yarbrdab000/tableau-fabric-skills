@@ -12,7 +12,7 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ## [Unreleased]
 
-### Added
+### Fixed
 
 - **`tableau-migration` (skill `2.274.0` → `2.275.0`): a per-visual status now says what was actually
   CHECKED, so a false green is visible (#173).** `status: "rebuilt"` asserts only that the visual
@@ -55,7 +55,7 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
   Suite 5008 → **5014**.
 
-- **`tableau-migration` (skill `2.266.0` → `2.274.0`): a published datasource reached only as a
+- **`tableau-migration` (skill `2.267.0` → `2.274.0`): a published datasource reached only as a
   SECONDARY no longer ships silently as a `localhost` phantom (#174).** A published Tableau
   datasource connects through a federated proxy whose connection class is `sqlproxy` and whose server
   is the literal `localhost` — an internal Tableau address, not an endpoint anything can reach. When
@@ -103,6 +103,39 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
   a phantom shipping. That count *is* the measurement of the silence.
 
   Suite 5001 → **5008**.
+
+- **`tableau-migration` (skill `2.266.0` → `2.267.0`): a Tableau donut's white "hole" colour no
+  longer paints the whole report's data invisible.** `_harvest_workbook_palette` promotes every mark
+  colour a workbook uses to the FRONT of the report theme's `dataColors`, so single-series visuals
+  rebuild in the author's colours instead of Power BI blue. But a Tableau workbook legitimately
+  contains mark colours whose entire purpose is to be **invisible** — the classic donut is a pie
+  with a white circle punched through its middle, and spacer/halo marks are painted in the canvas
+  colour on purpose. Harvested as ordinary mark colours, one of those can land at `dataColors[0]`
+  and become the default series colour for every visual in the report.
+
+  Measured on `0090_small_multiples`, whose donut hack paints `#ffffff`: that white reached
+  position 0 and silently erased **five bar charts entirely** (every mark, white on white), **the
+  donut's own fourth slice** (503.17K / 21.63%, leaving a ring that merely looked broken), and **one
+  of the two series in all four time-series panels**. The report validated clean, `pbir_lint` passed,
+  and definition-of-done reported success throughout — the defect is invisible to every gate we have,
+  because a valid hex in a valid theme is exactly what all of them check for. It was found by opening
+  the build and looking at it.
+
+  Lead colours (brand + harvested) are now dropped when they are indistinguishable from the page
+  background, by WCAG contrast ratio below 1.2. **The rule is about contrast, not about white**: on
+  a dark dashboard a white mark is the author's most visible colour and is kept, while a near-black
+  one is dropped — a plain "strip `#ffffff`" fix would have been the same defect inverted, and a test
+  asserts exactly that. The curated Tableau 10/20 tail is deliberately NOT filtered, so a workbook
+  with no brand and no harvested colours stays byte-identical (the never-regress contract).
+
+  Corpus A/B across all 34 workbooks, every one of the 1470 emitted files compared: **7 changed —
+  the 4 intended theme files, and 3 that differ only by their generation timestamp.** 0 files added
+  or removed. `0090` dropped `#ffffff` (21→20 colours, position 0 now Tableau blue); `0088` dropped
+  `#f0f0f0` and `#ffffff`, both invisible on its `#f5f5f5` canvas, with its brand colour untouched at
+  position 0. Nothing added, relative order preserved. Re-verified by cold-opening the rebuilt `.pbip`
+  and looking: all five bar charts populated, the donut whole, both time-series measures visible.
+
+### Added
 
 - **`tableau-migration` (skill `2.265.0` → `2.266.0`): a rollback anchor that points at the wrong
   commit is now caught, not just one that is missing or unreachable.** The two existing anchor gates
