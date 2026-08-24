@@ -3002,6 +3002,72 @@ def _build_date_dimensions(tables, emitted_names, relationships, *, mark_as_date
                              "tables": [n for n, _ in built], "islands": reports}
 
 
+def _filter_reach(adjacency, start):
+    """Every table a filter placed on ``start`` can reach, following ``adjacency``."""
+    seen, stack = set(), [start]
+    while stack:
+        node = stack.pop()
+        for nxt in adjacency.get(node, ()):  # noqa: SIM118 - dict.get on a defaultdict-free map
+            if nxt not in seen:
+                seen.add(nxt)
+                stack.append(nxt)
+    return seen
+
+
+def _activate_without_ambiguity(candidates, relationships, date_name):
+    """Which tables may keep an ACTIVE calendar relationship -> ``{display_name, ...}``.
+
+    POWER BI REFUSES TO OPEN A PROJECT THAT HAS TWO ACTIVE FILTER PATHS BETWEEN ANY TWO TABLES.
+    Not "renders oddly" -- the whole ``.pbip`` fails to load with *"There are ambiguous paths between
+    'X' and 'Y'"*, which also takes the model beside it out of reach. Giving every fact its own
+    active date edge is therefore not safe on its own: two facts joined to EACH OTHER and both joined
+    to the SAME calendar form a diamond, and the second path appears without either edge looking
+    wrong in isolation.
+
+    Measured on Salesforce NPSP: ``Date (Service Delivery)`` reached ``pmdm__ServiceDelivery__c``
+    both directly and through ``pmdm__ProgramEngagement__c``, and Desktop refused the project. Four
+    such pairs existed in one model. The per-island calendar split already removes the CROSS-island
+    form of this (one hub touching every island manufactures routes between otherwise clean stars);
+    this closes the WITHIN-island form, which the split cannot.
+
+    Greedy and order-deterministic: candidates are considered in a stable order and one is activated
+    only when doing so introduces no second path. Because an edge is added only when its whole
+    downstream set is currently unreachable from the calendar, the active graph stays a forest by
+    construction -- there is no second pass and no possibility of ending ambiguous.
+
+    Filter direction matters and inverting it inverts the answer. A relationship runs
+    ``from`` (MANY) -> ``to`` (ONE), while a filter propagates ONE -> MANY, i.e. ``to`` -> ``from``.
+    Modelling this undirected reports ambiguity everywhere a date table touches two facts, which is
+    the normal, legal star shape.
+    """
+    adjacency = {}
+    for rel in (relationships or []):
+        if rel.get("is_active") is False:
+            continue
+        src, dst = rel.get("to_table"), rel.get("from_table")
+        if not src or not dst:
+            continue
+        adjacency.setdefault(src, set()).add(dst)
+        if rel.get("cross_filter") == "both":
+            adjacency.setdefault(dst, set()).add(src)
+
+    # Stable order: a table whose primary date the workbook actually charts wins the direct edge,
+    # then alphabetical so the outcome never depends on dict iteration order.
+    ordered = sorted((c for c in candidates if c[2] is not None), key=lambda c: c[0])
+
+    activated = set()
+    for disp, _cols, _primary in ordered:
+        reachable_now = _filter_reach(adjacency, date_name)
+        if disp in reachable_now:
+            continue  # a second path -- leave this one inactive
+        downstream = _filter_reach(adjacency, disp) | {disp}
+        if downstream & reachable_now:
+            continue  # activating would create a second path to something further down
+        adjacency.setdefault(date_name, set()).add(disp)
+        activated.add(disp)
+    return activated
+
+
 def _build_date_dimension(tables, emitted_names, relationships, *, mark_as_date=True,
                           name_pref="Date", mode="import", date_range=None, date_usage=None):
     """Detect fact date columns and build a shared Date dimension + its relationships.
@@ -3070,6 +3136,9 @@ def _build_date_dimension(tables, emitted_names, relationships, *, mark_as_date=
         date_name = f"{name_pref} {i}"
 
     rels, warnings, details = [], [], []
+    # Which fact keeps its DIRECT calendar edge is decided by an ambiguity-avoiding pass below, not
+    # by iteration order, so the candidate primaries are collected first.
+    candidates = []
     for disp, date_cols in by_table:
         primary = _select_primary_date(date_cols, usage=date_usage)
         if primary is None:
@@ -3077,8 +3146,20 @@ def _build_date_dimension(tables, emitted_names, relationships, *, mark_as_date=
                 f"table '{disp}' has multiple date columns with no clearly primary one "
                 f"({', '.join(date_cols)}); all emitted inactive -- set the active date via "
                 f"USERELATIONSHIP or a model edit.")
+        candidates.append((disp, date_cols, primary))
+
+    activated = _activate_without_ambiguity(candidates, relationships, date_name)
+    for disp, date_cols, primary in candidates:
+        if primary is not None and disp not in activated:
+            warnings.append(
+                f"table '{disp}' date column '{primary}' is emitted INACTIVE: activating it would "
+                f"give '{date_name}' two filter paths to '{disp}' (the second runs through another "
+                f"fact already joined to this calendar), and Power BI REFUSES TO OPEN a project with "
+                f"an ambiguous path. '{disp}' is still date-filtered through that other fact; use "
+                f"USERELATIONSHIP to aggregate on its own date.")
+    for disp, date_cols, primary in candidates:
         for col in date_cols:
-            active = col == primary
+            active = (col == primary and disp in activated)
             rel = {
                 "from_table": disp, "from_col": col,
                 "to_table": date_name, "to_col": "Date",

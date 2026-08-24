@@ -14,6 +14,39 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ### Fixed
 
+- **`tableau-migration` (skill `2.267.0` → `2.268.0`): a rebuilt Salesforce model no longer refuses
+  to OPEN with "ambiguous paths".** Reported from the field as a Power BI Desktop frown: *"There's a
+  problem with the definition content in your Power BI Project. There are ambiguous paths between
+  'pmdm__ServiceDelivery__c' and 'Date (Service Delivery)'."* Power BI does not render this badly —
+  it declines the entire project, which takes the semantic model sitting beside the report out of
+  reach too. This ranks with invalid TMDL, not with fidelity.
+
+  **A regression from the per-datasource calendar work (2.260.0 / 2.261.0), and measured as one**:
+  the pre-change engine emitted 28 active / 11 inactive relationships and **0** ambiguous pairs; the
+  post-change engine emitted 33 active / 6 inactive and **4**. Giving every fact its own active date
+  edge is safe until two facts are joined to *each other* as well as to the same calendar — then
+  `calendar→SD` and `calendar→PE→SD` are two filter paths. Neither edge is wrong on its own; the
+  defect exists only in the *relation between* them, which is precisely the shape no per-object
+  validator can see. `powerbi-report-author validate`, `pbir_lint` and definition-of-done all
+  passed on a file that would not open.
+
+  Two independent layers now close it. The **emitter** (`_activate_without_ambiguity`) activates a
+  fact's date edge only when doing so introduces no second path, walking candidates in a stable
+  order so the active graph stays a forest by construction; a fact that loses its direct edge is
+  still date-filtered through its neighbour and gets a warning naming `USERELATIONSHIP`. The
+  **openability gate** grows `unambiguous_relationship_paths`, so an ambiguity reaching the output
+  by any other route fails the build instead of shipping.
+
+  Filter DIRECTION is the whole check, not a detail: a relationship runs many→one while a filter
+  propagates one→many. Modelled undirected, the same model reports **90** ambiguous pairs instead of
+  4 — and an ordinary star (one calendar, two facts) looks broken, so the gate would fail every
+  healthy build. A test pins that negative.
+
+  Calibrated against Desktop in both directions: the gate fires on the exact build Desktop refused
+  and passes the rebuilt one, which Desktop then **opened**. Corpus A/B over all 1470 emitted files:
+  **4 changed — 3 timestamps and only `0088`'s `relationships.tmdl`**, 0 added, 0 removed. Across all
+  23 corpus models: 1 unopenable before, **0 after**.
+
 - **`tableau-migration` (skill `2.266.0` → `2.267.0`): a Tableau donut's white "hole" colour no
   longer paints the whole report's data invisible.** `_harvest_workbook_palette` promotes every mark
   colour a workbook uses to the FRONT of the report theme's `dataColors`, so single-series visuals

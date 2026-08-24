@@ -521,6 +521,148 @@ REQUIRED_ROLES = {
 _REQUIRED_ROLES = REQUIRED_ROLES  # module-internal alias used by the rule below
 
 
+# --- R10: invisible ink -------------------------------------------------------------------
+# EVERY OTHER RULE IN THIS FILE ASKS "IS THIS WELL-FORMED". THIS ONE ASKS "WILL A HUMAN SEE IT",
+# and the two are independent: a colour is schema-valid whatever its value, so no validator --
+# ours, or Microsoft's ``powerbi-report-author validate`` -- can ever flag a mark painted the same
+# colour as the page. There is no malformed artifact to find. The report is perfect and empty.
+#
+# THE DEFECT THAT MOTIVATED IT (fixed in 2.267.0, guarded here so it cannot return by another
+# route). A Tableau donut is a pie with a WHITE CIRCLE punched through its middle; that white is a
+# real mark colour in the source, so the palette harvester collected it and it landed at
+# ``dataColors[0]`` -- the default series colour for the whole report. On 0090_small_multiples that
+# erased FIVE bar charts, the donut's own fourth slice, and one of two series in all four
+# time-series panels. ``validate`` clean, ``pbir_lint`` clean, definition-of-done PASS, throughout.
+#
+# Scope is deliberately narrow, because a false positive here blocks a legitimate build:
+#   * only EXPLICIT colours the emitter wrote are judged -- never a Power BI default, which we
+#     cannot see and must not guess at;
+#   * the comparison is against the background that colour actually sits on, resolved
+#     theme-background -> white (Power BI's own default canvas), not an assumed white;
+#   * the threshold is "the same colour to the eye", far below any accessibility bar. Tableau's own
+#     pale yellow #EDC948 sits at 1.61 on white and must pass -- this rule finds ink that is
+#     literally invisible, not ink that is merely low-contrast.
+_INK_INVISIBLE_CONTRAST = 1.2
+
+
+def _hex6(value):
+    """``value`` as a ``#rrggbb`` string, or ``None`` if it is not one.
+
+    Power BI writes colours several ways (bare literal, ``solid.color`` expr, theme index). Only a
+    literal hex can be judged here; a themed index is resolved by Power BI at render time and
+    guessing at it would manufacture false positives.
+    """
+    if not isinstance(value, str):
+        return None
+    v = value.strip()
+    if len(v) == 7 and v[0] == "#":
+        try:
+            int(v[1:], 16)
+        except ValueError:
+            return None
+        return v.lower()
+    return None
+
+
+def _relative_luminance(hex6):
+    chans = (int(hex6[i:i + 2], 16) / 255.0 for i in (1, 3, 5))
+    lin = [(c / 12.92 if c <= 0.04045 else ((c + 0.055) / 1.055) ** 2.4) for c in chans]
+    return 0.2126 * lin[0] + 0.7152 * lin[1] + 0.0722 * lin[2]
+
+
+def contrast_ratio(a, b):
+    """WCAG 2.x contrast ratio between two ``#rrggbb`` colours: 1.0 (identical) .. 21.0."""
+    la, lb = _relative_luminance(a), _relative_luminance(b)
+    return (max(la, lb) + 0.05) / (min(la, lb) + 0.05)
+
+
+def _theme_background(parts):
+    """The report theme's declared ``background``, or Power BI's own default canvas white.
+
+    Falling back to white is not an assumption about the workbook -- it is what Power BI actually
+    paints when a theme declares no background, which is the surface the ink competes with.
+    """
+    for path in sorted(parts):
+        if not path.endswith(".json") or "RegisteredResources" not in path:
+            continue
+        doc = _load_json(parts, path)
+        if isinstance(doc, dict) and "dataColors" in doc:
+            return _hex6(doc.get("background")) or "#ffffff"
+    return "#ffffff"
+
+
+def _lint_invisible_ink(parts):
+    """R10: an explicitly emitted colour that is indistinguishable from what it sits on.
+
+    Judges two surfaces, both of which have burned us or could:
+
+      * the report theme's ``dataColors`` -- position 0 is the default series colour for every
+        single-series visual, so one invisible entry there is a whole-report outage;
+      * a visual's explicit ``dataPoint.defaultColor`` / ``fill`` literal.
+
+    Returns a problem per invisible colour. Never raises.
+    """
+    problems = []
+    background = _theme_background(parts)
+
+    for path in sorted(parts):
+        if not path.endswith(".json") or "RegisteredResources" not in path:
+            continue
+        doc = _load_json(parts, path)
+        if not isinstance(doc, dict) or "dataColors" not in doc:
+            continue
+        for idx, raw in enumerate(doc.get("dataColors") or []):
+            hexed = _hex6(raw)
+            if hexed and contrast_ratio(hexed, background) < _INK_INVISIBLE_CONTRAST:
+                problems.append(
+                    "%s: theme dataColors[%d] = %s is invisible on the %s page background "
+                    "(contrast %.2f) -- Power BI paints series with it and the marks disappear; "
+                    "at index 0 this silently blanks every single-series visual in the report"
+                    % (path, idx, hexed, background, contrast_ratio(hexed, background)))
+
+    for path in sorted(parts):
+        if not path.endswith("visual.json"):
+            continue
+        doc = _load_json(parts, path)
+        if not isinstance(doc, dict):
+            continue
+        visual = doc.get("visual")
+        objs = visual.get("objects") if isinstance(visual, dict) else None
+        if not isinstance(objs, dict):
+            continue
+        for obj_name in ("dataPoint",):
+            for entry in (objs.get(obj_name) or []):
+                props = entry.get("properties") if isinstance(entry, dict) else None
+                if not isinstance(props, dict):
+                    continue
+                for prop_name in ("defaultColor", "fill"):
+                    hexed = _hex6(_color_literal(props.get(prop_name)))
+                    if hexed and contrast_ratio(hexed, background) < _INK_INVISIBLE_CONTRAST:
+                        problems.append(
+                            "%s: %s.%s = %s is invisible on the %s page background "
+                            "(contrast %.2f) -- the visual renders empty"
+                            % (path, obj_name, prop_name, hexed, background,
+                               contrast_ratio(hexed, background)))
+    return problems
+
+
+def _color_literal(node):
+    """Dig a ``#rrggbb`` out of PBIR's ``solid.color.expr.Literal.Value`` nesting, or ``None``."""
+    if isinstance(node, str):
+        return node
+    if not isinstance(node, dict):
+        return None
+    for key in ("solid", "color", "expr", "Literal"):
+        if key in node:
+            inner = _color_literal(node.get(key))
+            if inner:
+                return inner
+    value = node.get("Value")
+    if isinstance(value, str):
+        return value.strip().strip("'")
+    return None
+
+
 def _lint_required_roles(parts):
     """Validity R9: a visual must project every role its visual type requires (#144).
 
@@ -593,6 +735,7 @@ def lint_pbir_parts(parts, model_surface=None):
             + _lint_card_display_units(parts) + _lint_native_query_refs(parts)
             + _lint_page_order(parts) + _lint_required_roles(parts)
             + _lint_dangling_select_refs(parts)
+            + _lint_invisible_ink(parts)
             + lint_visual_model_bindings(parts, model_surface))
 
 
