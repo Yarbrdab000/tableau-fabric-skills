@@ -14,6 +14,35 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ### Added
 
+- **`tableau-migration` (skill `2.265.0` → `2.266.0`): a rollback anchor that points at the wrong
+  commit is now caught, not just one that is missing or unreachable.** The two existing anchor gates
+  ask whether an anchor EXISTS and whether git can RESOLVE it. Neither asks whether it points
+  anywhere *useful* — and that is the gap where the damage lands. When two parallel sessions collide
+  on a version they also collide on its anchor NAME, because `refs/tags` is one namespace shared by
+  every worktree; the loser's release step re-points the tag at its own commit. The anchor is then
+  still present and still reachable, both gates pass, and `git reset --hard rollback/pre-vX.Y.Z`
+  quietly lands you on work that already contains X.Y.Z. Rollback stops meaning rollback with no
+  signal at all. Observed live twice, most recently when a batch `git tag -d` of three
+  "obviously mine" anchors removed two whose *versions* belonged to another session.
+
+  The new gate asserts the thing that actually defines a rollback: **`VERSION` at the anchor must be
+  strictly less than the version the anchor names.** The tempting stricter rule — anchor ==
+  parent of the bump commit — was measured and rejected: 4 of 268 anchors violate it *legitimately*
+  because the parent is a PR merge commit, two with a byte-identical tree. Rollback is not a claim
+  about commit identity but about the state you land in, and the VERSION stamp is exactly that
+  state, so comparing stamps tolerates merges, rebases and renumbers while still catching every
+  re-point. Measured across all history: **306 anchors, 306 satisfy it, 0 violations** — an exact
+  property of the repo, not a rule retrofitted onto it. Two git calls total; labelled anchors
+  belonging to other skills are skipped rather than mis-compared.
+
+  Verified red under injection, with the three sibling anchor gates staying green — the standard
+  that a gate is unproven until it fails on something its neighbours miss. Also records the
+  non-destructive way to probe it: **add** a bogus low-numbered anchor, never re-point a real one.
+  The first probe re-pointed a live anchor and was recoverable only because that tag happened to be
+  on `origin`.
+
+### Fixed
+
 - **`tableau-migration` (skill `2.264.0` → `2.265.0`): an edited PBIP now reaches a running Power BI
   Desktop in about a second, instead of costing a ~115 s restart.** The repo's recorded wisdom was
   that `powerbi-desktop reload` "does NOT re-read edited TMDL" — it returns `{"success": true}` and
