@@ -70,6 +70,55 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ### Fixed
 
+- **`tableau-migration` (skill `2.266.0` → `2.274.0`): a published datasource reached only as a
+  SECONDARY no longer ships silently as a `localhost` phantom (#174).** A published Tableau
+  datasource connects through a federated proxy whose connection class is `sqlproxy` and whose server
+  is the literal `localhost` — an internal Tableau address, not an endpoint anything can reach. When
+  the **primary** datasource is that proxy the estate path already gates honestly (`pbip_status:
+  skipped`, needs-storage-decision). When a **secondary** is, nothing did: the workbook built, looked
+  complete, and carried an empty disconnected table pointed at `localhost`, while three sibling
+  workbooks in the same estate gated correctly.
+
+  **Verified independently before acting**, since the report was code-level: `secondary_datasources`
+  appears **exactly once** in the whole engine — written at its construction site, read nowhere — and
+  `storage_mode.py` contains **zero** references to `secondary`. Both of the reporter's measurements
+  were exact.
+
+  The write-only field turns out to be **deliberate**: `_workbook_binding_signal` documents itself as
+  *"records a SIGNAL; changes no routing today"*, pending a cross-skill catalog contract. So the
+  inert signal is not the bug. The bug is that the workbook then **ships a phantom with no
+  disclosure** — and the engine's own handover named the dependency, so it knew and said nothing
+  actionable.
+
+  Two changes, deliberately separate:
+
+  * `binding_signal` now records **`secondary_published_datasources`** — which secondaries are
+    themselves published. `secondary_datasources` carried bare labels, so nothing downstream (or
+    anyone reading the handover) could tell a published dependency from an ordinary one. Recorded as
+    its own key rather than by widening `is_published`: widening it would relabel the workbook's
+    `kind` as published, which is **false** — its primary is embedded — and every consumer that reads
+    `kind` to choose rebind-vs-rebuild would be told the wrong thing to fix a reporting gap.
+  * a new `phantom_published_proxy_tables` finding plus a warning, read from the **emitted**
+    connection parameters rather than re-derived from the workbook, naming the datasource and saying
+    the table opens empty.
+
+  **The silence is the defect, not the stub.** The model opens, validates and binds; the table is
+  simply always empty — the same family as a `= BLANK()` measure (2.227.0) and a dangling
+  `SelectRef`: structurally valid, semantically absent. Which is also why this is *third* instance of
+  the pattern in one file: `_workbook_blend_links` carries a comment recording issue #101, where a
+  declared block nothing read left a blended secondary related to nothing at all.
+
+  **Refusals are the feature.** `localhost` alone is an ordinary local SQL Server or Postgres, so
+  keying on the host would fire on valid models constantly; only the combination with the `sqlproxy`
+  parameter suffix means a published proxy. A `_sqlproxy` parameter pointing at a **real** host is a
+  successful rebind and is not reported. Both pinned by test.
+
+  **Clause 3 clean, both trees patched from the start:** disabling the detector gives
+  `3 failed, 5005 passed` — every failure one of the new tests, so nothing else in the suite notices
+  a phantom shipping. That count *is* the measurement of the silence.
+
+  Suite 5001 → **5008**.
+
 - **`tableau-migration` (skill `2.262.0` → `2.264.0`): a repeatable way to ask Power BI Desktop
   which JSON a formatting feature actually writes, instead of guessing the property name.**
   PBIR `visual.objects` resolves to `DataViewObjectDefinitions`, which permits **arbitrary**

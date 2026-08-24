@@ -2620,6 +2620,21 @@ def _workbook_binding_signal(twb_text, ir):
         return None
     primary, secondaries = _rank_primary_datasource(inventory, ir)
     is_published = (primary.get("connection_class") or "").strip().lower() == "sqlproxy"
+    # Which SECONDARIES are themselves published (#174). ``is_published`` above is deliberately
+    # about the PRIMARY -- that is what ``kind`` describes -- but a workbook can have an EMBEDDED
+    # primary and a PUBLISHED secondary, and that shape used to be invisible: ``secondary_datasources``
+    # carried bare labels, so nothing downstream (or reading the handover) could tell a published
+    # dependency from an ordinary one. The workbook then built with an empty ``sqlproxy`` proxy table
+    # pointed at ``localhost``, while sibling workbooks whose PRIMARY was published gated honestly.
+    # Recorded as its own key rather than by widening ``is_published``: widening it would relabel the
+    # workbook's ``kind`` as published, which is false -- its primary is embedded, and every consumer
+    # that reads ``kind`` to decide rebind-vs-rebuild would be told the wrong thing to fix a
+    # reporting gap.
+    secondary_published = [
+        s.get("label") or s.get("caption") or s.get("name")
+        for s in secondaries
+        if (s.get("connection_class") or "").strip().lower() == "sqlproxy"
+    ]
     label = primary.get("label") or primary.get("caption") or primary.get("name")
 
     view_local_calcs = []
@@ -2657,6 +2672,7 @@ def _workbook_binding_signal(twb_text, ir):
         "primary_datasource": label,
         "published_ds_name": label if is_published else None,
         "secondary_datasources": [s.get("label") for s in secondaries],
+        "secondary_published_datasources": secondary_published,
         "view_local_calcs": view_local_calcs,
         "recommendation": recommendation,
         "note": note,
@@ -3268,6 +3284,50 @@ _COLOUR_TWIN_SUFFIX = " (colour)"
 _COLOUR_TWIN_DECL_RE = re.compile(r"^\tmeasure '([^']+ \(colour\))'\s*=", re.M)
 
 
+def _phantom_published_proxy_tables(model_parts):
+    """Emitted tables bound to a published datasource's ``sqlproxy`` proxy rather than to real data.
+
+    A published Tableau datasource connects through a federated proxy whose connection class is
+    ``sqlproxy`` and whose server is the literal ``localhost`` -- an internal Tableau address, not an
+    endpoint anything can reach. When the PRIMARY datasource is that proxy the estate path already
+    gates honestly (``pbip_status: skipped``, needs-storage-decision). When a SECONDARY is, nothing
+    did: the workbook built, looked complete, and carried an empty disconnected table whose M points
+    at ``localhost`` (#174, on a 12-workbook estate where sibling workbooks gated correctly).
+
+    THE SILENCE IS THE DEFECT. The model opens, validates, and binds; the table is simply always
+    empty. That is the same family as a ``= BLANK()`` measure (2.227.0) and a dangling ``SelectRef``:
+    structurally valid, semantically absent, and invisible to every structural check. So this reads
+    the EMITTED artifact -- the connection parameters actually written -- rather than re-deriving
+    intent from the workbook, because what ships is what matters.
+
+    Keyed on the ``sqlproxy`` parameter suffix that ``emit_connection_parameters`` writes for a
+    federated proxy connection, together with the ``localhost`` server value. Both must be present:
+    a real connector that happens to be on localhost is a legitimate local database, and a
+    ``_sqlproxy`` parameter with a real host is a resolved rebind rather than a phantom.
+
+    Returns ``[{"parameter", "database"}]`` sorted, empty when nothing qualifies -- so a build with
+    no published secondary is unaffected.
+    """
+    if not isinstance(model_parts, dict):
+        return []
+    out = []
+    for path, text in sorted(model_parts.items()):
+        if not (isinstance(path, str) and path.endswith("expressions.tmdl")
+                and isinstance(text, str)):
+            continue
+        # ``expression Server_sqlproxy = "localhost" meta [...]`` and its Database_ sibling.
+        servers = dict(re.findall(
+            r'(?m)^expression\s+(Server_sqlproxy\w*)\s*=\s*"([^"]*)"', text))
+        dbs = dict(re.findall(
+            r'(?m)^expression\s+(Database_sqlproxy\w*)\s*=\s*"([^"]*)"', text))
+        for name, host in sorted(servers.items()):
+            if host.strip().lower() != "localhost":
+                continue
+            suffix = name[len("Server"):]
+            out.append({"parameter": name, "database": dbs.get("Database" + suffix)})
+    return out
+
+
 def _visuals_projecting_stub_measures(model_parts, report_parts):
     """Visuals that project a measure whose whole expression is an inert ``BLANK()`` stub.
 
@@ -3850,6 +3910,19 @@ def _build_datasource_pbip(entry, wb_detail, twb_text, result, ds, *, label, mod
     _stub_visuals = _visuals_projecting_stub_measures(res.get("parts"), report_parts)
     if _stub_visuals:
         entry["visuals_projecting_stub_measures"] = _stub_visuals
+    # A published datasource reached only as a SECONDARY used to land as an empty table pointed at
+    # localhost, with no gate and no flag, while sibling workbooks whose PRIMARY was published gated
+    # honestly (#174). Read on the SHIPPING model parts so it describes what the user opens.
+    _phantom = _phantom_published_proxy_tables(res.get("parts"))
+    if _phantom:
+        entry["phantom_published_proxy_tables"] = _phantom
+        _names = ", ".join(sorted({str(p.get("database")) for p in _phantom if p.get("database")}))
+        warns.append(
+            _PBIP_WARN + "the model carries a published-datasource proxy bound to 'localhost' "
+            f"({_names or 'unnamed'}) -- an internal Tableau address, not a reachable endpoint, so "
+            "that table opens EMPTY and every visual over it is blank. Co-migrate the published "
+            "datasource and rebind, or remove the dependency; a workbook whose PRIMARY datasource is "
+            "published is gated for this reason, and this one reached it as a SECONDARY")
     # PROVE the cross-check above actually left nothing dangling, on the BYTES THAT SHIP.
     # ``_crosscheck_report_refs`` is supposed to drop or rebind every reference the model did not
     # emit; this asserts the result rather than trusting it. reference_gate proves the same invariant
