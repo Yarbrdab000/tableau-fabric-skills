@@ -189,6 +189,88 @@ def _duplicates(seq):
     return dups
 
 
+def _calculate_value_arg(expr):
+    """The expression whose VALUE a measure returns, or ``None`` when not determinable.
+
+    ``CALCULATE(<value>, <filter>, <filter>...)`` returns ``<value>``; the filter arguments only
+    narrow the context. That asymmetry is the whole discriminator here, and it is easy to get
+    wrong in the obvious direction: a first cut at this analysis asked whether EVERY referenced
+    measure was blank, which is false for every real wrapper, because filter arguments routinely
+    name live measures (``FILTER('Case', 'Case'[CreatedDate] >= [Start Date Value])``). That probe
+    reported ZERO affected models against a model since measured to have eleven -- the wrong
+    population, inside the instrument built to find wrong populations.
+
+    Returns the inner text for ``CALCULATE(...)``, the expression itself when it is a bare
+    ``[Measure]`` alias, and ``None`` for anything else (arithmetic, ``DIVIDE``, an aggregation),
+    because at that point the value is computed rather than forwarded and this analysis stops.
+    """
+    if not expr:
+        return None
+    e = expr.strip()
+    m = re.match(r"CALCULATE\s*\(", e, re.IGNORECASE)
+    if not m:
+        return e if re.fullmatch(r"\[[^\]\[]+\]", e) else None
+    i, depth = m.end(), 1
+    start = i
+    while i < len(e):
+        c = e[i]
+        if c == "'":                      # skip a quoted table name so its parens/commas don't count
+            j = e.find("'", i + 1)
+            i = len(e) if j < 0 else j
+        elif c == '"':
+            j = e.find('"', i + 1)
+            i = len(e) if j < 0 else j
+        elif c == "(":
+            depth += 1
+        elif c == ")":
+            depth -= 1
+            if depth == 0:
+                return e[start:i].strip()
+        elif c == "," and depth == 1:
+            return e[start:i].strip()
+        i += 1
+    return None
+
+
+def _value_path_bottoms_out_blank(name, exprs, seen=frozenset()):
+    """Does ``name``'s value ultimately come from a ``BLANK()`` stub, through any depth of wrapper?
+
+    Deliberately derived by RESOLVING each measure's value path rather than by matching a naming
+    convention. The models that exposed this used a ``X (filtered)`` suffix, and keying on that
+    suffix would have worked on them and silently covered nothing anywhere else -- the same
+    mistake as reading a sample instead of the grammar. Nothing below looks at the name.
+    """
+    key = (name or "").casefold()
+    if key in seen or key not in exprs:
+        return False
+    body = (exprs[key] or "").strip()
+    if body == "BLANK()":
+        return True
+    inner = _calculate_value_arg(body)
+    if inner is None:
+        return False
+    ref = re.fullmatch(r"\[([^\]\[]+)\]", inner.strip())
+    if ref:
+        return _value_path_bottoms_out_blank(ref.group(1), exprs, seen | {key})
+    # a nested CALCULATE forwards its own value the same way
+    if re.match(r"CALCULATE\s*\(", inner.strip(), re.IGNORECASE):
+        return _value_path_bottoms_out_blank_expr(inner, exprs, seen | {key})
+    return False
+
+
+def _value_path_bottoms_out_blank_expr(expr, exprs, seen=frozenset()):
+    """``_value_path_bottoms_out_blank`` for a raw expression rather than a named measure."""
+    inner = _calculate_value_arg(expr)
+    if inner is None:
+        return False
+    ref = re.fullmatch(r"\[([^\]\[]+)\]", inner.strip())
+    if ref:
+        return _value_path_bottoms_out_blank(ref.group(1), exprs, seen)
+    if re.match(r"CALCULATE\s*\(", inner.strip(), re.IGNORECASE):
+        return _value_path_bottoms_out_blank_expr(inner, exprs, seen)
+    return False
+
+
 def _expression_body(text):
     """Strip metadata lines from an object body, leaving only DAX expression text.
 
@@ -572,8 +654,11 @@ def check_model_openability(parts, flatfile_headers=None, expected_endpoints=Non
     #     different failure and is not this check's business to guess at.
     refs_ok = True
     bare_col_ok = True
+    value_path_ok = True
     all_measures = set()
     all_columns = set()
+    measure_exprs = {}
+    measure_case = {}
     columns_by_table = {}
     for path in sorted(parts):
         text = parts[path]
@@ -585,7 +670,11 @@ def check_model_openability(parts, flatfile_headers=None, expected_endpoints=Non
             if tname:
                 columns_by_table.setdefault(tname.casefold(), set()).add(c.casefold())
         for m in _MEASURE_DECL_RE.finditer(text):
-            all_measures.add(_unquote(m.group("name")).casefold())
+            nm = _unquote(m.group("name"))
+            all_measures.add(nm.casefold())
+            measure_exprs[nm.casefold()] = " ".join(
+                _expression_body(m.group("expr")).split())
+            measure_case.setdefault(nm.casefold(), (nm, path))
 
     for path in sorted(parts):
         text = parts[path]
@@ -658,6 +747,46 @@ def check_model_openability(parts, flatfile_headers=None, expected_endpoints=Non
                               % (owner, name),
                 })
 
+    # TRANSITIVELY BLANK MEASURES. A measure whose expression is `BLANK()` is this repo's honest
+    # stub: valid, absent, and it LOOKS absent to anyone reading the model. A measure that WRAPS one
+    # is not honest, because nothing about it looks absent:
+    #
+    #     Avg. Days Participation (filtered) =
+    #         CALCULATE([Avg. Days Participation],                 <- BLANK() stub
+    #                   FILTER('Case', 'Case'[CreatedDate] >= [Start Date Value]), ...)
+    #
+    # It is a live `CALCULATE`, it resolves, it validates, its State is Ready, and it renders empty.
+    # Every stub-accounting instrument here matched `expression == "BLANK()"` and therefore counted
+    # ZERO of them -- a one-level detector against a two-level defect.
+    #
+    # Measured on 0088: 163 measures, 31 direct stubs, and 11 MORE reachable only this way, all 11
+    # projected by a visual. Confirmed three independent ways -- static parse, `INFO.MEASURES()` on
+    # the open model, and a DAX query returning null for all seven owners -- then confirmed at the
+    # render: a five-measure card entirely blank, and a bar chart with no bars. Two symptoms that
+    # had been tracked as separate unexplained defects turned out to be one measure.
+    #
+    # Reported separately from `dax_references_resolve` because nothing is unresolved, and
+    # separately from stub accounting because the expression is not a stub. The defect is that the
+    # VALUE PATH is empty while the expression is not.
+    for key in sorted(measure_exprs):
+        body = (measure_exprs[key] or "").strip()
+        if body == "BLANK()":
+            continue                      # the honest stub itself -- disclosed by design
+        if not _value_path_bottoms_out_blank(key, measure_exprs):
+            continue
+        owner, part = measure_case.get(key, (key, ""))
+        value_path_ok = False
+        issues.append({
+            "check": "measure_value_path_not_blank",
+            "part": part,
+            "detail": ("measure %r is a live expression whose VALUE ultimately comes from a "
+                       "BLANK() stub, so it renders empty while looking implemented. Only "
+                       "CALCULATE's FIRST argument carries the value -- its filter arguments may "
+                       "name live measures and do not make it non-blank. Either implement the "
+                       "stub it wraps, or make this measure an explicit BLANK() stub too so it is "
+                       "disclosed rather than silent" % owner),
+        })
+
     checks = {
         "tmdl_wellformed": wellformed,
         "no_duplicate_columns": no_dupes,
@@ -665,6 +794,7 @@ def check_model_openability(parts, flatfile_headers=None, expected_endpoints=Non
         "m_parameters_defined": params_ok,
         "dax_references_resolve": refs_ok,
         "bare_column_references_qualified": bare_col_ok,
+        "measure_value_path_not_blank": value_path_ok,
     }
     if expected_endpoints is not None and int(expected_endpoints) > 1:
         checks["endpoints_distinct"] = endpoints_ok

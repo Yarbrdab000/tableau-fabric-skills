@@ -14,6 +14,49 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ### Added
 
+- **`tableau-migration` (skill `2.306.0` → `2.308.0`): a measure can render blank while its
+  expression is not `BLANK()` — now a hard openability failure.** Found by opening a build,
+  refreshing it and looking at it. No static check in this repo could see it, and the reason is
+  structural rather than careless: every stub-accounting instrument matched
+  `expression == "BLANK()"`, and these measures are live `CALCULATE(...)` expressions.
+
+  ```dax
+  Avg. Days Participation (filtered) =
+      CALCULATE( [Avg. Days Participation],                  -- a BLANK() stub
+                 FILTER('Case', 'Case'[CreatedDate] >= [Start Date Value]), ... )
+  ```
+
+  It resolves, it validates, its `State` is `Ready`, and it renders empty. **A one-level detector
+  against a two-level defect** — the population, one indirection down.
+
+  Measured on corpus workbook 0088: 163 measures, 31 direct stubs, and **11 more** reachable only
+  through a wrapper, **all 11 projected by a visual**. Confirmed four independent ways before being
+  written down — a static TMDL parse, `INFO.MEASURES()` against the running model, a DAX query
+  returning `null` for all seven owners, and finally the render: a five-measure card entirely blank
+  and a bar chart with no bars. **Two symptoms that had been tracked as separate unexplained
+  defects turned out to be one measure.** The new check reproduces 11/11 on the corpus and flags
+  nothing in the other 33 workbooks.
+
+  **Only `CALCULATE`'s first argument carries the value**, and that is the whole discriminator. A
+  first cut at this analysis asked whether *every* referenced measure was blank, which is false for
+  every real wrapper, because filter arguments routinely name live measures
+  (`'Case'[CreatedDate] >= [Start Date Value]`). That probe reported **zero** affected models
+  against one since measured to have eleven — the wrong population, inside the instrument built to
+  find wrong populations. It is pinned as a test rather than described.
+
+  **The population is derived, not named.** The models that exposed this used an `X (filtered)`
+  suffix, and keying on that suffix would have worked on them while silently covering nothing
+  anywhere else. Nothing in the check reads a measure name — it resolves each measure's value path.
+  The independent reproduction surfaced a wrapper over a measure literally named `1`, which a
+  name-shaped matcher would have skipped and which this one catches.
+
+  Deliberately conservative in two directions, because this check spends its life reporting
+  silence. The honest `= BLANK()` stub is **not** flagged — it is disclosed by design and is the
+  convention the check protects. And the chain stops once a value is *computed* rather than
+  forwarded: `CALCULATE(DIVIDE([Stub], [Live]))` is not reported, because `DIVIDE(BLANK(), 5)` is
+  blank but `COALESCE([Stub], 0)` is **zero** and `ISBLANK([Stub])` is **TRUE**. Guessing there
+  would produce exactly the confident-wrong-answer this repo treats as worse than silence.
+
 - **`tableau-migration` (skill `2.299.0` → `2.306.0`): a measure that names a COLUMN unqualified is
   now a hard openability failure — the model opens, and the measure fails when queried.** Found in a
   real customer deliverable, not in the corpus. Its agent reported that a Tableau calc id "didn't
