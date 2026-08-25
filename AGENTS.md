@@ -162,6 +162,20 @@ not mirrored.
   "paired with something implausible" and "not present at all" can never look the same; and derive
   the expected population from the SOURCE (the `.twb`) rather than from the output, so an absence is
   a difference rather than an empty set.
+- **A diagnostic that partitions by SYMPTOM makes one problem look like several, and each looks too
+  small to fix.** Measured: three review reasons — `unsupported character '<' / '=' / '>'` from the
+  tokenizer, `expected '('` from an `IF` lexed as a function call, and `trailing tokens after
+  expression` from a bare `AND` — were **one boundary** (boolean/conditional logic is outside the
+  arithmetic Visual-Calculation subset) presenting as three unrelated gaps. Together they were **10 of
+  27 review rows**; separately each looked like a niche parser complaint not worth a release. The fix
+  was not parsing anything; it was noticing they were the same thing.
+
+  This compounds the other counting hazard: a per-function census built from `fallback_reason` is
+  already low by an **unbounded** amount, because only the FIRST unsupported head in a formula is
+  reported. So a review surface can be simultaneously **undercounted** (hidden heads) and
+  **fragmented** (symptom partitioning), and ranking by raw reason counts inherits both. Wherever many
+  distinct-looking low-count reasons share a surface, check whether they share a cause before
+  believing the ranking.
 - **A metric moving is not the render changing, and a count says nothing about WHICH object moved.**
   I read `visuals_projecting_stub_measures` dropping **6 → 1** on one workbook and told another
   session that four of its open render defects were therefore fixed. They checked at the artifact:
