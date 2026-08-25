@@ -14,6 +14,47 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ### Fixed
 
+- **`tableau-migration` (skill `2.293.0` → `2.294.0`): an object is rebuilt at the size its author
+  drew it, not stretched to fill the container it sits in.** Reported as "we STILL cannot figure out
+  how to properly size things like filters and parameters", with a screenshot of a Tableau filter
+  card next to our rebuild of it — ours a third taller, with a dead band under every dropdown. The
+  reporter's own diagnosis was exactly right: *"a massive part of the issue is us not being able to
+  distinguish objects from the containers they are in."*
+
+  Tableau states both numbers outright. On the Salesforce NPSP "Staff Capacity" dashboard
+  (1366×768, `sizing-mode='fixed'`) a filter card is authored `h=7422` → **57px**, inside a
+  `layout-flow` authored `h=12890` → **99px**. We emitted **99.12px**: the container's height, not
+  the control's. The leftover 42px is Tableau's card padding, and Tableau does not give it to the
+  control.
+
+  The cause is one line of flexbox semantics. `layout_solve.allocate` distributes a flow container's
+  box among its children **by fraction on the main axis** — and then hands every child the
+  container's **entire cross-axis extent**, which is what a CSS flex container does and what a
+  Tableau layout does not. So the defect was never specific to slicers: the KPI row's worksheets were
+  inflated from their authored 235px to the container's 257px by the same line.
+
+  Now the cross axis maps the child's own source fraction into the allocated box — the flow-axis twin
+  of what `_scale_abs` already did for a `frame`. The main axis is untouched, so every fixed/min/
+  squeeze rule above it is unchanged; this only ever affects the axis that was previously ignoring
+  the source entirely. Fail-safe: a node whose `src` extent is unusable falls back to the old
+  stretch, the size is clamped up to the child's own minimum, and the offset is clamped so
+  `offset + size <= extent` — so cross-axis containment becomes unconditional, matching the promise
+  the module already makes on the main axis.
+
+  Measured on that dashboard, authored-vs-emitted across every object that pairs unambiguously:
+
+  | | before | after |
+  |---|---|---|
+  | objects within 10px of authored **size** | **0 of 16** | 3 of 16 |
+  | median object displacement | 44px | **22px** |
+  | objects within 10px of authored **position** | 4 of 16 | **7 of 16** |
+  | emitted visuals overlapping each other | 0 | 0 |
+
+  The `0 of 16` is the number worth keeping: not one object on that page matched the size its author
+  drew, and the report validated clean throughout. Render-verified on a fresh build.
+
+### Added
+
 - **`tableau-migration` (skill `2.270.0` → `2.293.0`): a Tableau donut rebuilds as a donut instead of
   a card reading `(Blank)`.** Reported on the Salesforce NPSP "Staff Capacity" dashboard, where the
   *Program Engagement Stage* ring — 320 engagements across seven stages — arrived as a
