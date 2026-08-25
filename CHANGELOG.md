@@ -12,6 +12,28 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ## [Unreleased]
 
+### Fixed
+
+- **`tableau-migration` (skill `2.296.0` → `2.297.0`): the corrected `blocked_by` figure now names the
+  PREDICATE it counts, and a test pins it there.** 2.292.0 corrected “8 of the 11” to “9 of the 11” in
+  the prose and the CHANGELOG but left the same wrong figure in `_unmigrated_dependency_index`'s
+  summary-counter comment in `assemble_model.py`. Corrected here.
+
+  A bare corrected number would have drifted straight back, because **8 and 9 are both true of
+  different questions** over the same 11 calcs: 9 is the count of entries with a non-empty
+  `blocked_by` (what the counter actually sums), 8 is the count `_triage_stubs` independently calls
+  `cascadable`. They differ because triage re-translates with the *global* resolver while the build
+  uses a per-calc island-scoped one. The comment now states which predicate it counts and why the
+  neighbouring one differs, so re-deriving it from the wrong source is self-correcting.
+
+  Prose alone was not enough for a figure that had already drifted once, so the distinction is now
+  **executable**: `test_blocked_by_does_not_inherit_triage_s_verdict` asserts
+  `summary.blocked_by_unmigrated_calc` against a fixture where the two predicates disagree — the calc
+  is blocked but *not* cascadable, so a counter wired to triage reports `0` and the test fails.
+  Verified red by neutering the counter.
+
+  No behaviour changed; the only non-test edit is a comment.
+
 ### Added
 
 - **`tableau-migration` (skill `2.292.0` → `2.296.0`): the measurement-side rule the day's four defects

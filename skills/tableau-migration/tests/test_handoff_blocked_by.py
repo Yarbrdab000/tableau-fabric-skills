@@ -135,3 +135,11 @@ def test_blocked_by_does_not_inherit_triage_s_verdict():
         {"caption": "Calculation_1", "name": "Chosen year sales", "role": "measure"}]
     # ...and triage's own opinion is untouched and still separately reported
     assert "Difference" not in ho["triage"]["cascadable"]
+    # The summary counter counts the BLOCKED_BY predicate, not triage's. Pinned executably because
+    # the two predicates give different totals on the same data (on the corpus, 9 vs 8 over the
+    # same 11 calcs), so a maintainer re-deriving the documented figure from the wrong one silently
+    # gets a plausible wrong answer -- which is exactly what happened to the 2.291.0 comment. Here
+    # `Difference` is blocked BUT NOT cascadable, so a counter wired to triage would report 0.
+    assert ho["summary"]["blocked_by_unmigrated_calc"] == 1
+    assert sum(1 for n in ho["needs_review"]
+               if n["name"] in ho["triage"]["cascadable"]) == 0

@@ -4272,8 +4272,17 @@ def translation_handoff_artifact(measure_report, calc_column_report, resolve, *,
         "partial_fidelity": len(partial_fidelity),
         # Additive: how much of needs_review is waiting on ANOTHER unmigrated calc rather than on
         # its own reported error. Measured on the 34-workbook corpus at 2.291.0: 13 of 69
-        # needs-review calcs, and 8 of the 11 entries carrying "bare row-level field [..]" -- so
-        # ranking that class by raw fallback_reason count overstates the work behind it ~4x.
+        # needs-review calcs, and 9 of the 11 entries carrying "bare row-level field [..]" --
+        # leaving only 2 roots in that class, so ranking it by raw fallback_reason count measures
+        # LEAVES, not work.
+        #
+        # The 9 is the count of entries with a NON-EMPTY blocked_by, which is what this counter
+        # sums. Stated explicitly because a neighbouring predicate gives 8 -- _triage_stubs
+        # independently calls 8 of those 11 "cascadable" -- and the two genuinely differ: triage
+        # re-translates with the GLOBAL resolver while the build uses a per-calc island-scoped one,
+        # so on a multi-datasource workbook it can call a real cascade irreducible. Both numbers are
+        # true of different questions; an earlier revision of this comment carried the 8 by mistake,
+        # so name the predicate rather than the number alone.
         "blocked_by_unmigrated_calc": sum(1 for n in needs_review if n.get("blocked_by")),
     }
     triage = _triage_stubs(requests, calc_lookup, resolve,
