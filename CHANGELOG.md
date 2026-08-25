@@ -12,9 +12,9 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ## [Unreleased]
 
-### Fixed
+### Added
 
-- **`tableau-migration` (skill `2.298.0` → `2.300.0`): a formula-authored table calc no longer ships
+- **`tableau-migration` (skill `2.299.0` → `2.300.0`): a formula-authored table calc no longer ships
   as an inert `BLANK()` stub — it rebuilds as a Power BI **Visual Calculation**.** Corpus 0074's
   control chart projected `Upper` and `Lower`, both `= BLANK()`: the report validated clean, `pbir_lint`
   was clean, and **both bands rendered EMPTY**. Structurally valid, semantically absent — the family a
@@ -60,6 +60,57 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
   12 → 10 (0074's `['Lower', 'Upper']` → `[]`), visual calculations emitted 10 → 11. **Exactly one
   `visual.json` in the corpus changed**; 0070, 0076 and 0088 are byte-identical and merely gained honest
   review disclosures where a silent model stub used to be the only record.
+- **`tableau-migration` (skill `2.298.0` → `2.299.0`): an anchor left behind by an interleaved merge
+  is now caught — "strictly lower" was never enough.** The existing gate (2.266.0) asserts `VERSION`
+  at `rollback/pre-vX.Y.Z` is strictly *less* than `X.Y.Z`. Found by the integrator:
+  `rollback/pre-v2.293.0` points at a commit stamped **2.270.0** — true on the lane it was cut in,
+  where the state before 2.293.0 really was 2.270.0 — but after merge 2.291.0 and 2.292.0 sit
+  between. Resetting there lands **two releases short of what the tag claims**, and every gate
+  passes: the tag exists, resolves, is reachable, and 2.270.0 is dutifully lower than 2.293.0.
+
+  The new gate asserts **equality**: `VERSION` at the anchor must be exactly the predecessor the
+  version's own CHANGELOG entry declares. Measured on the integration branch — 82 chain entries,
+  **78 pass, 4 mismatch, 0 missing** — and the four are precisely the interleave boundaries
+  (2.143.0, 2.274.0, 2.293.0, 2.296.0), with no false positives. Reproduced independently by the
+  integrator from a different starting revision: same four, nothing named in advance.
+
+  **Why this is buildable where its predecessor was not**, which is the part worth keeping. The
+  obvious formulation — "every anchor must name a version that exists" — was measured and
+  **rejected**: 244 of 319 anchors fail it against the CHANGELOG (which retains ~75 versions by
+  design), and 35 still fail against every `VERSION` ever stamped on any ref. Those 35 are *correct*
+  behaviour: `rollback/pre-v2.216.0`..`pre-v2.224.0` all point at one commit, all cut inside one
+  minute — a whole block claimed under the old block rule and never shipped. A claimed-but-unused
+  anchor and a renumbered-away anchor are indistinguishable by construction, so that gate could only
+  have shipped with a 35-entry exceptions file that grew with every claim.
+
+  This gate judges **CHANGELOG entries, not anchors**, so an orphan block anchor has no entry and is
+  never judged. The exclusion is **by construction rather than by allowlist** — the difference
+  between a gate and a gate with a rotting exceptions file.
+
+  **Stated limit, so the coverage is not overclaimed:** a version *renumbered away* has no entry
+  either, so it is not judged here. This catches anchors whose meaning went **stale**, not anchors
+  that are **missing**. Overstating a gate's reach is the same defect class as a `rebuilt` status
+  that only means "the emitter did not raise".
+
+  Fixing a violation is an **integrator** operation — re-point the boundary anchor at the merged
+  parent — which is exactly the act a session must never perform on another session's tag, and is
+  legitimate for whoever owns the merge, because the merge is what changed the anchor's meaning.
+  Whoever re-chains the CHANGELOG must also re-point the anchor; those two halves have always been
+  one operation and nobody had noticed. The four known boundaries ship as a documented debt ledger
+  so the gate lands green and can only fire on something new; a companion test flags a ledger entry
+  whose debt has been *paid*, which is how the count drops for real instead of quietly staying put.
+
+  That companion test was wrong twice first, in opposite directions, and both failures are recorded
+  in it: asserting every ledgered version *appears* in the chain fails on every lane branch (other
+  lanes' boundaries are not merged yet), and asserting every ledgered version *currently mismatches*
+  fails on a lane too (on its own lane 2.293.0 satisfies the invariant — the debt is latent there
+  and active only after the merge). It now skips where the question is undecidable rather than
+  answering it wrongly.
+
+  Verified red by injection on a real mismatch, with the three sibling anchor gates staying green.
+
+### Fixed
+
 - **`tableau-migration` (skill `2.297.0` → `2.298.0`): the measurement-side gotchas section had a wrong
   count — in the section about wrong counts (docs-only).** 2.296.0 said the uppercase-only triage regex
   corrupted **five** entries. Re-derived over the whole population it is **seven**, and the third
