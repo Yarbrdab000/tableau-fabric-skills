@@ -183,14 +183,45 @@ anchor to revert a bad release). Do all three, every time:
    resolver that patches the CHANGELOG with `str.replace(old, new, 1)` reports success by returning a
    string whether or not it matched, so **assert the match count** rather than trusting the call.
 
-### Concurrent releases: claim a version BLOCK, above the current tip
+### Concurrent releases: ask the INTEGRATOR for a version number
 
-When two sessions ship into the same repo, "take the next integer" collides whenever their fetches
-straddle a push — fetching narrows that window and cannot close it. So each session claims a
-contiguous **block** (e.g. `2.175`–`2.184`) and allocates only inside it, announcing the next block in
-the same message as that block's first commit.
+**Version allocation is centralised. Do not claim a block. At your release step, ask the integrating
+session for a number; it reads `refs/tags` and hands you one.** What follows is why, because the
+previous rule was not obviously broken and is still worth understanding.
 
-Two rules make it work:
+The old rule was: each session claims a contiguous block above the tip, and publishes that block's
+extent by cutting **every** anchor in it at claim time — which does make the extent visible in
+`refs/tags`, the only namespace all worktrees share. The mechanism was sound. It failed anyway,
+**twice in fifteen minutes, in opposite directions**, because it requires a multi-step ritual
+executed perfectly under time pressure:
+
+* Session A declared `2.290`–`2.294` but cut anchors only to `2.292`. Session B read the low-water
+  mark of `2.292` and correctly took `2.293` — inside A's block.
+* Session B then declared `2.293`–`2.302` but cut anchors only to `2.295`. Session A read *that*
+  low-water mark and took `2.296` — inside B's block.
+
+Both sessions did the right thing with the information actually present in `refs/tags`. Neither was
+careless; one cut 3 of 10 anchors while shipping fast. **A coordination rule whose correctness
+depends on every participant completing a ritual under pressure will fail precisely when the repo is
+busiest, which is when collisions are possible at all.** Centralised allocation does not depend on
+anyone's discipline, and costs one message.
+
+**This also retires the only legitimate source of orphan anchors, which matters later.** Cutting a
+whole block's anchors up front, combined with "leave a dead block's anchors in place", *deliberately
+manufactures anchors for versions that will never exist* — measured, 35 of them, including nine cut
+against a single commit within one minute (`pre-v2.216.0`–`pre-v2.224.0` → `232fed7`). That is the
+rule working as designed. The cost is that **a claimed-but-unused anchor and a renumbered-away
+anchor become indistinguishable by construction**, so no gate can tell a harmless orphan from a
+rollback path that silently restores the wrong state. Once allocation is centralised and blocks are
+gone, every anchor should name a version that really exists — and only then is that gate buildable.
+
+**Anchors cut on a branch line do not survive an INTERLEAVED merge with their meaning intact.**
+`rollback/pre-v2.293.0` points at a commit stamped `2.270.0`: an ancestor, strictly lower, passing
+every existing gate — and still wrong, because on its own branch the state before `2.293.0` really
+was `2.270.0`, while in merged history it is `2.292.0`. Rolling back there lands you missing two
+releases. When two sessions interleave into one range, re-check what each anchor now means.
+
+The historical block rules, kept because old anchors and CHANGELOG entries still reflect them:
 
 * **Claim the block ABOVE the current tip, and expect it to erode from below.** The `VERSION` stamp
   must stay monotonic, so a block is alive **only for its portion above `HEAD`** — it is not a
