@@ -2728,3 +2728,167 @@ def test_agg_row_param_free_calc_stays_out_of_scope():
         param_resolver=_case_param_resolver)
     assert dax is None
     assert reason == "not a parameter-driven row calc"
+# -- Parameter dispatchers: partial rebuild instead of an all-or-nothing stub ----------------------
+# ``CASE [Parameters].[P] WHEN 1 THEN <a> WHEN 2 THEN <b> ... END`` is a dashboard's control
+# surface. One unrenderable branch used to stub the WHOLE measure to BLANK(), blanking every
+# selection. See ``translate_param_dispatcher_calc``.
+from calc_to_dax import (  # noqa: E402
+    translate_param_dispatcher_calc as _dispatch,
+    is_param_dispatcher_calc as _is_dispatch,
+)
+
+_DISPATCH_FIELDS = {
+    "Score": ("Assessments", "Score", "decimal"),
+}
+
+
+def _dispatch_resolver(caption):
+    return _DISPATCH_FIELDS.get(caption)
+
+
+def _dispatch_param(name):
+    return ("[Metric Value]", "number") if name == "Metric" else None
+
+
+# [Good A]/[Good B] are translated siblings; [Unmigrated] is a sibling this model emits only as an
+# inert BLANK() stub, so it is offered through ``stub_measure_refs`` (never through measure_refs).
+_DISPATCH_REFS = {"good a": ("Good A", "number"), "good b": ("Good B", "number")}
+_DISPATCH_STUBS = {"unmigrated": ("Unmigrated", "number")}
+_DISPATCH_FORMULA = ("CASE [Parameters].[Metric] WHEN 1 THEN [Good A] "
+                     "WHEN 2 THEN [Unmigrated] WHEN 3 THEN [Good B] END")
+
+
+def _run_dispatch(formula=_DISPATCH_FORMULA, **kw):
+    kw.setdefault("param_resolver", _dispatch_param)
+    kw.setdefault("measure_refs", _DISPATCH_REFS)
+    kw.setdefault("stub_measure_refs", _DISPATCH_STUBS)
+    return _dispatch(formula, _dispatch_resolver, **kw)
+
+
+def test_dispatcher_is_all_or_nothing_without_the_rescue():
+    # the defect this closes: the plain translator emits NOTHING for the whole dispatcher because
+    # of the single branch it cannot render -- so all three selections go blank, not just one.
+    dax, reason, _t = translate_tableau_calc_to_dax(
+        _DISPATCH_FORMULA, _dispatch_resolver, param_resolver=_dispatch_param,
+        measure_refs=_DISPATCH_REFS)
+    assert dax is None
+    assert "Good A" not in (reason or "")
+
+
+def test_dispatcher_keeps_live_branches_and_self_heals_the_blank_one():
+    dax, reason, detail = _run_dispatch()
+    assert reason == "ok"
+    # every selection keeps its slot: the two live branches are real DAX, and the third points at
+    # the sibling's own measure so it becomes correct the moment that sibling translates.
+    assert dax == "SWITCH([Metric Value], 1, [Good A], 2, [Unmigrated], 3, [Good B])"
+    assert detail["live"] == ["1", "3"]
+    assert detail["dropped"] == []
+    assert [b["branch"] for b in detail["blank"]] == ["2"]
+    assert detail["blank"][0]["measure"] == "Unmigrated"
+
+
+def test_dispatcher_prunes_a_branch_with_no_sibling_measure():
+    # an unresolved field has no measure to point at -> that ONE selection is dropped, the rest live
+    dax, reason, detail = _run_dispatch(stub_measure_refs=None)
+    assert reason == "ok"
+    assert dax == "SWITCH([Metric Value], 1, [Good A], 3, [Good B])"
+    assert detail["live"] == ["1", "3"]
+    assert [b["branch"] for b in detail["dropped"]] == ["2"]
+    assert detail["blank"] == []
+
+
+def test_dispatcher_keeps_a_translatable_else():
+    dax, reason, detail = _run_dispatch(
+        formula="CASE [Parameters].[Metric] WHEN 1 THEN [Good A] "
+                "WHEN 2 THEN [Nope] ELSE [Good B] END")
+    assert dax == "SWITCH([Metric Value], 1, [Good A], [Good B])"
+    assert [b["branch"] for b in detail["dropped"]] == ["2"]
+
+
+def test_dispatcher_drops_an_untranslatable_else():
+    dax, reason, detail = _run_dispatch(
+        formula="CASE [Parameters].[Metric] WHEN 1 THEN [Good A] "
+                "WHEN 2 THEN [Good B] ELSE [Nope] END")
+    assert dax == "SWITCH([Metric Value], 1, [Good A], 2, [Good B])"
+    assert [b["branch"] for b in detail["dropped"]] == ["ELSE"]
+
+
+def test_dispatcher_refuses_when_no_branch_genuinely_translates():
+    # THE fail-closed rule: a SWITCH of nothing but blanks says no more than the stub did, but
+    # WOULD be counted as translated -- structurally valid and semantically absent. Stay a stub.
+    dax, reason, detail = _run_dispatch(
+        formula="CASE [Parameters].[Metric] WHEN 1 THEN [Unmigrated] "
+                "WHEN 2 THEN [Unmigrated] END")
+    assert dax is None
+    assert reason == "no parameter-dispatcher branch translates"
+    assert detail["live"] == []
+
+
+def test_dispatcher_refuses_when_every_branch_already_translates():
+    # nothing to repair -> the plain translator already had it; never a second emit path
+    dax, reason, _d = _run_dispatch(
+        formula="CASE [Parameters].[Metric] WHEN 1 THEN [Good A] WHEN 2 THEN [Good B] END")
+    assert dax is None
+    assert reason == "parameter dispatcher needs no branch repair"
+
+
+def test_dispatcher_refuses_a_single_branch_calc():
+    dax, reason, _d = _run_dispatch(
+        formula="CASE [Parameters].[Metric] WHEN 1 THEN [Unmigrated] END")
+    assert dax is None
+    assert reason == "parameter dispatcher has a single branch"
+
+
+def test_dispatcher_refuses_without_a_param_resolver():
+    dax, reason, _d = _run_dispatch(param_resolver=None)
+    assert dax is None
+    assert reason == "no parameter resolver"
+
+
+def test_dispatcher_never_self_references():
+    # the calc's own names are pinned out of the stub pool, so a dispatcher can never point at
+    # itself (which would be a self-referential measure and refuse to evaluate)
+    dax, reason, detail = _run_dispatch(
+        stub_measure_refs={"unmigrated": ("Unmigrated", "number")},
+        exclude_keys=("Unmigrated", None))
+    assert dax == "SWITCH([Metric Value], 1, [Good A], 3, [Good B])"
+    assert [b["branch"] for b in detail["dropped"]] == ["2"]
+
+
+def test_dispatcher_type_mismatch_falls_back_to_pruning():
+    # a stub typed TEXT cannot share a SWITCH with numeric branches; rather than emit mistyped DAX
+    # the rebuild drops to the pruned form (the parser's own return-type check does the work)
+    dax, reason, detail = _run_dispatch(
+        stub_measure_refs={"unmigrated": ("Unmigrated", "text")})
+    assert dax == "SWITCH([Metric Value], 1, [Good A], 3, [Good B])"
+    assert reason == "ok"
+    # the branch is reported as DROPPED, not as a blank that will self-heal -- it no longer has a
+    # slot at all, and saying otherwise would misdescribe the model
+    assert detail["blank"] == []
+    assert [b["branch"] for b in detail["dropped"]] == ["2"]
+
+
+def test_dispatcher_shape_gate_is_strict():
+    # only a CASE over a bare [Parameters].[X] comparand is a dispatcher
+    assert _is_dispatch(_DISPATCH_FORMULA)
+    assert _is_dispatch("CASE [Parameters].[Metric] WHEN 1 THEN [Good A] "
+                        "WHEN 2 THEN [Good B] ELSE [Good B] END")
+    assert not _is_dispatch("CASE [Region] WHEN 'East' THEN 1 WHEN 'West' THEN 2 END")
+    assert not _is_dispatch("CASE WHEN [Sales] > 1 THEN 1 ELSE 2 END")
+    assert not _is_dispatch("SUM([Sales])")
+    assert not _is_dispatch("")
+    assert not _is_dispatch("CASE [Parameters].[Metric] WHEN 1 THEN [Good A]")
+
+
+def test_dispatcher_shape_gate_tolerates_nested_end_bearing_branches():
+    # a nested IF ... END inside a branch body carries its own END; it must not terminate the
+    # dispatcher early or every such calc would be misparsed into a shorter one
+    nested = ("CASE [Parameters].[Metric] "
+              "WHEN 1 THEN IF [Good A] > 0 THEN [Good A] ELSE [Good B] END "
+              "WHEN 2 THEN [Unmigrated] END")
+    assert _is_dispatch(nested)
+    dax, reason, detail = _run_dispatch(formula=nested)
+    assert reason == "ok"
+    assert dax.startswith("SWITCH([Metric Value], 1, IF(")
+    assert "[Unmigrated]" in dax
+    assert [b["branch"] for b in detail["blank"]] == ["2"]

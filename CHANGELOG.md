@@ -14,6 +14,55 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ### Fixed
 
+- **`tableau-migration` (skill `2.301.0` → `2.302.0`): the interleave-debt ledger drops 4 → 1,
+  because the debt was PAID rather than re-labelled.** 2.299.0 shipped the anchor-predecessor gate
+  green with four known violations parked in `_INTERLEAVE_DEBT`. That was the correct sequence —
+  build the instrument first, so a repair has something to prove itself against — and this is the
+  repair.
+
+  **The gate immediately caught its own integrator doing half an operation.** Merging 2.299.0
+  produced *no conflict* in `CHANGELOG.md` and silently placed the entry ABOVE 2.300.0. Re-ordering
+  and re-chaining that boundary then created **two fresh violations that did not exist before the
+  merge**:
+
+  ```
+  2.300.0 declares predecessor 2.299.0, but rollback/pre-v2.300.0 was stamped 2.275.0
+  2.299.0 declares predecessor 2.298.0, but rollback/pre-v2.299.0 was stamped 2.295.0
+  ```
+
+  That is the gate's thesis demonstrated on the gate's own merge: **re-chaining a CHANGELOG boundary
+  without re-pointing its anchor is half an operation**, and the omitted half is the one that decides
+  where a rollback actually lands. The debt does not sit still — every integration manufactures more
+  of it, which is why a documented ledger alone would have rotted.
+
+  Five anchors re-pointed at the release commit of their declared predecessor, each original first
+  preserved as `archive/anchor-pre-vX-preintegration`:
+
+  ```
+  pre-v2.274.0  9d822fc7 (2.266.0) -> 181d3bbd (2.270.0)
+  pre-v2.293.0  181d3bbd (2.270.0) -> c0c3b30d (2.292.0)
+  pre-v2.296.0  c0c3b30d (2.292.0) -> bb4026d2 (2.295.0)
+  pre-v2.299.0  bb4026d2 (2.295.0) -> 026c83d0 (2.298.0)
+  pre-v2.300.0  c55e6644 (2.275.0) -> 0e5fbf1b (2.299.0)
+  ```
+
+  Archiving is not ceremony: re-pointing is the only irreversible step in this ritual, and every old
+  target was **accurate on the lane it was cut on**. The re-point makes it accurate on the integrated
+  line instead; both facts are worth keeping.
+
+  **`2.143.0` is deliberately left in the ledger.** It predates this work and no merge in this series
+  created it, so re-pointing it would be speculation about someone else's intent — the same reach for
+  another session's anchor the gate exists to make visible.
+
+  **What proved the repair was not the suite going green.** The companion test
+  `test_the_interleave_debt_ledger_stays_honest` went RED and named the three paid entries, demanding
+  their deletion. That demand is the evidence; deleting them is what hands each boundary to the gate.
+  A ledger that silently kept passing after its debt was paid would be an allowlist, which is the
+  failure mode the referential formulation was rejected for.
+
+
+### Added
+
 - **`tableau-migration` (skill `2.300.0` → `2.301.0`): a comment shipped in `2.300.0` asserted
   something measurably FALSE about why a formula table calc stubs, and the correction reframes when
   the Visual-Calculation route is the right one.** The claim was that a formula-authored table calc
@@ -51,7 +100,7 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
   unbuilt feature), which makes them *latent*, not irrelevant. Prose, comments and one new test only;
   no behaviour change, and the corpus artifacts are unchanged from `2.300.0`.
 
-- **`tableau-migration` (skill `2.275.0` → `2.300.0`): a formula-authored table calc no longer ships
+- **`tableau-migration` (skill `2.299.0` → `2.300.0`): a formula-authored table calc no longer ships
   as an inert `BLANK()` stub — it rebuilds as a Power BI **Visual Calculation**.** Corpus 0074's
   control chart projected `Upper` and `Lower`, both `= BLANK()`: the report validated clean, `pbir_lint`
   was clean, and **both bands rendered EMPTY**. Structurally valid, semantically absent — the family a
@@ -97,6 +146,357 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
   12 → 10 (0074's `['Lower', 'Upper']` → `[]`), visual calculations emitted 10 → 11. **Exactly one
   `visual.json` in the corpus changed**; 0070, 0076 and 0088 are byte-identical and merely gained honest
   review disclosures where a silent model stub used to be the only record.
+- **`tableau-migration` (skill `2.298.0` → `2.299.0`): an anchor left behind by an interleaved merge
+  is now caught — "strictly lower" was never enough.** The existing gate (2.266.0) asserts `VERSION`
+  at `rollback/pre-vX.Y.Z` is strictly *less* than `X.Y.Z`. Found by the integrator:
+  `rollback/pre-v2.293.0` points at a commit stamped **2.270.0** — true on the lane it was cut in,
+  where the state before 2.293.0 really was 2.270.0 — but after merge 2.291.0 and 2.292.0 sit
+  between. Resetting there lands **two releases short of what the tag claims**, and every gate
+  passes: the tag exists, resolves, is reachable, and 2.270.0 is dutifully lower than 2.293.0.
+
+  The new gate asserts **equality**: `VERSION` at the anchor must be exactly the predecessor the
+  version's own CHANGELOG entry declares. Measured on the integration branch — 82 chain entries,
+  **78 pass, 4 mismatch, 0 missing** — and the four are precisely the interleave boundaries
+  (2.143.0, 2.274.0, 2.293.0, 2.296.0), with no false positives. Reproduced independently by the
+  integrator from a different starting revision: same four, nothing named in advance.
+
+  **Why this is buildable where its predecessor was not**, which is the part worth keeping. The
+  obvious formulation — "every anchor must name a version that exists" — was measured and
+  **rejected**: 244 of 319 anchors fail it against the CHANGELOG (which retains ~75 versions by
+  design), and 35 still fail against every `VERSION` ever stamped on any ref. Those 35 are *correct*
+  behaviour: `rollback/pre-v2.216.0`..`pre-v2.224.0` all point at one commit, all cut inside one
+  minute — a whole block claimed under the old block rule and never shipped. A claimed-but-unused
+  anchor and a renumbered-away anchor are indistinguishable by construction, so that gate could only
+  have shipped with a 35-entry exceptions file that grew with every claim.
+
+  This gate judges **CHANGELOG entries, not anchors**, so an orphan block anchor has no entry and is
+  never judged. The exclusion is **by construction rather than by allowlist** — the difference
+  between a gate and a gate with a rotting exceptions file.
+
+  **Stated limit, so the coverage is not overclaimed:** a version *renumbered away* has no entry
+  either, so it is not judged here. This catches anchors whose meaning went **stale**, not anchors
+  that are **missing**. Overstating a gate's reach is the same defect class as a `rebuilt` status
+  that only means "the emitter did not raise".
+
+  Fixing a violation is an **integrator** operation — re-point the boundary anchor at the merged
+  parent — which is exactly the act a session must never perform on another session's tag, and is
+  legitimate for whoever owns the merge, because the merge is what changed the anchor's meaning.
+  Whoever re-chains the CHANGELOG must also re-point the anchor; those two halves have always been
+  one operation and nobody had noticed. The four known boundaries ship as a documented debt ledger
+  so the gate lands green and can only fire on something new; a companion test flags a ledger entry
+  whose debt has been *paid*, which is how the count drops for real instead of quietly staying put.
+
+  That companion test was wrong twice first, in opposite directions, and both failures are recorded
+  in it: asserting every ledgered version *appears* in the chain fails on every lane branch (other
+  lanes' boundaries are not merged yet), and asserting every ledgered version *currently mismatches*
+  fails on a lane too (on its own lane 2.293.0 satisfies the invariant — the debt is latent there
+  and active only after the merge). It now skips where the question is undecidable rather than
+  answering it wrongly.
+
+  Verified red by injection on a real mismatch, with the three sibling anchor gates staying green.
+
+### Fixed
+
+- **`tableau-migration` (skill `2.297.0` → `2.298.0`): the measurement-side gotchas section had a wrong
+  count — in the section about wrong counts (docs-only).** 2.296.0 said the uppercase-only triage regex
+  corrupted **five** entries. Re-derived over the whole population it is **seven**, and the third
+  failure mode is worse than either recorded:
+
+  ```
+  VANISHED  'unsupported function size'   -> [A-Z_]+ matches nothing         1
+  MANGLED   'unsupported function Total'  -> captures 'T'                    4
+            'unsupported function Sales'  -> captures 'S'  ┐ merged into one
+            'unsupported function Stage'  -> captures 'S'  ┘ bogus bucket    2
+  ```
+
+  `Sales` and `Stage` **collapse into a single category `S` that never existed in the source**,
+  carrying a wholly plausible count of `2`. So the tally does not merely lose or mis-file rows — it
+  **fabricates a category**, and anyone auditing the breakdown would be checking a name the instrument
+  invented. Of the seven corruptions, a match-count assertion catches exactly **one**; the rule as
+  first written was necessary and badly insufficient.
+
+  Two rules added, both earned by this correction:
+
+  * **Validate the captures, not just the match count** — assert each capture round-trips to a value
+    the source could actually have produced.
+  * **A corpus count must cite the engine version it was measured at**, or it is a claim with a hidden
+    expiry date. The same query returns 71 needs-review calcs at 2.275.0 and 69 at 2.291.0; the delta
+    is two calcs a release *fixed*. The existing corpus figure in this section is now dated.
+
+  And the meta-rule this correction is itself an instance of: **re-derive the SCOPE, not just the
+  arithmetic.** 2.296.0 correctly refused a reported “25 vs 30” and re-measured it — but re-measured
+  only the two function names the report happened to mention, so it got the arithmetic right and the
+  answer wrong. Inheriting someone else's *question* is the same defect as inheriting their answer,
+  and far harder to see, because the work you did was correct. The verifier for this release derives
+  over the whole population and names nothing in advance.
+
+### Fixed
+
+- **`tableau-migration` (skill `2.296.0` → `2.297.0`): the corrected `blocked_by` figure now names the
+  PREDICATE it counts, and a test pins it there.** 2.292.0 corrected “8 of the 11” to “9 of the 11” in
+  the prose and the CHANGELOG but left the same wrong figure in `_unmigrated_dependency_index`'s
+  summary-counter comment in `assemble_model.py`. Corrected here.
+
+  A bare corrected number would have drifted straight back, because **8 and 9 are both true of
+  different questions** over the same 11 calcs: 9 is the count of entries with a non-empty
+  `blocked_by` (what the counter actually sums), 8 is the count `_triage_stubs` independently calls
+  `cascadable`. They differ because triage re-translates with the *global* resolver while the build
+  uses a per-calc island-scoped one. The comment now states which predicate it counts and why the
+  neighbouring one differs, so re-deriving it from the wrong source is self-correcting.
+
+  Prose alone was not enough for a figure that had already drifted once, so the distinction is now
+  **executable**: `test_blocked_by_does_not_inherit_triage_s_verdict` asserts
+  `summary.blocked_by_unmigrated_calc` against a fixture where the two predicates disagree — the calc
+  is blocked but *not* cascadable, so a counter wired to triage reports `0` and the test fails.
+  Verified red by neutering the counter.
+
+  No behaviour changed; the only non-test edit is a comment.
+
+### Added
+
+- **`tableau-migration` (skill `2.295.0` → `2.296.0`): the measurement-side rule the day's four defects
+  all shared, recorded once (docs-only).**
+  [`resources/migration-gotchas.md`](skills/tableau-migration/resources/migration-gotchas.md) gains
+  *“Its mirror image: a MEASUREMENT that is well-formed and says nothing”*, directly under the existing
+  silent-output section — because it is the same defect turned on the instrument. A filter over a
+  population emits partial output that is indistinguishable from complete output, since the rows it
+  failed to match emit nothing to notice.
+
+  Two rules, the second of which is a **design** constraint rather than reading advice:
+
+  1. A filter must assert its match count against its population — and check the *captures*, not just
+     the match count, because a greedy-enough pattern will match and hand back a truncated token
+     rather than fail.
+  2. **When a summary list and a payload list sit side by side, any field that changes a decision must
+     be on BOTH.** You cannot fix this downstream by telling readers to look elsewhere: the reader who
+     needs telling is precisely the one who never got there. `translation_handoff` puts `blocked_by` on
+     both `needs_review` and `requests` for this reason; `category_guidance` sits on `requests` alone,
+     and that asymmetry caused a reported defect. Cross-linked from
+     [`second-compiler.md`](skills/tableau-migration/resources/second-compiler.md).
+
+  The worked example is sharper than the one first written for it, because re-deriving it from the
+  corpus contradicted the received account. `unsupported (?:function|table calculation) ([A-Z_]+)`
+  fails **two different silent ways at once**: `unsupported function size` matches nothing and
+  vanishes, while `unsupported function Total` **does** match — `[A-Z_]+` captures just `T` — and is
+  tallied under a function named `T`. So four of the five affected stubs were *present but
+  miscategorised*, not missing, which is the harder half to notice: the total stays right and only the
+  per-name breakdown is wrong.
+
+  Written against the artifact rather than the account: the first draft of this section repeated a
+  reported “25 vs 30, `TOTAL` and `SIZE` invisible”, and the re-derivation refused to reproduce it —
+  the drop is 1, the miscapture is 4, and the source string is lower-case `size`. Enshrining another
+  session's arithmetic in a permanent rules doc would have been the very failure the section describes.
+
+### Fixed
+
+- **`tableau-migration` (skill `2.294.0` → `2.295.0`): a stale measured constant stops overriding
+  every authored filter card.** With the cross-axis fix in place the solver correctly produced the
+  authored **57px** for a Tableau filter card — and the emitter then floored it back up to **76px**,
+  so the dead band under every dropdown survived a fix that had already solved it.
+
+  The 76 was not a guess. It is the arithmetic of Power BI's **default ~12pt** dropdown chrome
+  (header 28 + selector 32 + padding 8/8), measured against a real clipping defect: issue #100, 16
+  slicers emitted between 45px and 64px, every one clipped. It was correct when it was measured.
+
+  It was measured **before this emitter began stamping the source's 9pt point size** — which was the
+  other half of that same fix, and which shrinks the chrome the floor was protecting. So a constant
+  with genuine provenance quietly outlived its premise and started doing the opposite of its job:
+  instead of rescuing a degenerate card, it grew every faithfully-sized one by a third.
+
+  **A stale measured constant is more dangerous than a guessed one**, because its provenance is the
+  reason nobody re-checks it. Render-verified at 9pt: a 57px card shows its full label *and* its
+  selector, no clipping. The floor stays — a degenerate tiny card still has to render its control —
+  but is now set to the smallest height shown to work at the font actually emitted.
+
+  `layout_solve.MIN_SLICER` moves with it: an existing test asserts the solve reserves exactly what
+  emit will use, and moving one without the other would leave the solve under-reserving and
+  overrunning whatever it seated below.
+
+  The floor test now asserts the **constant** rather than a literal, and separately asserts the floor
+  actually bound. That literal had gone stale twice already — 64 → 76 → 57 — and each time turned a
+  deliberate re-measurement into a failure that said nothing about behaviour.
+
+### Added
+
+- **`tableau-migration` (skill `2.293.0` → `2.294.0`): an object is rebuilt at the size its author
+  drew it, not stretched to fill the container it sits in.** Reported as "we STILL cannot figure out
+  how to properly size things like filters and parameters", with a screenshot of a Tableau filter
+  card next to our rebuild of it — ours a third taller, with a dead band under every dropdown. The
+  reporter's own diagnosis was exactly right: *"a massive part of the issue is us not being able to
+  distinguish objects from the containers they are in."*
+
+  Tableau states both numbers outright. On the Salesforce NPSP "Staff Capacity" dashboard
+  (1366×768, `sizing-mode='fixed'`) a filter card is authored `h=7422` → **57px**, inside a
+  `layout-flow` authored `h=12890` → **99px**. We emitted **99.12px**: the container's height, not
+  the control's. The leftover 42px is Tableau's card padding, and Tableau does not give it to the
+  control.
+
+  The cause is one line of flexbox semantics. `layout_solve.allocate` distributes a flow container's
+  box among its children **by fraction on the main axis** — and then hands every child the
+  container's **entire cross-axis extent**, which is what a CSS flex container does and what a
+  Tableau layout does not. So the defect was never specific to slicers: the KPI row's worksheets were
+  inflated from their authored 235px to the container's 257px by the same line.
+
+  Now the cross axis maps the child's own source fraction into the allocated box — the flow-axis twin
+  of what `_scale_abs` already did for a `frame`. The main axis is untouched, so every fixed/min/
+  squeeze rule above it is unchanged; this only ever affects the axis that was previously ignoring
+  the source entirely. Fail-safe: a node whose `src` extent is unusable falls back to the old
+  stretch, the size is clamped up to the child's own minimum, and the offset is clamped so
+  `offset + size <= extent` — so cross-axis containment becomes unconditional, matching the promise
+  the module already makes on the main axis.
+
+  Measured on that dashboard, authored-vs-emitted across every object that pairs unambiguously:
+
+  | | before | after |
+  |---|---|---|
+  | objects within 10px of authored **size** | **0 of 16** | 3 of 16 |
+  | median object displacement | 44px | **22px** |
+  | objects within 10px of authored **position** | 4 of 16 | **7 of 16** |
+  | emitted visuals overlapping each other | 0 | 0 |
+
+  The `0 of 16` is the number worth keeping: not one object on that page matched the size its author
+  drew, and the report validated clean throughout. Render-verified on a fresh build.
+
+### Added
+
+- **`tableau-migration` (skill `2.292.0` → `2.293.0`): a Tableau donut rebuilds as a donut instead of
+  a card reading `(Blank)`.** Reported on the Salesforce NPSP "Staff Capacity" dashboard, where the
+  *Program Engagement Stage* ring — 320 engagements across seven stages — arrived as a
+  `multiRowCard` showing `(Blank) / 1 (filtered) / 320`.
+
+  A Tableau donut is several stacked Pie panes: one draws the ring, the others draw the number in
+  the hole. The emitter already knew to drive the worksheet off a Pie pane rather than the primary
+  one — its own comment says so verbatim, "so its legend (colour) + angle (wedge-size) encodings are
+  read". But it selected the **first** pane carrying a Pie mark, and when *every* pane is a Pie that
+  is a coin toss. It lost. This worksheet's three panes carry `text` / `color=[Stage]` +
+  `wedge-size` / `text`, and pane 1 won.
+
+  So the ring's colour dimension never reached `encodings`; `latent_color` stayed False; the
+  pie/donut router in `_card_collapse_alternatives` could not fire; and the worksheet fell through to
+  `card`. Every gate passed — the JSON is well-formed, the visual type is real, the fields resolve.
+  It is wrong only against the source.
+
+  The fix selects the pane carrying the encodings that *define* a ring (`color`, `wedge-size` or
+  `angle`), falling back to the first Pie pane when none stands out, so a workbook without such a
+  pane behaves exactly as before. Render-verified on a fresh build: the donut draws its stage
+  segments with labels (85 / 26.56%, 142 / 44.38%, 25, 17, 7), matching the Tableau reference.
+
+  The hole is still empty — the `320` is `donutChart.centerValue`, which Power BI defaults off and
+  the engine does not yet emit. Separate increment, deliberately not bundled here.
+
+  (Version jumps `2.270.0` → `2.293.0`: this branch was at 2.270.0 while the integration branch had
+  reached 2.291.0, so the block was claimed above that tip at the release step.)
+
+- **`tableau-migration` (skill `2.291.0` → `2.292.0`): the handover prose now tells a reader how to
+  read the stub manifest without being misled by it (docs-only).** 2.291.0 added `blocked_by` so a
+  cascade names the calc that actually failed, but left `fallback_reason` untouched — correctly, since
+  the string is the literal translator error and is pinned by the row-level reroute router's contract.
+  The consequence was that a reader who reads only `fallback_reason` is *still* misdirected; they now
+  have to know to read `blocked_by` too, and nothing told them so.
+
+  Measured while writing it, a second and worse instance of the same adjacency defect: `category_guidance`,
+  `fields`, `formula` and `target_table` ship on `translation_handoff.requests` **only**, never on the
+  concise `needs_review` list. A reader inspecting `needs_review` for routing advice finds none and
+  concludes the engine shipped none — it ships 547 characters of it, on a sibling list. (`guidance` is
+  empty on **0 of 69** requests corpus-wide, not on 30 as reported.)
+
+  [`resources/second-compiler.md`](skills/tableau-migration/resources/second-compiler.md) gains a
+  *“Two ways this manifest will mislead you”* block, an accurate shipped-shape sample (`blocked_by`,
+  `triage`, `partial_fidelity`, `summary.blocked_by_unmigrated_calc`), a **Triage** section recording
+  that triage re-translates with the *global* resolver while the build uses a per-calc island-scoped
+  one — so on a multi-datasource workbook it can call a cascade irreducible — and a **Partial fidelity**
+  section for live-but-incomplete objects that are absent from `needs_review` by design. The estate-CLI
+  loop gains an explicit **“author roots first”** step, and its verification line now reads *at least*
+  the count landed rather than *exactly*, because clearing a root cascades its dependents.
+  [`resources/migration-report.md`](skills/tableau-migration/resources/migration-report.md) and
+  [`SKILL.md`](skills/tableau-migration/SKILL.md) get the short form at their own reader surfaces.
+
+  No code changed. `translation_router.py` was inspected and needed no fix.
+
+### Corrected
+
+- **`tableau-migration`: the 2.291.0 entry below said “8 of the 11”; the correct figure is “9 of the
+  11”.** 8 is the count of entries `triage` independently called cascadable; 9 is the count carrying a
+  non-empty `blocked_by`. Both predicates are real and they differ by one, and the sentence is about
+  `blocked_by`. Caught by a check that re-derives every numeric claim in the prose from the corpus
+  export rather than from the previous sentence. The same wrong figure remains in a code comment in
+  `assemble_model.py` (`_unmigrated_dependency_index`'s summary counter) and is being handed to the
+  session that owns that file rather than edited across an active lane boundary.
+
+- **`tableau-migration` (skill `2.290.0` → `2.291.0`): a stub now names the calc that ACTUALLY failed,
+  instead of inheriting its dependency's error (#173 family).** A calc that falls back only because a
+  calc it REFERENCES is unmigrated reported the dependency's translator error as its own
+  `fallback_reason`. The classic shape is a dispatcher or comparison measure pointing at an unmigrated
+  LOD: it reports `bare row-level field [..] not valid in a measure` while containing no row-level
+  field at all. A reader triaging the flat `needs_review` list was sent hunting inside the wrong
+  measure, and the broken one was never named — silent because the entry looks complete.
+
+  Measured on the 34-workbook corpus at 2.275.0: **13** needs-review entries carried that reason,
+  **9 of them were cascades by the engine's own triage**, and **none of the 13 named a dependency**,
+  because no such key existed in the export. So this was a reporting gap, not an engine one — the
+  engine computed the split and shipped it in the same `report.json`, in a sibling `triage` block
+  keyed only by name.
+
+  Every `needs_review` and `requests` entry now carries an additive **`blocked_by`**:
+  `[{caption, name, role}]` naming the referenced calcs that are themselves needs-review, so the
+  dependency chain is walkable to its root (corpus 0088:
+  `Avg Days Participation same as Goal ●` → `Avg. Days Participation vs Goal` →
+  `Avg. Days Participation`, the nested LOD). `summary.blocked_by_unmigrated_calc` counts them:
+  **13 of 69** at 2.291.0, and **9 of the 11** entries carrying `bare row-level field [..]` — leaving
+  only 2 roots in that class, so ranking it by raw `fallback_reason` count measures leaves, not work.
+  *(Corrected in 2.292.0: this originally read “8 of the 11”, which was the count of entries `triage`
+  independently called cascadable, not the count carrying a non-empty `blocked_by`. Both predicates
+  are real and they differ by one; the sentence is about `blocked_by`, so 9 is the right number.)*
+
+  `blocked_by` asserts only the FACT *“these referenced calcs are also unmigrated”*, deliberately not
+  the prediction *“this would translate once they are fixed”*. That prediction is `triage`'s job, and
+  triage is measurably fallible: it re-translates with the single global resolver while the build
+  uses a per-calc island-scoped one, so on a multi-datasource workbook it can call a cascade
+  irreducible (0088's `Select Metric` at 2.275.0). Deriving `blocked_by` from triage would inherit
+  that; it is derived from the already-computed report rows instead, so it cannot. The two signals
+  genuinely disagree in one corpus case (0073's `Difference` references an unmigrated calc AND has
+  its own irreducible problem) — both are true, which is the argument for reporting the fact rather
+  than a boolean.
+
+  `fallback_reason` is deliberately unchanged: the string is the literal translator error and is
+  pinned by `_ROW_LEVEL_IN_MEASURE_REASON`, the row-level reroute router's contract.
+
+- **`tableau-migration` (skill `2.275.0` → `2.290.0`): one unmigrated branch no longer blanks EVERY
+  selection of a parameter dispatcher (#168, #171).** A Tableau control-surface calc —
+  `CASE [Parameters].[P] WHEN 1 THEN <metric a> WHEN 2 THEN <metric b> … END` — was translated
+  all-or-nothing: a single branch the translator could not render stubbed the **whole** measure to
+  `BLANK()`, so every selection rendered empty, not just the one. Structurally valid, semantically
+  absent — the measure exists, the visual binds, `pbir_lint` is clean, validation returns zero
+  errors, and the chart is blank.
+
+  Measured on corpus workbook 0088 (`salesforce_nonprofit_case_mgmt`) at 2.275.0: `Sort By` had
+  **3 of its 4** branches already translated and `Select Metric` **3 of 4**, yet both emitted
+  `BLANK()`. Between them they were **5 of the 12** visuals corpus-wide that projected a stub — the
+  single largest cause of empty charts.
+
+  The dispatcher is now rebuilt from the branches that DO translate. A failing branch that names a
+  sibling calc this model emits keeps its slot, pointing at that sibling's own measure: blank today
+  (the sibling is its own honest `BLANK()` stub) and correct for free the moment that sibling's
+  translation lands, with no further change here. Any other failing branch is pruned, so that one
+  selection returns blank while the rest work.
+
+  Fail-closed in the way that matters: a dispatcher with **no** genuinely translated branch stays a
+  stub rather than becoming a live measure that says nothing for every input — which would be the
+  same defect wearing a green badge (0088's `Select Metric Decimal`, whose only branch is blank,
+  correctly stays a stub). No DAX is composed by the new code; it prunes and re-points branches and
+  hands the result to the same parser, type check and emit guardrail as any other measure, so a
+  mistyped sibling is rejected and pruned rather than emitted.
+
+  Because a repaired dispatcher counts as translated and therefore LEAVES the needs-review list, its
+  still-blank selections are disclosed in two places or the repair would reproduce the silence it
+  fixes: the model file's `TranslatedBy` annotation names them, and an additive `partial_fidelity`
+  list (plus a `summary.partial_fidelity` count) in `model_translation_handoff` carries the
+  structured form. Both are empty on any build with no such calc.
+
+  Corpus effect, whole estate, 2.275.0 → 2.290.0: `visuals_projecting_stub_measures` **12 → 7**,
+  workbook calcs translated **216 → 218**, stubbed **71 → 69**; exactly one workbook changed and no
+  workbook lost a translated calc, gained a stub-projecting visual, or changed viz/pbip/openability
+  status.
 
 - **`tableau-migration` (skill `2.274.0` → `2.275.0`): a per-visual status now says what was actually
   CHECKED, so a false green is visible (#173).** `status: "rebuilt"` asserts only that the visual
@@ -139,7 +539,7 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
   Suite 5008 → **5014**.
 
-- **`tableau-migration` (skill `2.268.0` → `2.274.0`): a published datasource reached only as a
+- **`tableau-migration` (skill `2.270.0` → `2.274.0`): a published datasource reached only as a
   SECONDARY no longer ships silently as a `localhost` phantom (#174).** A published Tableau
   datasource connects through a federated proxy whose connection class is `sqlproxy` and whose server
   is the literal `localhost` — an internal Tableau address, not an endpoint anything can reach. When
@@ -187,6 +587,83 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
   a phantom shipping. That count *is* the measurement of the silence.
 
   Suite 5001 → **5008**.
+### Added
+
+- **`tableau-migration` (skill `2.269.0` → `2.270.0`): a capability nobody can find no longer counts
+  as shipped.** The skill carries 50+ scripts, and an agent only ever learns one exists by reading
+  `SKILL.md` or a `resources/*.md` runbook — it never reads a directory listing. So a **runnable**
+  script that no prose mentions is invisible: present, tested, paid for, and never used.
+
+  Not hypothetical. `scripts/pbip_desktop_reload.py` (2.265.0) turns a ~115 s
+  edit → restart → verify cycle into ~1 s, and the very next question asked about it was *"how do I
+  make another session aware of that?"* It **was** in SKILL.md's resource table — and still absent
+  from `fidelity-oracle.md`, which is the page an agent actually lands on when it sits down to do
+  render verification. Being listed is not the same as being findable at the moment of need.
+
+  `fidelity-oracle.md`'s render-verify section now leads with the fast reload, why the packaged CLI
+  appears not to work (`reloadModelDefinition` hard-coded false), and — equally important — what
+  reload does **not** do: no data refresh, no `cache.abf`, and **no substitute for a cold open**,
+  which is the only thing that proves a file opens at all. It also records, as one measurement on
+  one model rather than a new rule, that a definition reload preserved loaded rows
+  (`COUNTROWS` 9,994 before and after), so the refresh-every-iteration rule can be relaxed *with
+  evidence* while a blank frame after a reload still means "not ready", never "the answer".
+
+  `tests/test_capability_discoverability.py` makes it an invariant: every script with a `__main__`
+  and an argument surface must be named in the prose. Internal modules are deliberately exempt —
+  their callers are their documentation, and judging all 52 scripts alike would demand runbooks for
+  14 importables and turn the gate into noise. Four pre-existing undocumented scripts
+  (`geometry_audit`, `polish_layout`, `tmdl_lint`, `workbook_calc_usage`) sit in an explicit debt
+  ledger so the rule lands green and can only fire on something new; a second test stops that ledger
+  going stale or quietly buying back an exemption. Verified red under three injections — a new
+  undocumented script, the render runbook losing its pointer, and the reload runbook dropping a
+  stated limit — each caught by the test named for it.
+
+### Fixed
+
+- **`tableau-migration` (skill `2.268.0` → `2.269.0`): a model that reads from the ORIGINAL AUTHOR'S
+  LAPTOP is no longer reported as `built`.** Found by opening all 34 corpus workbooks in Power BI
+  Desktop and looking at all 98 rendered pages — 13 workbooks had visibly broken pages that every
+  static gate had passed. The largest cluster was four workbooks rendering every page as bare
+  headers under *"Some of the tables have incomplete or no data"*, and interrogating the live model
+  gave the cause in one line:
+
+  ```
+  Could not find a part of the path
+  'C:\Users\bshonk\AppData\Local\Temp\TableauTemp\...\Clipboard_20121219T112939.xls'
+  ```
+
+  A `.twbx` records the upstream file its author originally loaded from. When the bundled payload
+  cannot be read — here a legacy `.tde` extract, which the engine has no reader for — the emitter
+  falls back to that recorded path. `0071_numerical_dates` shipped pointing at a stranger's **temp
+  folder from 2012**; `0084_rounding_minutes_to_quarters` at their **desktop**. Both models open,
+  "refresh" to zero rows, render every visual empty — and the pipeline called both plain `built`,
+  with no warning of any kind.
+
+  Nothing static could have seen it: the M is syntactically perfect and the TMDL is valid. The path
+  is wrong only relative to a filesystem, which no schema knows about. The contrast that makes the
+  gap precise: `0083_previous_workday` reaches the SAME blank pages by a different route (an
+  unfinished `TODO` partition stub) and **is** honestly reported. The defect was never the dead
+  path — it was the silence.
+
+  `openability_gate` grows `local_source_paths`, which fails definition-of-done when a partition
+  reads a path under another user's profile. Whether a path is FOREIGN is decidable from the text
+  alone, so the gate stays hermetic and the verdict travels with the model; whether it EXISTS needs
+  a filesystem and is left to the caller. Conservative in both directions — a plain data folder is
+  never judged, `Public`/`Default` are not accounts, and the current user's own profile is fine
+  (case-insensitively). Also fixes the diagnosis wording: a dead path makes a model **"open but load
+  NO DATA"**, not "not openable", and telling a reader the wrong one sends them hunting a corruption
+  that isn't there.
+
+  Corpus: flags exactly the 2 affected workbooks out of 34, 0 false positives. A/B over all 1612
+  emitted files — 3 changed, all three the summary/manifest carrying the new diagnostic.
+
+  **Instrument note (this one invalidates an earlier claim's evidence, not its conclusion).** The
+  corpus differ used `os.walk` on a bare Windows path, which SILENTLY STOPS DESCENDING past
+  MAX_PATH — no error, the tree just looks smaller. Two byte-identical builds reported 1470 vs 1579
+  files purely because their output roots differed by ONE CHARACTER. So the "all 1470 files" quoted
+  for 2.267.0 and 2.268.0 was really **1470 of 1612 (91%)**; re-run with a long-path-safe walk, both
+  conclusions are unchanged. This is the second form of this hole in the same tool — the first was
+  *reading* a long path, fixed one release earlier, and fixing the read did nothing for the walk.
 
 - **`tableau-migration` (skill `2.267.0` → `2.268.0`): a rebuilt Salesforce model no longer refuses
   to OPEN with "ambiguous paths".** Reported from the field as a Power BI Desktop frown: *"There's a

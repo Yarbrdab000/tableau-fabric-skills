@@ -2696,8 +2696,29 @@ def translate_tableau_calc_to_dax_typed(formula, resolver, param_resolver=None, 
         return None, "empty formula", tables_used, None
     try:
         toks = _tokenize(f)
-        if not toks:
-            return None, "empty formula", tables_used, None
+    except _CalcError as e:
+        return None, str(e), tables_used, None
+    return _translate_measure_toks(
+        toks, resolver, param_resolver=param_resolver, measure_refs=measure_refs,
+        known_tables=known_tables, inline_calcs=inline_calcs,
+        related_tables=related_tables, conformed_hubs=conformed_hubs)
+
+
+def _translate_measure_toks(toks, resolver, param_resolver=None, measure_refs=None,
+                            known_tables=None, inline_calcs=None, related_tables=None,
+                            conformed_hubs=None):
+    """Measure-mode parse + the shared post-parse guards, over an ALREADY-tokenized formula.
+
+    Lifted verbatim out of ``translate_tableau_calc_to_dax_typed`` (which now delegates here, so
+    there is exactly one measure-mode emit path) purely so a caller that rewrites a calc at the
+    TOKEN level -- ``translate_param_dispatcher_calc`` -- runs the identical parser, single-table
+    guard and emit guardrail instead of re-implementing any of them. Returns the same 4-tuple
+    ``(dax|None, reason, tables_used, dtype|None)``.
+    """
+    tables_used = set()
+    if not toks:
+        return None, "empty formula", tables_used, None
+    try:
         dax, dtype = _Parser(
             toks, resolver, tables_used, param_resolver=param_resolver,
             measure_refs=measure_refs, known_tables=known_tables,
@@ -2903,6 +2924,261 @@ def translate_aggregated_param_row_calc(formula, agg, resolver, param_resolver=N
     if leak:
         return None, f"emit guardrail: {leak}", tables
     return dax, "ok", tables
+
+
+# --- Parameter dispatchers -------------------------------------------------------------------
+# A Tableau "control surface" calc: CASE [Parameters].[P] WHEN 1 THEN <metric a> WHEN 2 THEN
+# <metric b> ... END, driven by a slicer and projected by the visuals the dashboard is built
+# around. It already translates to a DAX SWITCH -- but ALL-OR-NOTHING: a single branch the
+# translator cannot render stubs the WHOLE measure to BLANK(), so every selection goes blank,
+# including the n-1 whose DAX was already in hand. Measured on corpus workbook 0088
+# (salesforce_nonprofit_case_mgmt): ``Sort By`` had 3 of 4 branches translated and ``Select
+# Metric`` 3 of 4, yet both emitted BLANK() and between them blanked 5 visuals -- the largest
+# single cause of empty charts in the corpus. See ``translate_param_dispatcher_calc``.
+
+def _dispatcher_branch_label(val_toks):
+    """Render a WHEN value back to readable Tableau text for the report (never re-parsed)."""
+    out = []
+    for kind, v in val_toks or ():
+        if kind == "str":
+            out.append('"%s"' % v)
+        elif kind == "field":
+            out.append("[%s]" % v)
+        elif kind == "qfield":
+            out.append(".".join("[%s]" % p for p in v))
+        elif kind == "datelit":
+            out.append("#%s#" % v)
+        else:
+            out.append(str(v))
+    return " ".join(out)
+
+
+def _split_param_dispatcher(toks):
+    """Slice ``CASE [Parameters].[P] WHEN v THEN r ... [ELSE z] END`` into its parts.
+
+    Returns ``{"head": <qfield tok>, "branches": [(value_toks, body_toks)], "else_toks": [...]|None}``
+    -- or ``None`` for anything that is not EXACTLY that shape, which is the fail-closed gate for
+    the whole partial-dispatcher rescue. Deliberately strict: the comparand must be a single
+    ``[Parameters].[X]`` token (a dispatcher is a parameter switch by definition; a CASE over a
+    data field is a different construct with different semantics, and the searched form
+    ``CASE WHEN <cond> THEN`` has no comparand at all).
+
+    Scanning is token-level, so a nested ``IF``/``CASE`` (which carries its own ``END``), a
+    parenthesised sub-expression, and a ``{FIXED ...}`` LOD in a branch body are all traversed
+    without their keywords being mistaken for the dispatcher's own: ``kwdepth`` tracks nested
+    IF/CASE...END pairs and ``depth`` tracks ``(``/``{`` nesting, and only a WHEN/THEN/ELSE/END
+    seen at depth 0 AND kwdepth 0 terminates a slice.
+    """
+    if not toks or len(toks) < 6:
+        return None
+    if toks[0][0] != "id" or str(toks[0][1]).upper() != "CASE":
+        return None
+    head = toks[1]
+    if head[0] != "qfield" or not head[1] or str(head[1][0]).strip().lower() != "parameters":
+        return None
+    if not (toks[2][0] == "id" and str(toks[2][1]).upper() == "WHEN"):
+        return None
+    branches, else_toks = [], None
+    val, body = [], []
+    mode = "val"
+    depth = kwdepth = 0
+    saw_end = False
+    i = 3
+    while i < len(toks):
+        kind, v = toks[i]
+        up = str(v).upper() if kind == "id" else ""
+        if kind == "id" and up in ("IF", "CASE") and depth == 0:
+            kwdepth += 1
+        elif kind == "id" and up == "END" and depth == 0 and kwdepth > 0:
+            kwdepth -= 1
+        elif kind == "op" and v in "({":
+            depth += 1
+        elif kind == "op" and v in ")}":
+            depth -= 1
+            if depth < 0:
+                return None
+        elif depth == 0 and kwdepth == 0 and kind == "id" and up in ("WHEN", "THEN", "ELSE", "END"):
+            if up == "THEN":
+                if mode != "val" or not val:
+                    return None
+                mode, body = "body", []
+            elif up == "WHEN":
+                if mode != "body" or not body:
+                    return None
+                branches.append((val, body))
+                val, mode = [], "val"
+            elif up == "ELSE":
+                if mode != "body" or not body:
+                    return None
+                branches.append((val, body))
+                else_toks, mode = [], "else"
+            else:  # our END
+                if mode == "body" and body:
+                    branches.append((val, body))
+                elif not (mode == "else" and else_toks):
+                    return None
+                saw_end = True
+                i += 1
+                break
+            i += 1
+            continue
+        (val if mode == "val" else (body if mode == "body" else else_toks)).append(toks[i])
+        i += 1
+    if not saw_end or i != len(toks) or not branches:
+        return None
+    return {"head": head, "branches": branches, "else_toks": else_toks}
+
+
+def is_param_dispatcher_calc(formula):
+    """True when ``formula`` is a parameter dispatcher (``CASE [Parameters].[P] WHEN ... END``).
+
+    Used by the caller to keep a dispatcher out of the stub-reference pool it offers to OTHER
+    dispatchers: a rescued dispatcher's DAX is real, so letting one point at another could close a
+    measure-reference cycle. A plain stub is always ``BLANK()`` and can never do that.
+    """
+    try:
+        toks = _tokenize((formula or "").strip())
+    except _CalcError:
+        return False
+    if not toks:
+        return False
+    return _split_param_dispatcher(toks) is not None
+
+
+def translate_param_dispatcher_calc(formula, resolver, param_resolver=None, measure_refs=None,
+                                    known_tables=None, inline_calcs=None, related_tables=None,
+                                    conformed_hubs=None, stub_measure_refs=None,
+                                    exclude_keys=None):
+    """Rescue a PARAMETER DISPATCHER that stubs wholesale because ONE branch will not translate.
+
+    ``CASE [Parameters].[P] WHEN 1 THEN <a> WHEN 2 THEN <b> WHEN 3 THEN <c> END`` is a dashboard's
+    control surface. Today one bad branch takes the entire measure to ``BLANK()`` and every
+    selection renders empty. Here each branch is probed INDEPENDENTLY through the real translator
+    and the dispatcher is rebuilt from the branches that survive, so the n-1 good selections work.
+
+    A failing branch is handled one of two ways:
+
+      * **self-healing reference** -- when its body is a bare ``[X]`` naming a SIBLING calc this
+        model emits as its own measure (``stub_measure_refs``), the branch KEEPS its slot and
+        references that measure. It reads blank today (the sibling is itself a ``BLANK()`` stub)
+        -- exactly what the whole dispatcher did before -- and becomes correct for free the moment
+        that sibling's own translation lands, with no change here. This is why the structure is
+        preserved rather than pruned wherever it can be.
+      * **pruned** -- anything else (an unresolved field, an unsupported construct) is dropped from
+        the rebuilt SWITCH, so that one selection returns BLANK while the others work.
+
+    Fail-closed, and additive -- ``None`` (caller keeps the existing inert stub) unless ALL hold:
+
+      * a ``param_resolver`` is supplied and the formula is exactly the dispatcher shape
+        (``_split_param_dispatcher``) with >= 2 WHEN branches;
+      * at least ONE branch translates on its own merits -- otherwise the rebuild would be a SWITCH
+        of nothing but blanks, which is no more faithful than the stub but WOULD be counted as
+        translated, i.e. precisely the "structurally valid, semantically absent" failure this
+        rescue exists to remove (corpus ``Select Metric Decimal``, whose only branch is a blank,
+        correctly stays a stub);
+      * at least one branch actually needed repair (otherwise the plain translator already had it);
+      * the rebuilt token stream translates through ``_translate_measure_toks`` -- the SAME parser,
+        single-table guard, type check and emit guardrail as any other measure. No DAX is composed
+        here; this function only prunes and re-points branches.
+
+    ``exclude_keys`` pins the calc's own names out of the self-healing pool (no self-reference).
+
+    Returns ``(dax|None, reason, detail)`` where ``detail`` is
+    ``{"live": [<branch>], "blank": [{branch, measure, reason}], "dropped": [{branch, reason}]}``
+    -- the record that keeps a partially-rebuilt dispatcher from going silent once it leaves the
+    needs-review list.
+    """
+    detail = {"live": [], "blank": [], "dropped": []}
+    if not param_resolver:
+        return None, "no parameter resolver", detail
+    try:
+        toks = _tokenize((formula or "").strip())
+    except _CalcError as e:
+        return None, str(e), detail
+    parts = _split_param_dispatcher(toks)
+    if parts is None:
+        return None, "not a parameter dispatcher", detail
+    head = (parts["head"][0], list(parts["head"][1]))
+    branches, else_toks = parts["branches"], parts["else_toks"]
+    if len(branches) < 2:
+        return None, "parameter dispatcher has a single branch", detail
+
+    def _run(stream, refs):
+        return _translate_measure_toks(
+            stream, resolver, param_resolver=param_resolver, measure_refs=refs,
+            known_tables=known_tables, inline_calcs=inline_calcs,
+            related_tables=related_tables, conformed_hubs=conformed_hubs)
+
+    skip = {str(k or "").strip().lower() for k in (exclude_keys or ())}
+    pool = {str(k or "").strip().lower(): v for k, v in (stub_measure_refs or {}).items()}
+    slots, extra = [], {}
+    for val, body in branches:
+        label = _dispatcher_branch_label(val)
+        probe = [("id", "CASE"), head, ("id", "WHEN")] + list(val) + [("id", "THEN")] \
+            + list(body) + [("id", "END")]
+        bdax, why, _bt, _bd = _run(probe, measure_refs)
+        if bdax is not None:
+            slots.append((val, body, "live"))
+            detail["live"].append(label)
+            continue
+        target = None
+        if len(body) == 1 and body[0][0] == "field":
+            key = str(body[0][1] or "").strip().lower()
+            if key and key not in skip:
+                target = pool.get(key)
+        if target is not None:
+            slots.append((val, body, "healed"))
+            extra[str(body[0][1] or "").strip().lower()] = target
+            detail["blank"].append({"branch": label, "measure": target[0], "reason": why})
+        else:
+            detail["dropped"].append({"branch": label, "reason": why})
+    if not detail["live"]:
+        return None, "no parameter-dispatcher branch translates", detail
+    if not detail["blank"] and not detail["dropped"]:
+        # Every WHEN branch translates on its own, so the only thing left that can be wrong is the
+        # ELSE. Confirm against the INTACT formula: a dispatcher the plain translator already
+        # handles must never be re-emitted through this path (there is one emit path per calc).
+        whole, _wwhy, _wt, _wd = _run(list(toks), measure_refs)
+        if whole is not None or not else_toks:
+            return None, "parameter dispatcher needs no branch repair", detail
+
+    refs = dict(measure_refs or {})
+    refs.update(extra)
+    healed_any = bool(detail["blank"])
+
+    def _rebuild(include_healed, with_else):
+        out = [("id", "CASE"), head]
+        for val, body, kind in slots:
+            if kind == "healed" and not include_healed:
+                continue
+            out += [("id", "WHEN")] + list(val) + [("id", "THEN")] + list(body)
+        if with_else:
+            out += [("id", "ELSE")] + list(else_toks)
+        out.append(("id", "END"))
+        return out
+
+    # Candidate rebuilds, MOST FAITHFUL FIRST, each handed to the same translator; the first that
+    # survives its parse, type check and emit guardrail wins. The descent is what keeps a
+    # mistyped sibling out of the model: a stub whose declared type cannot share a SWITCH with the
+    # live branches is rejected by the parser's own return-type check, and the branch is pruned on
+    # the next candidate instead of being emitted as mistyped DAX.
+    options = [(h, e)
+               for h in ([True, False] if healed_any else [True])
+               for e in ([True, False] if else_toks else [False])]
+    last = "parameter dispatcher did not translate after branch repair"
+    for include_healed, with_else in options:
+        dax, why, _t, _d = _run(_rebuild(include_healed, with_else), refs)
+        if dax is None:
+            last = why
+            continue
+        if not include_healed:
+            detail["dropped"].extend(
+                {"branch": b["branch"], "reason": b["reason"]} for b in detail["blank"])
+            detail["blank"] = []
+        if else_toks and not with_else:
+            detail["dropped"].append({"branch": "ELSE", "reason": last})
+        return dax, "ok", detail
+    return None, last, detail
 
 
 def _addressing_fact_guard(tables_used, required_facts):

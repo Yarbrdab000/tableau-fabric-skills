@@ -38,6 +38,7 @@ check) no readable header is simply skipped, never flagged.
 from __future__ import annotations
 
 import re
+import os
 
 try:
     from tmdl_lint import lint_tmdl_text
@@ -292,7 +293,58 @@ def _ambiguous_relationship_pairs(text, limit=12):
     return found
 
 
-def check_model_openability(parts, flatfile_headers=None, expected_endpoints=None):
+def _M_ABSOLUTE_PATHS(text):
+    """Every absolute Windows path written as a string literal inside an M partition.
+
+    Matches the escaped form TMDL actually stores (``C:\\\\Users\\\\...``) and the unescaped form,
+    returning the real path either way. Deliberately literal-only: a path assembled at runtime from
+    a parameter cannot be judged here, and guessing would produce false accusations.
+    """
+    out = []
+    for m in re.finditer(r'"([A-Za-z]:(?:\\\\|\\)[^"]{3,400})"', text or ""):
+        # TMDL escapes a backslash, so the stored form is C:\\Users\\... -- collapse it back to the
+        # real path. Skipping this leaks the escaped text into the diagnostic, which then does not
+        # match what a reader sees in the M query.
+        out.append(m.group(1).replace("\\\\", "\\"))
+    return out
+
+
+# Where a per-user home directory lives on the two platforms a .twbx can be authored on. A path
+# under one of these belongs to a NAMED account, which is what makes "not ours" decidable without
+# touching the filesystem.
+_PROFILE_ROOTS = ("users", "home")
+
+
+def _foreign_profile_owner(path, current_user):
+    """The other user's account name when ``path`` lives under someone else's profile, else ``None``.
+
+    Conservative in both directions, because both mistakes are expensive: a false positive fails a
+    good build, and a false negative is the silent-empty-model defect this exists to catch.
+
+      * only a path whose FIRST segment is a profile root counts (``C:\\Users\\<name>\\...``), so an
+        ordinary data folder like ``C:\\data\\sales.xlsx`` is never judged;
+      * a path under the CURRENT user is fine -- that is just a local file;
+      * ``Public`` / ``Default`` / ``All Users`` are shared pseudo-accounts, not a person's laptop.
+    """
+    parts = [p for p in re.split(r"[\\/]+", path or "") if p]
+    # A Windows path starts with a drive segment (``C:``) so the profile root is parts[1]; a POSIX
+    # path has no drive and its root is parts[0]. Indexing past a drive that is not there was the
+    # first version's bug -- ``/home/alice/data.csv`` came back clean.
+    if parts and re.fullmatch(r"[A-Za-z]:", parts[0]):
+        parts = parts[1:]
+    if len(parts) < 2:
+        return None
+    if parts[0].lower() not in _PROFILE_ROOTS:
+        return None
+    owner = parts[1]
+    low = owner.lower()
+    if low in ("public", "default", "default user", "all users") or low == current_user:
+        return None
+    return owner
+
+
+def check_model_openability(parts, flatfile_headers=None, expected_endpoints=None,
+                            current_user=None):
     """Structurally validate a built model's ``parts`` dict; return a verdict.
 
     ``parts`` -- the ``{relative_path: tmdl_text}`` mapping ``assemble_import_model`` returns.
@@ -716,6 +768,54 @@ def check_model_openability(parts, flatfile_headers=None, expected_endpoints=Non
                            % (b, a, " -> ".join(paths[0]), " -> ".join(paths[1]))),
             })
     checks["unambiguous_relationship_paths"] = unambiguous
+
+    # ``local_source_paths`` -- an absolute path in an M partition that belongs to SOMEBODY ELSE'S
+    # MACHINE. A ``.twbx`` records the upstream file the author originally loaded from; when the
+    # bundled payload cannot be read (a legacy ``.tde`` extract, say) the emitter falls back to that
+    # recorded path -- and it is a path on a laptop we have never seen.
+    #
+    # Measured on the corpus, 2026-08-24. ``0071_numerical_dates`` emitted
+    # ``C:\Users\bshonk\AppData\Local\Temp\TableauTemp\...\Clipboard_20121219T112939.xls`` and
+    # ``0084_rounding_minutes_to_quarters`` emitted ``C:\Users\bshonk\Desktop\dates.xlsx`` -- the
+    # original author's temp folder and desktop, from 2012. Both models OPEN, refresh to ZERO rows,
+    # and render every page as bare headers under "Some of the tables have incomplete or no data".
+    # Both were reported by the pipeline as plain ``built``, with no warning of any kind. (A third,
+    # ``0083_previous_workday``, hits the same blank pages by a DIFFERENT route -- an unfinished
+    # ``TODO`` partition stub -- and that one IS honestly reported, which is the contrast that makes
+    # this gap worth closing.)
+    #
+    # Two questions, deliberately kept apart. Whether a path is FOREIGN is decidable from the text
+    # alone, so it is judged here and travels with the model. Whether a path EXISTS depends on the
+    # filesystem, which this module must never touch -- ``local_file_paths_exist`` in
+    # ``migrate_estate`` owns that. A foreign path is the stronger signal anyway: a file under
+    # another user's profile is wrong even on the rare machine where it happens to resolve.
+    foreign_paths = True
+    if current_user is None:
+        current_user = os.environ.get("USERNAME") or os.environ.get("USER") or ""
+    current_user = (current_user or "").lower()
+    for path in sorted(parts):
+        if not _TABLE_PART_RE.match(path):
+            continue
+        text = parts[path] or ""
+        table = _table_name(text) or path
+        for raw in _M_ABSOLUTE_PATHS(text):
+            owner = _foreign_profile_owner(raw, current_user)
+            if owner is None:
+                continue
+            foreign_paths = False
+            issues.append({
+                "check": "local_source_paths",
+                "table": table,
+                # %s, not %r: the path is already unescaped, and %r would re-double every
+                # backslash -- putting the escaped form back into the diagnostic, which then does
+                # not match what a reader sees in the M query.
+                "detail": ("partition reads '%s', which lives under another user's profile (%r) -- "
+                           "this is the upstream path recorded in the source workbook, not a file "
+                           "on this machine, so the table loads ZERO rows and every visual bound to "
+                           "it renders empty while the model still opens and 'refreshes'"
+                           % (raw[:180], owner)),
+            })
+    checks["local_source_paths"] = foreign_paths
 
     # ``not_evaluated`` (#141) states a NON-ANSWER positively instead of leaving it to be inferred.
     # Additive by construction: ``ok``, ``checks`` and ``issues`` are untouched and keep their exact

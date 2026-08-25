@@ -304,6 +304,60 @@ nothing*. Three sightings from three unrelated lanes, all found only by reading 
 Ask *"does this emitted artifact say anything"*, not *"is it well-formed"*. The two questions have
 different answers far more often than they look like they should.
 
+### Its mirror image: a MEASUREMENT that is well-formed and says nothing
+
+The same defect turned on the instrument. A filter, query or regex over a population produces
+*partial* output that is indistinguishable from *complete* output, because the rows it silently
+failed to match emit nothing to notice. Four sightings in a single day's work, from four people
+who all knew better:
+
+* a triage regex `unsupported (?:function|table calculation) ([A-Z_]+)` run over reason strings, which
+  failed **three escalating silent ways at once**. `unsupported function size` (lower-case in the
+  source) matched nothing and vanished. `unsupported function Total` **did** match — `[A-Z_]+` happily
+  captured just `T` — and was tallied under a function named `T`. And worst, `Sales` and `Stage` both
+  captured `S`, so **two distinct functions merged into a single bucket that never existed in the
+  source**, carrying a wholly plausible count of `2`. Seven entries corrupted on a 34-workbook
+  corpus (1 vanished, 6 mangled), of which a match-count assertion catches exactly **one**. Auditing
+  the resulting tally would mean checking a name the instrument invented;
+* `os.path.isdir(report["pbip_folder"])` — that value is a path to a **file**, so the check was
+  always `False` and every stub count silently read as `0`;
+* a stub-class ranking that used `fallback_reason` as ground truth, when (at engine 2.291.0) 9 of the
+  11 entries in the largest class were dependents inheriting a *dependency's* error (see `blocked_by`
+  in [second-compiler.md](second-compiler.md));
+* a claim that `category_guidance` was empty on 30 stubs, measured against `needs_review` — a list
+  that does not carry that key at all. It is empty on **0**.
+
+Three rules, and the last two are the ones people miss:
+
+1. **A filter over a population must assert its match count against that population — and then
+   validate the CAPTURES.** `matched + unmatched == total` is necessary and *badly* insufficient: it
+   caught 1 of the 7 corruptions above. A greedy-enough pattern does not fail, it succeeds and hands
+   back a truncated token; two truncated tokens can then collide into one fabricated category. Assert
+   that each capture round-trips — that it is a value the source could actually have produced.
+2. **When a summary list and a payload list sit side by side, a reader will measure whichever they
+   find first — so any field that changes a decision must be on BOTH.** This is a *design* rule for
+   whoever adds the field, not a reading rule for whoever consumes it; you cannot fix it downstream
+   by telling readers to look elsewhere, because the reader who needs telling is precisely the one
+   who never got there. `translation_handoff` carries `blocked_by` on both `needs_review` and
+   `requests` for exactly this reason, while `category_guidance` — on `requests` only — produced the
+   fourth sighting above.
+3. **A corpus count must cite the engine version it was measured at, or it is a claim with a hidden
+   expiry date.** The same query returned 71 needs-review calcs at 2.275.0 and 69 at 2.291.0; the
+   delta was two calcs a release had *fixed*. A bare `71` in a rules file reads as a fact about the
+   corpus forever, and silently becomes wrong the moment the engine improves.
+
+And the rule that catches all of them: **re-derive every claim from the artifact, never from the
+sentence before it.** A number checked only against the previous draft of the same number will
+survive any quantity of careful reading. The `9 of 11` / `8 of 11` correction in the 2.291.0
+CHANGELOG entry had passed three human reads and fell on the first automated re-derivation.
+
+**Its subtler form, which produced the `S` merge above: re-derive the SCOPE too, not just the
+arithmetic.** The first version of this very section correctly refused a reported "25 vs 30" and
+re-measured it — but re-measured only the two function names the report happened to mention, and so
+reported five corrupted entries instead of seven and missed the merge entirely. Inheriting someone
+else's *question* is the same defect as inheriting their answer, and it is much harder to see,
+because the arithmetic you did is genuinely correct.
+
 ---
 
 ## Security

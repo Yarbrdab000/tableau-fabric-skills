@@ -85,7 +85,7 @@ MAX_GROWTH = FRAME_DEMAND_CAP
 # A leaf minimum must be at least what the EMIT path will actually give that leaf: emit re-floors a
 # slicer to its own dropdown minimum after placement, so a smaller reservation here does not shrink
 # the emitted box, it just makes it overrun whatever the solver seated below it.
-MIN_SLICER = (120.0, 76.0)       # dropdown: matches the emitter's own SLICER_DROPDOWN_MIN_H floor
+MIN_SLICER = (120.0, 57.0)       # dropdown: matches the emitter's own SLICER_DROPDOWN_MIN_H floor
 MIN_SLICER_LIST_H = 100.0        # list/checklist mode is taller
 MIN_PARAMCTRL = (120.0, 56.0)
 MIN_TEXT = (120.0, 32.0)
@@ -330,6 +330,62 @@ def _scale_abs(src, frame):
             sh / fsh * fh)
 
 
+def _cross_from_src(child, node, origin, extent, axis):
+    """The child's cross-axis ``(size, position)`` from its AUTHORED size, not a stretch-to-fill.
+
+    A flexbox container stretches its children across the cross axis; Tableau does not. A Tableau
+    zone declares its own size inside its parent, and the leftover is the card's padding -- so
+    stretching a leaf to its container's cross extent inflates every object by exactly that padding.
+
+    Measured on the Salesforce NPSP "Staff Capacity" dashboard (1366x768 fixed): a filter card
+    authored ``h=7422`` inside a ``layout-flow`` authored ``h=12890`` was emitted **99px tall instead
+    of 57px**, i.e. the container's height, leaving a dead band under every dropdown. The same
+    stretch inflated the KPI row's worksheets from their authored 235px to the container's 257px.
+    Across the page not one of 16 scored objects landed within 10px of its authored SIZE, and the
+    median displacement of an object's centre was 44px.
+
+    This is the flow-axis twin of what ``_scale_abs`` already does for a ``frame``: map the source
+    fraction into the allocated box. The MAIN axis is untouched -- the flex algorithm above owns it,
+    with its fixed/min/squeeze rules -- so this only ever changes the axis that was previously
+    ignoring the source entirely.
+
+    Fail-safe and containment-preserving:
+      * a node or child with no usable ``src`` extent falls back to the old stretch, so any tree the
+        parser could not measure behaves exactly as before;
+      * the size is clamped UP to the child's own minimum (never past the container), keeping the
+        min-respect invariant;
+      * the offset is clamped so ``offset + size <= extent``, so cross-axis containment stays
+        unconditional -- the same promise the module already makes on the main axis.
+    """
+    ns = node.get("src") or {}
+    cs = child.get("src") or {}
+    n_ext = ns.get(axis)
+    c_ext = cs.get(axis)
+    try:
+        n_ext = float(n_ext)
+        c_ext = float(c_ext)
+    except (TypeError, ValueError):
+        return extent, origin
+    if n_ext <= 0 or c_ext <= 0:
+        return extent, origin
+
+    size = extent * min(1.0, c_ext / n_ext)
+    minkey = "min_w" if axis == "w" else "min_h"
+    try:
+        size = max(size, min(float(child.get(minkey) or 0.0), extent))
+    except (TypeError, ValueError):
+        pass
+    size = max(0.0, min(size, extent))
+
+    okey = "x" if axis == "w" else "y"
+    try:
+        off = (float(cs.get(okey) or 0.0) - float(ns.get(okey) or 0.0)) / n_ext * extent
+    except (TypeError, ValueError):
+        off = 0.0
+    off = max(0.0, min(off, max(0.0, extent - size)))
+    return size, origin + off
+
+
 def allocate(node, rect):
     """Assign ``node['rect']`` and recurse, distributing a flow container's rect among its children.
 
@@ -476,9 +532,11 @@ def allocate(node, rect):
     for c in kids:
         size = max(0.0, alloc[id(c)])
         if vertical:
-            allocate(c, (x, cursor, w, size))
+            cw, cx = _cross_from_src(c, node, x, w, "w")
+            allocate(c, (cx, cursor, cw, size))
         else:
-            allocate(c, (cursor, y, size, h))
+            ch, cy = _cross_from_src(c, node, y, h, "h")
+            allocate(c, (cursor, cy, size, ch))
         cursor += size + gap
 
 

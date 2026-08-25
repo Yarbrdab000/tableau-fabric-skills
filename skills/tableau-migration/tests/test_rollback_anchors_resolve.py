@@ -276,3 +276,150 @@ def test_every_anchor_predates_the_version_it_anchors(repo):
           "one namespace shared by every worktree, so the tag NAME can end up owned by one session "
           "while the VERSION it anchors belongs to another. Re-cut at a commit whose VERSION is "
           "lower than the anchored version -- normally the release's parent.")
+
+
+# --- the anchor's MEANING, not just its existence -------------------------------------------
+# An anchor cut on a lane branch is accurate about the history it was cut in, and can stop being
+# accurate the moment that history is merged. Measured on the integration branch:
+# `rollback/pre-v2.293.0` points at a commit stamped 2.270.0 -- true on that lane, where the state
+# before 2.293.0 really was 2.270.0 -- but 2.291.0 and 2.292.0 now sit between. Resetting there
+# lands TWO RELEASES SHORT of what the tag claims, and every gate above passes: the tag exists, it
+# resolves, its commit is reachable, and 2.270.0 is dutifully "strictly less than" 2.293.0.
+#
+# WHY THIS GATE IS BUILDABLE AND ITS PREDECESSOR WAS NOT. The obvious formulation -- "every anchor
+# must name a version that exists" -- was measured and REJECTED: 244 of 319 anchors fail it against
+# the CHANGELOG (which retains ~75 versions by design), and 35 still fail against every VERSION ever
+# stamped on any ref. Those 35 are CORRECT behaviour: `rollback/pre-v2.216.0` .. `pre-v2.224.0` all
+# point at one commit, all cut inside one minute -- a whole block claimed under the old block rule
+# and never shipped. A claimed-but-unused anchor and a renumbered-away anchor are indistinguishable
+# by construction, so that gate could only have shipped with a 35-entry exceptions file that grew
+# with every claim.
+#
+# This one judges CHANGELOG ENTRIES, not anchors. An orphan block anchor has no entry, so it is
+# never judged -- the exclusion is BY CONSTRUCTION rather than by allowlist, which is the whole
+# difference between a gate and a gate with a rotting exceptions file.
+#
+# WHAT IT DOES NOT CATCH, stated so the coverage is not overclaimed: a version RENUMBERED AWAY has
+# no CHANGELOG entry either, so it is not judged here. This catches anchors whose meaning went
+# STALE, not anchors that are MISSING. Overstating a gate's reach is the same defect class as a
+# `rebuilt` status that only means "the emitter did not raise".
+#
+# FIXING a violation is an INTEGRATOR operation: re-point the boundary anchor at the merged parent.
+# That is precisely the act a session must never perform on another session's tag, and it is
+# legitimate for whoever owns the merge, because the merge is what changed the anchor's meaning.
+# Whoever re-chains the CHANGELOG must also re-point the anchor; those two halves have always been
+# one operation and nobody had noticed.
+#
+# The ledger below is debt, not exemption. Each entry is a real interleave boundary whose anchor
+# still means what it meant on its lane. Unlike the 35 orphans it is finite and shrinking.
+_INTERLEAVE_DEBT = {
+    "2.143.0",   # predates centralised allocation; owner unknown, and no merge in this series
+                 # created it -- left alone deliberately rather than re-pointed on speculation.
+    # 2.274.0 / 2.293.0 / 2.296.0 were PAID by the integrator on 2026-08-25: each anchor re-pointed
+    # at the release commit of its declared predecessor, in the same pass that re-chained the
+    # CHANGELOG. Originals preserved as archive/anchor-pre-vX-preintegration, because re-pointing is
+    # the only irreversible step in the ritual and each old target was ACCURATE on the lane it was
+    # cut on. Deleting them from this ledger is what hands them to the gate, and the companion test
+    # demanding that deletion is what proved the repair -- the count going 4 -> 1 is the evidence,
+    # not the fact that the suite went green.
+}
+
+
+def _chain_pairs(repo):
+    """``[(declared_predecessor, produced_version), ...]`` from the CHANGELOG's own chain."""
+    import io
+    import re
+
+    path = os.path.join(repo, "CHANGELOG.md")
+    if not os.path.isfile(path):
+        return []
+    text = io.open(path, encoding="utf-8").read()
+    return [(m.group(1), m.group(2)) for m in
+            re.finditer(r"\(skill\s+`(\d+\.\d+\.\d+)`\s*\u2192\s*`(\d+\.\d+\.\d+)`\)", text)]
+
+
+def test_each_anchor_sits_exactly_one_release_before_what_it_anchors(repo):
+    """``VERSION`` at ``rollback/pre-vX`` must EQUAL the predecessor its CHANGELOG entry declares.
+
+    "Strictly less" is not enough, and that gap is the whole point: an anchor left behind by an
+    interleaved merge is still lower, still reachable, still resolvable -- and restores a state two
+    releases short of the one it names. Equality is what makes a rollback land where it claims.
+    """
+    pairs = _chain_pairs(repo)
+    if not pairs:
+        pytest.skip("no versioned CHANGELOG entries in this checkout")
+    tags = _tag_commits(repo)
+    wanted = [tags["rollback/pre-v" + made] for _pred, made in pairs
+              if ("rollback/pre-v" + made) in tags]
+    at = _version_at(repo, wanted)
+    if not at:
+        pytest.skip("could not read VERSION at the anchor commits")
+
+    violations = []
+    for pred, made in pairs:
+        if made in _INTERLEAVE_DEBT:
+            continue
+        sha = tags.get("rollback/pre-v" + made)
+        if not sha:
+            continue                      # absence is the sibling gate's business, not this one
+        got = at.get(sha)
+        if got and got != pred:
+            violations.append("%s declares predecessor %s, but rollback/pre-v%s -> %s is stamped %s"
+                              % (made, pred, made, sha[:8], got))
+
+    assert not violations, (
+        "anchor(s) do not sit exactly one release before the version they name, so resetting to "
+        "them lands short of what the tag claims:\n  " + "\n  ".join(violations)
+        + "\n\nUsual cause: the anchor was cut on a lane branch and an interleaved merge inserted "
+          "other releases between it and its own. The fix is the INTEGRATOR's: re-point the anchor "
+          "at the merged parent, in the same operation that re-chains the CHANGELOG.")
+
+
+def test_the_interleave_debt_ledger_stays_honest(repo):
+    """Flag debt that has been PAID -- but only where that is decidable.
+
+    Two earlier formulations were wrong, and both are worth keeping because they are the same
+    mistake in opposite directions:
+
+      * *"every ledgered version appears in the chain"* -- fails on every lane branch. 2.274.0 and
+        2.296.0 are other lanes' boundaries and do not exist in this CHANGELOG until the merge
+        brings them. Absence here means "not merged yet", not "stale".
+      * *"every ledgered version currently mismatches"* -- fails on a lane too, in reverse: on its
+        own lane 2.293.0 declares predecessor 2.270.0 and its anchor stamps 2.270.0, so it
+        SATISFIES the invariant there. It only breaks once the merge inserts 2.291.0/2.292.0
+        between. The debt is latent on the lane and active after the merge.
+
+    So the honest scope: a boundary's status is only decidable once the interleave has actually
+    happened, i.e. on a chain containing the whole ledger. Anywhere else this skips rather than
+    guessing -- the same discipline as the rest of this module.
+
+    Where it IS decidable, this is how the integrator's repair proves itself: re-pointing an anchor
+    makes it satisfy the invariant, this test then demands its ledger entry be removed, and the
+    count drops for real rather than quietly staying put.
+    """
+    pairs = _chain_pairs(repo)
+    if not pairs:
+        pytest.skip("no versioned CHANGELOG entries in this checkout")
+    produced = {made for _pred, made in pairs}
+    if not _INTERLEAVE_DEBT.issubset(produced):
+        pytest.skip("this chain does not yet contain every ledgered boundary (lane branch), so "
+                    "whether a boundary's debt is paid is not decidable here")
+
+    tags = _tag_commits(repo)
+    wanted = [tags["rollback/pre-v" + made] for _p, made in pairs
+              if ("rollback/pre-v" + made) in tags]
+    at = _version_at(repo, wanted)
+    if not at:
+        pytest.skip("could not read VERSION at the anchor commits")
+
+    paid = []
+    for pred, made in pairs:
+        if made not in _INTERLEAVE_DEBT:
+            continue
+        sha = tags.get("rollback/pre-v" + made)
+        if sha and at.get(sha) == pred:
+            paid.append("%s (anchor now stamps %s, its declared predecessor)" % (made, pred))
+
+    assert not paid, (
+        "interleave-debt ledger names version(s) whose anchor now satisfies the invariant -- the "
+        "debt is paid, so delete the entry and let the gate protect it:\n  " + "\n  ".join(paid))

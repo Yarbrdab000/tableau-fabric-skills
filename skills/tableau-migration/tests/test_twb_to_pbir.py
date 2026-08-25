@@ -8402,7 +8402,15 @@ def test_dropdown_filter_card_height_is_floored_at_the_chrome_minimum():
     # §13.3: a scaled filter card (h=6000 -> 6000*0.008 = 48px) in Dropdown mode is
     # floored at SLICER_DROPDOWN_MIN_H so Power BI never clips the control.
     #
-    # The floor is 76, not the 64 this test previously asserted. 64 was an ESTIMATE of where Power
+    # Asserts the CONSTANT, not a literal. A literal here has gone stale twice -- 64 -> 76 -> 57 --
+    # each time because the floor was deliberately RE-MEASURED, and each time the literal turned
+    # that re-measurement into a failure that says nothing about behaviour. What this test is FOR
+    # is that a too-short card gets grown; the exact target is the constant's business.
+    #
+    # Moved to 57.0 on 2026-08-25: 76 was the arithmetic of Power BI's DEFAULT ~12pt chrome and
+    # predates this emitter stamping the source's 9pt face. At 9pt a 57px card renders its full
+    # label AND selector (render-verified on the Salesforce NPSP 'Staff Capacity' band), so the old
+    # floor was silently growing every authored Tableau filter card by a third. 64 was an ESTIMATE of where Power
     # BI starts clipping; 76 is the arithmetic of the chrome itself -- header 28 + selector 32 +
     # padding 8/8 -- and below it the header or the selector is clipped and the control is unusable
     # (issue #100). The failure is validation-invisible: the JSON is well-formed and the report
@@ -8414,7 +8422,9 @@ def test_dropdown_filter_card_height_is_floored_at_the_chrome_minimum():
     dash = _one_card_dashboard("W", "none:Region:nk", card_h=6000, card_y=90000)
     slicers = _page_slicers(emit_pbir(parse_twb(_workbook(ws, dash), layout="legacy")))
     assert len(slicers) == 1
-    assert slicers[0]["position"]["height"] == 76.0
+    from twb_to_pbir import SLICER_DROPDOWN_MIN_H as _FLOOR
+    assert slicers[0]["position"]["height"] == _FLOOR
+    assert slicers[0]["position"]["height"] > 48.0, "the floor must have bound on a 48px card"
 
 
 def test_checklist_filter_card_height_tracks_the_scaled_zone():
