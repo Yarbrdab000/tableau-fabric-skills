@@ -126,6 +126,15 @@ not mirrored.
   shipped set, or read branches rather than tags — and note that the integrator wrote the anchor
   rule ("an anchor tells you a version is CLAIMED, never that it is unlanded") and then built a
   ledger on exactly the surface it warns about.
+- **A second opinion narrower than the check it verifies is not redundancy.** The shipped CHANGELOG
+  chain gate accepts both `->` and `\u2192` and does not require a backticked skill name, so it has always
+  examined all **137** entries. My independent probe — written to double-check it — required the
+  Unicode arrow *and* the backticked name, and saw **86**. Two formats coexist in that file, the older
+  51 using bare `tableau-migration` and ASCII `->`. So the "second opinion" I was relying on could
+  never have contradicted the gate on 51 of its entries; had the gate been wrong there, my check would
+  have agreed by construction. Verify a check with something at least as broad as the check, and make
+  both print their admitted counts so a divergence like 86-vs-137 surfaces as a question rather than
+  as agreement.
 - **A known-unreliable instrument's most extreme output is the one most likely to be its artifact —
   and it is the one that gets quoted.** A proximity matcher documented as unreliable for large
   movements paired an object that was *never emitted* against an unrelated chart and produced a
