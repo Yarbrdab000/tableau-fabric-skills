@@ -536,6 +536,16 @@ The historical block rules, kept because old anchors and CHANGELOG entries still
   `archive/anchor-pre-vX-preintegration` there would have been nothing to compare against, and the
   finding would have been an argument between two readings instead of a fact. An archive is a
   measurement you have not needed yet.
+* **On a shared mutable ref, the safe move on disagreement is to REPORT, not to converge** — because
+  convergence requires a shared view, and disagreement is the proof you have not got one. Measured:
+  two sessions independently adopted each other's *prior* position one message apart, with
+  `refs/tags` between them. Both were reasoning from published evidence; neither was careless. The
+  only reason it stayed harmless is that **both actors who could write the ref stopped and reported
+  instead** — one flagged a red gate without fixing it, the other asked them not to write before they
+  could. Had either "just fixed it", six anchors would have been re-broken by whichever write landed
+  second, and the tree would have been wrong in a way that looked like a merge conflict.
+  Corollary: never leave *"say the word and I'll write it"* on the table for a shared ref — the offer
+  is the hazard, because the answer may cross a change that makes it wrong.
 * **An anchor tells you a version is CLAIMED, never that it is unlanded.** Three distinct anchor
   failures showed up in one day and none was predictable from the others: pointing at an orphan,
   absent because another session deleted it, and present-but-already-shipped.
