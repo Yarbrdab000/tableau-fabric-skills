@@ -14,6 +14,35 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ### Fixed
 
+- **`tableau-migration` (skill `2.294.0` → `2.295.0`): a stale measured constant stops overriding
+  every authored filter card.** With the cross-axis fix in place the solver correctly produced the
+  authored **57px** for a Tableau filter card — and the emitter then floored it back up to **76px**,
+  so the dead band under every dropdown survived a fix that had already solved it.
+
+  The 76 was not a guess. It is the arithmetic of Power BI's **default ~12pt** dropdown chrome
+  (header 28 + selector 32 + padding 8/8), measured against a real clipping defect: issue #100, 16
+  slicers emitted between 45px and 64px, every one clipped. It was correct when it was measured.
+
+  It was measured **before this emitter began stamping the source's 9pt point size** — which was the
+  other half of that same fix, and which shrinks the chrome the floor was protecting. So a constant
+  with genuine provenance quietly outlived its premise and started doing the opposite of its job:
+  instead of rescuing a degenerate card, it grew every faithfully-sized one by a third.
+
+  **A stale measured constant is more dangerous than a guessed one**, because its provenance is the
+  reason nobody re-checks it. Render-verified at 9pt: a 57px card shows its full label *and* its
+  selector, no clipping. The floor stays — a degenerate tiny card still has to render its control —
+  but is now set to the smallest height shown to work at the font actually emitted.
+
+  `layout_solve.MIN_SLICER` moves with it: an existing test asserts the solve reserves exactly what
+  emit will use, and moving one without the other would leave the solve under-reserving and
+  overrunning whatever it seated below.
+
+  The floor test now asserts the **constant** rather than a literal, and separately asserts the floor
+  actually bound. That literal had gone stale twice already — 64 → 76 → 57 — and each time turned a
+  deliberate re-measurement into a failure that said nothing about behaviour.
+
+### Added
+
 - **`tableau-migration` (skill `2.293.0` → `2.294.0`): an object is rebuilt at the size its author
   drew it, not stretched to fill the container it sits in.** Reported as "we STILL cannot figure out
   how to properly size things like filters and parameters", with a screenshot of a Tableau filter

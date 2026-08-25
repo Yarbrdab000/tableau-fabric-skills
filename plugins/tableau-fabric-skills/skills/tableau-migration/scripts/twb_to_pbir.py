@@ -207,17 +207,21 @@ SLICER_CTRL_H = 40.0
 # chrome pad added) -- the emitted box tracks the SOURCE card number-for-number, per the user. A small
 # absolute floor (SLICER_DROPDOWN_MIN_H) guarantees a degenerate tiny card still renders its control.
 #
-# The floor is 76px because that is what a Power BI dropdown slicer's own chrome costs: header 28 +
-# selector 32 + padding 8/8. Below it the header or the selector is CLIPPED and the control is
-# unusable -- a validation-invisible rendering bug, since the JSON is well-formed and the report
-# opens (issue #100: 16 slicers emitted between 45px and 64px, every one clipped). The previous 64.0
-# was an estimate of where Power BI starts clipping; the 76 is the arithmetic of the chrome itself.
+# The floor is 57px: the height Tableau itself authors for a filter card, and the height a Power BI
+# dropdown demonstrably needs at the 9pt face this emitter stamps (SLICER_FONT_PT). Render-verified
+# 2026-08-25 on the Salesforce NPSP "Staff Capacity" band -- every card showed its full label AND its
+# selector, with no clipping and no dead space.
 #
-# This deliberately overrides "track the source card number-for-number" ONLY at the bottom end: a
-# Tableau filter card and a Power BI dropdown have different chrome, so a faithful pixel copy of a
-# short Tableau card produces a control the reader cannot use. Every card at or above the floor is
-# still translated directly.
-SLICER_DROPDOWN_MIN_H = 76.0
+# It was 76.0, and that number is the arithmetic of Power BI's DEFAULT (~12pt) chrome: header 28 +
+# selector 32 + padding 8/8. That was correct when it was measured (issue #100: 16 slicers between
+# 45px and 64px, every one clipped) -- and it was measured BEFORE this emitter began stamping the
+# source's 9pt point size, which is the other half of that same fix. A floor calibrated against the
+# larger face outlived the reason for it, and then overrode the authored size on every dashboard:
+# a 57px Tableau card was silently grown to 76px, i.e. a third taller than the author drew it.
+#
+# Keep a floor -- a degenerate tiny card still has to render its control -- but set it to the
+# smallest height actually shown to work at the font we emit, not to the chrome of a font we do not.
+SLICER_DROPDOWN_MIN_H = 57.0
 SLICER_PAD_X = 7.0
 SLICER_ROW_GUTTER = 8.0
 SLICER_FONT_PT = 9.0
