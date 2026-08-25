@@ -71,9 +71,27 @@ not mirrored.
   ```
   cd skills\tableau-migration; py -3.11 -m pytest tests -q
   ```
-  Keep it green. The current baseline is **956 passed / 1 skipped / 1 xfailed**.
+  Keep it green. The current baseline is **5123 passed / 6 skipped / 1 xfailed** (it advances with
+  almost every release — treat it as "must not go DOWN", and re-read it from the tip rather than
+  trusting this line, which has been stale before).
 - Keep report-schema changes **additive** — add new keys or artifacts; do not rename or remove
   existing report keys. Add tests; never delete passing tests to make a change pass.
+- **A filter that finds nothing has told you about its own predicate, not about the world.** When
+  you measure a population by matching strings, assert the match count against the population size,
+  or you silently report on a subset. Four instruments lied this way in a single investigation, each
+  producing a confident number: a regex `([A-Z_]+)` that matched `WINDOW_MAX` and simply did not
+  match `Total`, hiding 5 of 30 stubs; `len(x) if isinstance(x, (list, tuple))` against a value that
+  is a **dict**, reporting 0 visual calculations where there were 3; comparing a `blocked_by` dict
+  against a set of name strings, reporting 8 of 8 dangling when 0 dangle; and `os.path.isdir()` on
+  `pbip_folder`, which is a relative path to a **file**, zeroing every per-workbook count. The
+  failure is not that the predicate was wrong — it is that a non-match emits nothing to notice, so
+  partial output looks complete. Count what you examined, and inject a known-bad case to watch the
+  detector go red, before believing any clean result.
+- **When a summary list and a payload list sit side by side, a reader measures whichever they find
+  first.** `model_translation_handoff` carries `needs_review` (summary) and `requests` (payload) at
+  equal length; `category_guidance`, `fields`, `formula` and `target_table` exist **only** on
+  `requests`. Reading the summary and concluding "guidance is empty on all 30" was wrong — it is
+  empty on 0 of 71. If you add a field that a triaging reader needs, put it on **both** lists.
 - Before committing, confirm packaging is valid: every `SKILL.md` frontmatter parses, the four
   JSON manifests parse, and relative links resolve.
 
@@ -192,6 +210,20 @@ Two rules make it work:
 * **An anchor tells you a version is CLAIMED, never that it is unlanded.** Three distinct anchor
   failures showed up in one day and none was predictable from the others: pointing at an orphan,
   absent because another session deleted it, and present-but-already-shipped.
+* **`refs/stash` is shared too, and it is the more dangerous of the two** because the reflex that
+  reaches for it (`git stash pop`) is a WRITE to your working tree, not a read. One `stash@{0}`
+  currently sits in the common `.git` — *"parked last-mile edits (stale 1.4.0 base)"* — touching
+  `assemble_model.py`, `migrate_estate.py` and `deploy_to_fabric.py` in both trees, from roughly 290
+  minor versions ago. Popping it would drop a 1.4.0 file on top of live work, and because the change
+  would arrive in YOUR worktree under YOUR name it would read as your own mistake. Do not pop, apply,
+  or drop a stash you did not create; the same rule as anchors, for the same reason. When auditing
+  what a lane might collide with, `git stash list` belongs next to `git branch` and `git tag -l`.
+* **A local branch existing on `origin` does NOT mean deleting it is safe — check that it MATCHES.**
+  Deleting three abandoned branches, two of which `git ls-remote` confirmed were on `origin`, would
+  still have stranded one commit: `powerbi-formatting-research` was locally AHEAD of its remote. The
+  predicate "is it recoverable?" is `local tip == remote tip`, not "does the remote ref exist".
+  Archive-tag anything you delete (`archive/<branch>`), which costs nothing and makes the only
+  irreversible step in branch cleanup reversible.
 
 
 When several features shipped unversioned, catch up per feature: assign each its own MINOR version +
