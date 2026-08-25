@@ -14,6 +14,70 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ### Added
 
+- **`tableau-migration` (skill `2.313.0` → `2.314.0`): a zero-entry CHANGELOG parse is now a
+  FAILURE, not a skip — the gate that guards every release could stop guarding it silently.**
+  Before this, a broken `_ENTRY_RE` — a format change, or a pattern mangled in transit — made every
+  check in `test_changelog_version_chain` **skip**. Measured by injection: with the entry pattern
+  broken the module reported **6 passed, 0 failed, 0 skipped**. A green module over a parser that
+  had matched nothing.
+
+  In a 5000-test run a skip surfaces as one more line in an already non-zero `skipped` count, so
+  the chain gate — the only thing preventing a rebased stack from silently renumbering — would go
+  quiet in a way no reader could distinguish from health.
+
+  **Absent and unparsed must never produce the same output.** A missing `CHANGELOG.md` is a real
+  absence and still skips (an installed skill has no repo root); a file *full of entry-shaped
+  bullets* that the strict parser cannot read is a **parser failure** and now fails, printing the
+  count, the first offending line, and the pattern that stopped matching.
+
+  **The sentinel must be strictly WIDER than the parser it guards, in every dimension.** Measured
+  against 148 strict entries:
+
+  | candidate | matches | |
+  |---|---|---|
+  | ``- **`tableau-migration` `` | **99** | narrower — misses the second entry format this file uses |
+  | `^\s*-\s.*\(skill\s` | **148** | **equal** — depends on `(skill`, which the parser also needs |
+  | ``- **`?tableau-migration`? `` | **153** | wider, along the axis that has actually varied |
+
+  The equal-width candidate is the instructive rejection: it would fall silent *for the same reason
+  the parser does*, so both go to zero together — **a second instrument sharing the first one's
+  blind spot, i.e. false corroboration inside a single test.** The first candidate was this
+  release's own first draft, and it was caught by measuring rather than by reading.
+
+  After the guard, the same injection reports **4 failed, 0 skipped** — every check that consumes
+  `_entries()` now speaks.
+
+  Pinned bidirectionally from one harness, so the conflation is not simply rebuilt one level up: a
+  genuinely absent CHANGELOG must still **skip**, a present-but-unparsed one must **fail**, and the
+  two must say different things. A third test asserts the module's *own* checks go red rather than
+  merely proving the helper raises — the original defect was a green **module**, not a quiet helper.
+
+  One near-miss worth recording: that third test was first written as a subprocess run behind an
+  env-var injection hook, and would have **skipped whenever the hook was absent** — a test that
+  cannot fail, added to fix a check that could not fail. Rewritten in-process.
+
+  **Also folds in a docstring correction of the same class** (a property holds and nothing states
+  it), on 2.311.0's non-DAX-function pattern. Ablation:
+
+  | variant | `TOTALYTD` | `LOOKUPVALUE` | `MYTEXT([a])` |
+  |---|---|---|---|
+  | lookbehind + `\s*\(` (shipped) | silent | silent | silent |
+  | no lookbehind, keeps `\s*\(` | silent | silent | **TEXT** — breaks |
+  | lookbehind + `\b` instead of `\s*\(` | silent | silent | silent — safe |
+  | no boundary at all | **TOTAL** | **LOOKUP** | **TEXT** — breaks badly |
+
+  The **leading lookbehind** is the uniquely load-bearing property: only it blocks a longer
+  identifier ending in a listed name. A *trailing* boundary is what protects `TOTALYTD`, and
+  `\s*\(` is not special there — a plain `\b` is equivalent. The length-descending sort affects
+  only which name a message reports (`TEXTJOIN` over `TEXT`); both are entries, so it is precision,
+  not correctness.
+
+  The comment previously called that guard *"defensive, not validated"*, having measured only one
+  of its **two** jobs — the unexercised one. The other is exercised by an existing test. **A
+  property is not validated or unvalidated; each of its jobs is, separately** — and this was
+  under-claiming produced by care about over-claiming, which is a failure mode whose defence causes
+  it.
+
 - **`tableau-migration` (skill `2.312.0` → `2.313.0`): a committed git conflict marker is now a
   test failure.** Three of them sat in `CHANGELOG.md` at the tip of an integration branch carrying
   eighteen merged releases, and **every gate stayed green**: the suite passed, the version-chain gate

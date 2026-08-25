@@ -334,11 +334,32 @@ _NON_DAX_FUNCTIONS = {
     "SIZE": None, "TOTAL": None, "LOOKUP": "LOOKUPVALUE",
 }
 
-# ``(?<![A-Za-z0-9_.\[])`` so a MEASURE whose name contains a call -- 0088 really does define
-# ``WINDOW_MAX(Avg. Days Participation)*1.2`` -- is not mistaken for one when referenced as
-# ``[WINDOW_MAX(...)]``. NOT EXERCISED by the current corpus: measured both with and without the
-# lookbehind and both return 0, because nothing references those measures from an expression. It is
-# defensive, not validated evidence, and should not be cited as though the corpus proved it.
+# ``(?<![A-Za-z0-9_.\[])`` does TWO separate jobs, and they have different evidence behind them.
+# Measured by ablation against the shipped pattern:
+#
+#   variant                              TOTALYTD  LOOKUPVALUE  MYTEXT([a])
+#   lookbehind + \s*\(   (SHIPPED)        silent     silent     silent
+#   no lookbehind, keeps \s*\(            silent     silent     TEXT      <- breaks
+#   lookbehind + \b instead of \s*\(      silent     silent     silent    <- safe
+#   NO boundary at all                    TOTAL      LOOKUP     TEXT      <- breaks badly
+#
+#   JOB 1, blocking a longer identifier that ENDS in a listed name (``MYTEXT(``): the lookbehind is
+#   the ONLY thing that does this. A trailing boundary does not help, because the name really is
+#   followed by ``(``. EXERCISED, by ``test_a_bad_name_embedded_in_a_longer_identifier_is_not_flagged``.
+#
+#   JOB 2, stopping a measure NAMED after a call -- 0088 defines ``WINDOW_MAX(Avg. Days
+#   Participation)*1.2`` -- from matching when referenced as ``[WINDOW_MAX(...)]``. NOT exercised by
+#   the corpus: measured with and without the lookbehind and both return 0, because nothing
+#   currently references those measures from an expression.
+#
+# So the guard is validated for one job and defensive for the other. An earlier version of this
+# comment called the whole guard unexercised, having measured only job 2 -- **a property is not
+# validated or unvalidated; each of its jobs is, separately.**
+#
+# What protects ``TOTALYTD``/``LOOKUPVALUE`` is the TRAILING boundary, and ``\s*\(`` is not special
+# there -- a plain ``\b`` is equivalent. The length-descending sort affects only which name a
+# message reports (``TEXTJOIN`` rather than ``TEXT``); both are entries, so it is precision, not
+# correctness.
 _NON_DAX_CALL_RE = re.compile(
     r"(?<![A-Za-z0-9_.\[])(%s)\s*\(" % "|".join(sorted(_NON_DAX_FUNCTIONS, key=len, reverse=True)),
     re.IGNORECASE)

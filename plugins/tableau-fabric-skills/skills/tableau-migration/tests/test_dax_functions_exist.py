@@ -135,10 +135,16 @@ def test_each_distinct_function_is_reported_once_per_object():
 def test_a_measure_NAMED_after_a_table_calc_is_not_mistaken_for_a_call():
     """0088 really defines ``WINDOW_MAX(Avg. Days Participation)*1.2`` as a measure NAME.
 
-    Referencing it as ``[WINDOW_MAX(...)]`` must not read as a call. NOTE: this control is
-    **defensive, not validated** -- measured with and without the guard and the corpus returns 0
-    either way, because nothing currently references those measures from an expression. It should
-    not be cited as evidence the corpus exercised it.
+    Referencing it as ``[WINDOW_MAX(...)]`` must not read as a call. This is **job 2** of the
+    leading lookbehind and it is **not exercised by the corpus** -- measured with and without the
+    guard, the corpus returns 0 either way, because nothing currently references those measures
+    from an expression.
+
+    Job 1 -- blocking a longer identifier that ends in a listed name, ``MYTEXT(`` -- *is* exercised,
+    by the test below, and the lookbehind is the only thing that does it. An earlier version of this
+    docstring called the guard "defensive, not validated" on the strength of job 2 alone: **a
+    property is not validated or unvalidated; each of its jobs is, separately.** Under-claiming
+    produced by care about over-claiming.
     """
     parts = _model([
         ("measure", "WINDOW_MAX(Avg. Days Participation)*1.2", "BLANK()"),

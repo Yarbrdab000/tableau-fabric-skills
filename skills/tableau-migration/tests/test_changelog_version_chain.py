@@ -63,8 +63,36 @@ def _find_repo_root():
         cur = parent
 
 
+_ENTRY_SENTINEL_RE = re.compile(r"^\s*-\s\*\*`?tableau-migration`?")
+
+
 def _entries():
-    """``[(line_no, frm, to)]`` newest-first, one per skill-version bullet."""
+    """``[(line_no, frm, to)]`` newest-first, one per skill-version bullet.
+
+    A ZERO-ENTRY PARSE IS A PARSE FAILURE, NOT AN ABSENCE, and the two must never look alike.
+    Before this guard, a broken ``_ENTRY_RE`` -- a CHANGELOG format change, or a shell mangling the
+    pattern -- made every caller ``skip``. In a 5000-test run that surfaces as one more line in an
+    already non-zero ``skipped`` count, so the gate protecting every release in this repo would stop
+    protecting it and report something a reader cannot distinguish from health. Verified by
+    injection: with the entry pattern broken the whole module went green, six passed.
+
+    That is the same shape as the sibling failure in this file's own history -- a chain parse that
+    reads a *file with conflict markers in it* and correctly reports 0 breaks, because markers are
+    not bullets. **Both are correct answers to the question the predicate encodes, and in neither
+    case was the question "is this file well-formed".**
+
+    THE SENTINEL MUST BE STRICTLY WIDER THAN THE PARSER IT GUARDS, in every dimension. Measured on
+    the current file (148 strict entries):
+
+        - **`tableau-migration`      99   NARROWER -- misses the un-backticked entry format
+        - **`?tableau-migration`?   153   wider, and wider along the axis that has actually varied
+        ^\\s*-\\s.*\\(skill\\s          148   EQUAL -- depends on ``(skill``, which the parser also
+                                          needs, so both would go to zero together
+
+    A sentinel that can fall silent for the same reason as its parser is a second instrument sharing
+    the first one's blind spot -- false corroboration, inside a single test. The backtick-optional
+    form is used because the name format is the thing this file has actually changed.
+    """
     root = _find_repo_root()
     if root is None:
         pytest.skip("repo layout not present (installed-skill context)")
@@ -82,6 +110,17 @@ def _entries():
         if m:
             out.append((i, m.group("frm"), m.group("to")))
     if not out:
+        looks_like = [i for i, l in enumerate(lines, 1) if _ENTRY_SENTINEL_RE.match(l)]
+        assert not looks_like, (
+            "CHANGELOG.md contains %d entry-shaped bullet(s) but the strict entry pattern matched "
+            "NONE of them -- the parser is broken, not the file empty. Every chain check in this "
+            "module would otherwise SKIP, which is indistinguishable from passing in a suite run.\n"
+            "  first at line %d: %s\n"
+            "  strict pattern : %s\n"
+            "Usual causes: the CHANGELOG entry format changed, or the pattern was mangled in "
+            "transit (a shell eating backticks does exactly this)."
+            % (len(looks_like), looks_like[0], lines[looks_like[0] - 1][:100].strip(),
+               _ENTRY_RE.pattern))
         pytest.skip("no versioned CHANGELOG entries to check")
     return out
 
