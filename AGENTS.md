@@ -528,6 +528,14 @@ The historical block rules, kept because old anchors and CHANGELOG entries still
   dead block's anchors in place: an unused anchor is inert to every gate here, while a wrongly deleted
   one destroys a rollback path and reads to the next person as "reported but absent". Deletion is the
   only irreversible step in this ritual.
+* **Archive before any destructive ref change — not only so it can be undone, but so the DECISION can
+  later be checked.** The second reason is the one that pays. Six anchors were re-pointed here to
+  satisfy a gate, and the re-points were later found to have broken every one of them. The decisive
+  evidence was a one-line comparison between the archived original and the current target — *"the
+  original is an ancestor of its own release, the re-point is not."* Without
+  `archive/anchor-pre-vX-preintegration` there would have been nothing to compare against, and the
+  finding would have been an argument between two readings instead of a fact. An archive is a
+  measurement you have not needed yet.
 * **An anchor tells you a version is CLAIMED, never that it is unlanded.** Three distinct anchor
   failures showed up in one day and none was predictable from the others: pointing at an orphan,
   absent because another session deleted it, and present-but-already-shipped.
