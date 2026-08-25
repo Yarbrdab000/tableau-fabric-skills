@@ -99,6 +99,21 @@ not mirrored.
   predicate was wrong — it is that a non-match emits nothing to notice, so partial output looks
   complete. Count what you examined, check what you captured, and inject a known-bad case to watch
   the detector go red, before believing any clean result.
+- **THE MOVE THAT FINDS THESE: take the confident sentence and ask what would have to be true.** Not
+  "check the work" — check the **claim**. Every finding in one high-volume day came from this, applied
+  by two sessions in turn against each other and against themselves: *"a formula table calc carries no
+  addressing intent"* (false — 46/46 usages carry it), *"those four defects are already fixed"* (the
+  metric moved, the render did not), *"6 → 1 proves it"* (true number, wrong population), *"our
+  convergence was deterministic"* (falsified by its own author before sending), *"the anchor sits two
+  releases short"* (measured on the wrong order — the founding defect was never real), and a probe
+  reporting ~300 releases between two commits (absurd enough to indict the probe, not the repo).
+
+  The cheapest instance overturned the most: **one `git merge-base --is-ancestor`**, run because the
+  claim *"the anchor sits one release before"* had never been tested against what a reset actually
+  does. It took down a gate, an exception ledger, six anchor repairs and three documentation commits.
+
+  The rules below are all specialisations of it. Reach for them when you have a specific suspicion;
+  reach for **this** when you have a sentence that sounds right.
 - **"No conflict" is not evidence of correctness; it is the absence of one specific alarm.** The
   general form of most of the rules below: *the failure is not that something was lost, it is that
   something plausible was produced.* A clean three-way merge and a regex that fabricates an `S`
