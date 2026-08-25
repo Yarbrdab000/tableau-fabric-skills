@@ -79,7 +79,18 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
   Found by a parallel session that measured the ordering at the correct engine after first measuring
   it at a stale one, and that **declined the authorised work** on discovering the approved fix was
-  the wrong one. Tests pin both the merge's conservatism and its effect, the latter from one fixture
+  the wrong one. That session then implemented it independently and measured what a fixture-verified
+  change could not:
+
+  - **A SECOND check flips, not one.** `bare_column_references_qualified` also goes
+    `true → false` on 0088. `Client per Staff Max Goal` is a what-if parameter **column**, so the
+    wrapper emits `CALCULATE([<a column>], …)` — exactly the shape 2.306.0 made a hard failure, and a
+    real query-time error rather than a technicality.
+  - **Blast radius: 2 of 34 workbooks** carry row-predicate wrappers. 0088 newly fails;
+    `0134_parameter_filters` has 3 wrapped projections and stays **clean**. The change discriminates
+    rather than firing on the mechanism.
+  - **The estate definition-of-done moves to `failed` for 0088** — correctly. Those defects were
+    always in the shipped artifact; only the verdict was computed too early to see them. Tests pin both the merge's conservatism and its effect, the latter from one fixture
   carrying a wrapper over a `BLANK()` stub and an identical wrapper over a live base — a check that
   flagged both would be matching the `(filtered)` naming convention rather than resolving the value
   path, and would fire on the 19 correct wrappers alongside the 9 defective ones.
