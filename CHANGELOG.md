@@ -12,6 +12,55 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ## [Unreleased]
 
+### Fixed
+
+- **`tableau-migration` (skill `2.300.0` → `2.302.0`): the interleave-debt ledger drops 4 → 1,
+  because the debt was PAID rather than re-labelled.** 2.299.0 shipped the anchor-predecessor gate
+  green with four known violations parked in `_INTERLEAVE_DEBT`. That was the correct sequence —
+  build the instrument first, so a repair has something to prove itself against — and this is the
+  repair.
+
+  **The gate immediately caught its own integrator doing half an operation.** Merging 2.299.0
+  produced *no conflict* in `CHANGELOG.md` and silently placed the entry ABOVE 2.300.0. Re-ordering
+  and re-chaining that boundary then created **two fresh violations that did not exist before the
+  merge**:
+
+  ```
+  2.300.0 declares predecessor 2.299.0, but rollback/pre-v2.300.0 was stamped 2.275.0
+  2.299.0 declares predecessor 2.298.0, but rollback/pre-v2.299.0 was stamped 2.295.0
+  ```
+
+  That is the gate's thesis demonstrated on the gate's own merge: **re-chaining a CHANGELOG boundary
+  without re-pointing its anchor is half an operation**, and the omitted half is the one that decides
+  where a rollback actually lands. The debt does not sit still — every integration manufactures more
+  of it, which is why a documented ledger alone would have rotted.
+
+  Five anchors re-pointed at the release commit of their declared predecessor, each original first
+  preserved as `archive/anchor-pre-vX-preintegration`:
+
+  ```
+  pre-v2.274.0  9d822fc7 (2.266.0) -> 181d3bbd (2.270.0)
+  pre-v2.293.0  181d3bbd (2.270.0) -> c0c3b30d (2.292.0)
+  pre-v2.296.0  c0c3b30d (2.292.0) -> bb4026d2 (2.295.0)
+  pre-v2.299.0  bb4026d2 (2.295.0) -> 026c83d0 (2.298.0)
+  pre-v2.300.0  c55e6644 (2.275.0) -> 0e5fbf1b (2.299.0)
+  ```
+
+  Archiving is not ceremony: re-pointing is the only irreversible step in this ritual, and every old
+  target was **accurate on the lane it was cut on**. The re-point makes it accurate on the integrated
+  line instead; both facts are worth keeping.
+
+  **`2.143.0` is deliberately left in the ledger.** It predates this work and no merge in this series
+  created it, so re-pointing it would be speculation about someone else's intent — the same reach for
+  another session's anchor the gate exists to make visible.
+
+  **What proved the repair was not the suite going green.** The companion test
+  `test_the_interleave_debt_ledger_stays_honest` went RED and named the three paid entries, demanding
+  their deletion. That demand is the evidence; deleting them is what hands each boundary to the gate.
+  A ledger that silently kept passing after its debt was paid would be an allowlist, which is the
+  failure mode the referential formulation was rejected for.
+
+
 ### Added
 
 - **`tableau-migration` (skill `2.299.0` → `2.300.0`): a formula-authored table calc no longer ships

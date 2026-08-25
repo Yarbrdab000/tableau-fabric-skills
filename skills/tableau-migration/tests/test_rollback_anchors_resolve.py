@@ -313,10 +313,15 @@ def test_every_anchor_predates_the_version_it_anchors(repo):
 # The ledger below is debt, not exemption. Each entry is a real interleave boundary whose anchor
 # still means what it meant on its lane. Unlike the 35 orphans it is finite and shrinking.
 _INTERLEAVE_DEBT = {
-    "2.143.0",   # predates centralised allocation; owner unknown
-    "2.274.0",   # integrator's boundary, theirs to re-point
-    "2.293.0",   # landed between the dispatcher's 2.292.0 and its own lane's 2.270.0
-    "2.296.0",   # dispatcher's boundary, theirs to re-point
+    "2.143.0",   # predates centralised allocation; owner unknown, and no merge in this series
+                 # created it -- left alone deliberately rather than re-pointed on speculation.
+    # 2.274.0 / 2.293.0 / 2.296.0 were PAID by the integrator on 2026-08-25: each anchor re-pointed
+    # at the release commit of its declared predecessor, in the same pass that re-chained the
+    # CHANGELOG. Originals preserved as archive/anchor-pre-vX-preintegration, because re-pointing is
+    # the only irreversible step in the ritual and each old target was ACCURATE on the lane it was
+    # cut on. Deleting them from this ledger is what hands them to the gate, and the companion test
+    # demanding that deletion is what proved the repair -- the count going 4 -> 1 is the evidence,
+    # not the fact that the suite went green.
 }
 
 
