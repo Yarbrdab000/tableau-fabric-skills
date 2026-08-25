@@ -271,6 +271,35 @@ def _value_path_bottoms_out_blank_expr(expr, exprs, seen=frozenset()):
     return False
 
 
+def _forwarded_value_source(name, exprs, seen=frozenset()):
+    """The measure whose value ``name`` ultimately FORWARDS, or ``None`` if it computes its own.
+
+    Forwarding means ``[Other]`` or ``CALCULATE([Other], <filters>)`` to any depth: the filters
+    change which rows are seen, never what KIND of number comes back. That is what makes an
+    inherited format string mandatory rather than merely nice -- a wrapper that forwards a
+    percentage returns a percentage, so a missing ``formatString`` is not a style choice, it is a
+    lost one. Anything that computes (``DIVIDE``, arithmetic, an aggregation) returns ``None``,
+    because there the wrapper legitimately owns a different format from its inputs.
+    """
+    key = (name or "").casefold()
+    if key in seen or key not in exprs:
+        return None
+    inner = _calculate_value_arg((exprs[key] or "").strip())
+    if inner is None:
+        return None
+    ref = re.fullmatch(r"\[([^\]\[]+)\]", inner.strip())
+    if ref:
+        deeper = _forwarded_value_source(ref.group(1), exprs, seen | {key})
+        return deeper or ref.group(1)
+    if re.match(r"CALCULATE\s*\(", inner.strip(), re.IGNORECASE):
+        nested = _calculate_value_arg(inner.strip())
+        nref = re.fullmatch(r"\[([^\]\[]+)\]", (nested or "").strip())
+        if nref:
+            deeper = _forwarded_value_source(nref.group(1), exprs, seen | {key})
+            return deeper or nref.group(1)
+    return None
+
+
 def _expression_body(text):
     """Strip metadata lines from an object body, leaving only DAX expression text.
 
@@ -655,10 +684,12 @@ def check_model_openability(parts, flatfile_headers=None, expected_endpoints=Non
     refs_ok = True
     bare_col_ok = True
     value_path_ok = True
+    format_kept_ok = True
     all_measures = set()
     all_columns = set()
     measure_exprs = {}
     measure_case = {}
+    measure_format = {}
     columns_by_table = {}
     for path in sorted(parts):
         text = parts[path]
@@ -671,10 +702,12 @@ def check_model_openability(parts, flatfile_headers=None, expected_endpoints=Non
                 columns_by_table.setdefault(tname.casefold(), set()).add(c.casefold())
         for m in _MEASURE_DECL_RE.finditer(text):
             nm = _unquote(m.group("name"))
-            all_measures.add(nm.casefold())
-            measure_exprs[nm.casefold()] = " ".join(
-                _expression_body(m.group("expr")).split())
-            measure_case.setdefault(nm.casefold(), (nm, path))
+            kf = nm.casefold()
+            all_measures.add(kf)
+            measure_exprs[kf] = " ".join(_expression_body(m.group("expr")).split())
+            measure_case.setdefault(kf, (nm, path))
+            fmt = re.search(r"(?m)^\s*formatString:\s*(.+?)\s*$", m.group("expr") or "")
+            measure_format[kf] = fmt.group(1) if fmt else None
 
     for path in sorted(parts):
         text = parts[path]
@@ -787,6 +820,64 @@ def check_model_openability(parts, flatfile_headers=None, expected_endpoints=Non
                        "disclosed rather than silent" % owner),
         })
 
+    # A WRAPPER THAT LOSES ITS BASE'S formatString. Every other check here asks whether a value is
+    # absent or wrong. This one is the inverse and nothing else can see it: the value is CORRECT and
+    # the presentation turns it into a wrong number.
+    #
+    # Measured on 0088. `EXCLUDE Days Since Goal Created Date Goals Completed by (filtered)`
+    # evaluates to 0.1732 -- verified against the running model -- and renders `0` on the card,
+    # because it carries no `formatString` while the measure it forwards carries `0.0%`. A reader
+    # sees a zero. Every value-level instrument reports it healthy, correctly, because it IS
+    # healthy; only the presentation is missing.
+    #
+    # Worth stating beside the customer defect that motivated 2.306.0, because they are opposite
+    # halves of one class and both read as "zero" to whoever is looking:
+    #     `VAR _val = 0` through currency formatting  -> a WRONG value formatted CONFIDENTLY
+    #     0.1732 with no format at all                -> a RIGHT value formatted into a WRONG one
+    #
+    # Scoped to FORWARDING wrappers only, which is what makes it safe rather than stylistic:
+    # `CALCULATE([X], <filters>)` returns the same KIND of number as X, so inheriting X's format is
+    # not a preference, it is the only correct answer. A measure that COMPUTES its value
+    # (`DIVIDE`, arithmetic, an aggregation) legitimately owns a different format from its inputs
+    # and is never flagged. Propagation is not broken in general here -- `Clients per Staff
+    # (filtered)` inherits `#,##0;-#,##0` correctly -- it is the EXCLUDE/LOD path that drops it.
+    for key in sorted(measure_exprs):
+        if measure_format.get(key):
+            continue                      # carries its own format; an override is a real choice
+        src = _forwarded_value_source(key, measure_exprs)
+        if not src:
+            continue                      # computes its own value, so owns its own format
+        src_fmt = measure_format.get((src or "").casefold())
+        if not src_fmt:
+            continue                      # base has no format either; nothing was lost
+        if "%" not in src_fmt:
+            # DELIBERATELY NARROWED to formats that change the NUMBER, not merely its styling.
+            #
+            # A percent format scales what the reader sees by 100: 0.1732 reads as `17.3%` with it
+            # and `0` without. That is a correct value presented as a wrong one, which is the class
+            # this check claims to find and the only one where a lost format is a CORRECTNESS bug.
+            #
+            # Measured before narrowing, not after. Across the corpus the unnarrowed rule fires 5
+            # times on one model: 2 percent (the verified defect and its intermediate wrapper) and
+            # 3 that forward an integer `0` format, where 7 still reads as 7. Those 3 are real
+            # fidelity losses and are NOT claimed here -- failing a build's openability for a lost
+            # thousands separator would invite exactly the allowlisting this repo refuses, and it
+            # would dilute a check whose whole value is that every hit is a wrong number on screen.
+            continue
+        owner, part = measure_case.get(key, (key, ""))
+        src_name = measure_case.get((src or "").casefold(), (src, ""))[0]
+        format_kept_ok = False
+        issues.append({
+            "check": "wrapper_keeps_base_format_string",
+            "part": part,
+            "detail": ("measure %r forwards the value of %r but declares no formatString, while "
+                       "%r declares %s. A forwarding wrapper returns the same kind of number as "
+                       "the measure it wraps, so the format is not a style choice -- dropping it "
+                       "renders a CORRECT value as a wrong one (a 0.1732 that should read 17.3%% "
+                       "renders as 0). Copy the base's formatString onto this measure"
+                       % (owner, src_name, src_name, src_fmt)),
+        })
+
     checks = {
         "tmdl_wellformed": wellformed,
         "no_duplicate_columns": no_dupes,
@@ -795,6 +886,7 @@ def check_model_openability(parts, flatfile_headers=None, expected_endpoints=Non
         "dax_references_resolve": refs_ok,
         "bare_column_references_qualified": bare_col_ok,
         "measure_value_path_not_blank": value_path_ok,
+        "wrapper_keeps_base_format_string": format_kept_ok,
     }
     if expected_endpoints is not None and int(expected_endpoints) > 1:
         checks["endpoints_distinct"] = endpoints_ok
