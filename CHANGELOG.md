@@ -90,7 +90,16 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
     `0134_parameter_filters` has 3 wrapped projections and stays **clean**. The change discriminates
     rather than firing on the mechanism.
   - **The estate definition-of-done moves to `failed` for 0088** — correctly. Those defects were
-    always in the shipped artifact; only the verdict was computed too early to see them. Tests pin both the merge's conservatism and its effect, the latter from one fixture
+    always in the shipped artifact; only the verdict was computed too early to see them.
+
+  **Why the merge unions issues rather than folding in only `True → False` transitions**, measured by
+  running two independent implementations of this fix against the same workbook. The transition-keyed
+  variant reports **1** `wrapper_keeps_base_format_string` issue where the union reports **2**: that
+  check was *already* `False` before the wrap, so a **second, new** format-string loss introduced by
+  the wrap is discarded by a filter keyed on the flip. **A filter keyed on a state transition is blind
+  to anything that happens to an object already in the failed state.** The transition rule is also
+  only *accidentally* safe against the missing-kwargs problem — a skipped check is absent rather than
+  `False`, so it happens not to be folded in; the union rule is safe by construction. Tests pin both the merge's conservatism and its effect, the latter from one fixture
   carrying a wrapper over a `BLANK()` stub and an identical wrapper over a live base — a check that
   flagged both would be matching the `(filtered)` naming convention rather than resolving the value
   path, and would fire on the 19 correct wrappers alongside the 9 defective ones.
