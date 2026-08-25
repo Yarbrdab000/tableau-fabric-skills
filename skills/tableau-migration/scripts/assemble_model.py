@@ -4067,6 +4067,79 @@ def _triage_stubs(requests, calc_lookup, resolve, *, param_resolver=None, known_
     }
 
 
+def _unmigrated_dependency_index(*reports):
+    """Build ``fields, name -> [{caption, name, role}]`` naming the referenced calcs that are
+    THEMSELVES needs-review.
+
+    Answers the question the handoff never did: *which calc actually failed*. A stub that fails only
+    because a calc it references is unmigrated reports the DEPENDENCY's translator error as its own
+    ``fallback_reason``, so a reader triaging the flat list is pointed at a measure with no such
+    problem in it and the broken one is never named.
+
+    Derived ENTIRELY from the already-computed report rows -- no re-translation and no resolver --
+    which is deliberate: the sibling ``triage`` block reaches its cascadable/irreducible verdict by
+    re-translating with the single global resolver, while the build uses a per-calc island-scoped
+    one, so on a multi-datasource workbook triage can be wrong (measured: 0088's ``Select Metric``
+    was called irreducible when it was a cascade). Deriving this from triage would inherit that.
+
+    So the returned list asserts a FACT -- *these referenced calcs are also unmigrated* -- and
+    deliberately NOT the prediction *"this would translate once they are fixed"*, which remains
+    triage's job and is reported separately. The two genuinely disagree in one corpus case
+    (0073's ``Difference`` references an unmigrated calc AND has its own irreducible problem);
+    both statements are true, which is the argument for reporting the fact rather than a boolean.
+
+    A reference is matched by caption or internal ``Calculation_*`` token, falling back to a
+    normalized-formula join for a calc whose row carries no token (dimension-role rows have no
+    ``source``). The formula join is dropped for any formula shared by two calcs, so an ambiguous
+    match names nobody rather than the wrong one.
+    """
+    alias, by_formula, ambiguous, review = {}, {}, set(), {}
+
+    def _key(v):
+        return str(v or "").strip().strip("[]").lower()
+
+    for rows, role in zip(reports, ("measure", "dimension")):
+        for row in rows or []:
+            name = row.get("measure") or row.get("column")
+            if not name:
+                continue
+            src = row.get("source") or {}
+            for a in (name, src.get("field_caption"), src.get("calc_instance_token")):
+                k = _key(a)
+                if k:
+                    alias.setdefault(k, name)
+            nf = " ".join(str(row.get("tableau_formula") or "").split()).lower()
+            if nf:
+                if nf in by_formula and by_formula[nf] != name:
+                    ambiguous.add(nf)
+                by_formula.setdefault(nf, name)
+            if (row.get("status") or "stub") in _HANDOFF_REVIEW:
+                review[name] = role
+    for nf in ambiguous:
+        by_formula.pop(nf, None)
+
+    def _blocked_by(fields, this_name):
+        out, seen = [], set()
+        for f in fields or ():
+            # ``unresolved`` is included alongside ``calc`` on purpose: a cross-island reference the
+            # handoff's global resolver could not place lands there, and it is exactly the case
+            # triage also gets wrong.
+            if (f or {}).get("kind") not in ("calc", "unresolved"):
+                continue
+            caption = str(f.get("caption") or "")
+            name = alias.get(_key(caption))
+            if name is None:
+                name = by_formula.get(
+                    " ".join(str(f.get("references_formula") or "").split()).lower())
+            if not name or name == this_name or name in seen or name not in review:
+                continue
+            seen.add(name)
+            out.append({"caption": caption, "name": name, "role": review[name]})
+        return out
+
+    return _blocked_by
+
+
 def translation_handoff_artifact(measure_report, calc_column_report, resolve, *, calc_lookup=None,
                                  param_resolver=None, known_tables=None):
     """Additive Tier-0 -> Tier-1 handoff manifest -- the deterministic engine's honest report of
@@ -4086,11 +4159,14 @@ def translation_handoff_artifact(measure_report, calc_column_report, resolve, *,
         approved) / ``needs_review`` (stub or pending suggestion), with the per-status breakdown, an
         honest ``coverage_pct`` (``None`` when there are no calcs), and a ``categories`` map giving
         the Tier-1 router category counts across the needs-review calcs.
-      * ``needs_review`` -- a concise ``[{name, role, fallback_reason, category, has_suggestion}]``
-        list for the check-in prompt.
+      * ``needs_review`` -- a concise ``[{name, role, fallback_reason, category, has_suggestion,
+        blocked_by}]`` list for the check-in prompt. ``blocked_by`` (see
+        ``_unmigrated_dependency_index``) names the referenced calcs that are THEMSELVES
+        needs-review, so the flat list a reader triages says *which calc actually failed* rather
+        than attributing a dependency's translator error to this one.
       * ``requests`` -- one structured record per needs-review calc: ``{name, role, target_table,
-        formula, fields[], fallback_reason, category, category_guidance, has_suggestion[,
-        suggestion]}``. ``fields`` are the resolved field references (table/column/type), cross-calc
+        formula, fields[], fallback_reason, category, category_guidance, blocked_by,
+        has_suggestion[, suggestion]}``. ``fields`` are the resolved field references (table/column/type), cross-calc
         references, and parameters; ``category``/``category_guidance`` are the deterministic router's
         stable Tier-1 classification (see ``translation_router.classify_fallback``) telling the second
         compiler what intent to supply and which DAX shape to aim for -- everything it needs to
@@ -4111,6 +4187,7 @@ def translation_handoff_artifact(measure_report, calc_column_report, resolve, *,
     requests = []
     needs_review = []
     partial_fidelity = []
+    _blocked_for = _unmigrated_dependency_index(measure_report, calc_column_report)
 
     def _consume(rows, role, target_of):
         for row in rows or []:
@@ -4140,6 +4217,15 @@ def translation_handoff_artifact(measure_report, calc_column_report, resolve, *,
                 routed = classify_fallback(row.get("reason"), role=role,
                                            fields=resolved_fields, has_suggestion=has_suggestion)
                 category_counts[routed["category"]] = category_counts.get(routed["category"], 0) + 1
+                # WHICH calc actually failed. ``fallback_reason`` is the literal error the
+                # translator raised, and for a cascade that error describes the DEPENDENCY, not
+                # this calc -- e.g. a dispatcher referencing an unmigrated LOD reports "bare
+                # row-level field [..] not valid in a measure" while containing no row-level field
+                # at all. A reader triaging the flat list is then pointed at the wrong measure and
+                # the broken one is never named. Measured on the 34-workbook corpus at 2.275.0:
+                # 9 of the 13 entries carrying that reason were cascades, and NONE of the 13 named
+                # a dependency, because no such key existed.
+                blocked = _blocked_for(resolved_fields, name)
                 req = {
                     "name": name,
                     "role": role,
@@ -4150,6 +4236,7 @@ def translation_handoff_artifact(measure_report, calc_column_report, resolve, *,
                     "has_suggestion": has_suggestion,
                     "category": routed["category"],
                     "category_guidance": routed["guidance"],
+                    "blocked_by": blocked,
                 }
                 sugg = row.get("assisted_suggestion")
                 if sugg:
@@ -4158,7 +4245,11 @@ def translation_handoff_artifact(measure_report, calc_column_report, resolve, *,
                 needs_review.append({"name": name, "role": role,
                                      "fallback_reason": row.get("reason"),
                                      "category": routed["category"],
-                                     "has_suggestion": has_suggestion})
+                                     "has_suggestion": has_suggestion,
+                                     # repeated onto the FLAT list deliberately: that list is what
+                                     # a reader triages, and it was the thing with no cascade
+                                     # signal at all.
+                                     "blocked_by": blocked})
 
     _consume(measure_report, "measure", lambda r: "_Measures")
     _consume(calc_column_report, "dimension", lambda r: r.get("table"))
@@ -4179,6 +4270,11 @@ def translation_handoff_artifact(measure_report, calc_column_report, resolve, *,
         # parameter dispatchers). Counted separately from needs_review because the object is live
         # and useful -- it just does not answer for every input.
         "partial_fidelity": len(partial_fidelity),
+        # Additive: how much of needs_review is waiting on ANOTHER unmigrated calc rather than on
+        # its own reported error. Measured on the 34-workbook corpus at 2.291.0: 13 of 69
+        # needs-review calcs, and 8 of the 11 entries carrying "bare row-level field [..]" -- so
+        # ranking that class by raw fallback_reason count overstates the work behind it ~4x.
+        "blocked_by_unmigrated_calc": sum(1 for n in needs_review if n.get("blocked_by")),
     }
     triage = _triage_stubs(requests, calc_lookup, resolve,
                            param_resolver=param_resolver, known_tables=known_tables)

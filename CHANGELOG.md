@@ -14,6 +14,41 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ### Fixed
 
+- **`tableau-migration` (skill `2.290.0` → `2.291.0`): a stub now names the calc that ACTUALLY failed,
+  instead of inheriting its dependency's error (#173 family).** A calc that falls back only because a
+  calc it REFERENCES is unmigrated reported the dependency's translator error as its own
+  `fallback_reason`. The classic shape is a dispatcher or comparison measure pointing at an unmigrated
+  LOD: it reports `bare row-level field [..] not valid in a measure` while containing no row-level
+  field at all. A reader triaging the flat `needs_review` list was sent hunting inside the wrong
+  measure, and the broken one was never named — silent because the entry looks complete.
+
+  Measured on the 34-workbook corpus at 2.275.0: **13** needs-review entries carried that reason,
+  **9 of them were cascades by the engine's own triage**, and **none of the 13 named a dependency**,
+  because no such key existed in the export. So this was a reporting gap, not an engine one — the
+  engine computed the split and shipped it in the same `report.json`, in a sibling `triage` block
+  keyed only by name.
+
+  Every `needs_review` and `requests` entry now carries an additive **`blocked_by`**:
+  `[{caption, name, role}]` naming the referenced calcs that are themselves needs-review, so the
+  dependency chain is walkable to its root (corpus 0088:
+  `Avg Days Participation same as Goal ●` → `Avg. Days Participation vs Goal` →
+  `Avg. Days Participation`, the nested LOD). `summary.blocked_by_unmigrated_calc` counts them:
+  **13 of 69** at 2.291.0, and 8 of the 11 entries carrying `bare row-level field [..]` — so ranking
+  that class by raw `fallback_reason` count overstates the work behind it by roughly 4x.
+
+  `blocked_by` asserts only the FACT *“these referenced calcs are also unmigrated”*, deliberately not
+  the prediction *“this would translate once they are fixed”*. That prediction is `triage`'s job, and
+  triage is measurably fallible: it re-translates with the single global resolver while the build
+  uses a per-calc island-scoped one, so on a multi-datasource workbook it can call a cascade
+  irreducible (0088's `Select Metric` at 2.275.0). Deriving `blocked_by` from triage would inherit
+  that; it is derived from the already-computed report rows instead, so it cannot. The two signals
+  genuinely disagree in one corpus case (0073's `Difference` references an unmigrated calc AND has
+  its own irreducible problem) — both are true, which is the argument for reporting the fact rather
+  than a boolean.
+
+  `fallback_reason` is deliberately unchanged: the string is the literal translator error and is
+  pinned by `_ROW_LEVEL_IN_MEASURE_REASON`, the row-level reroute router's contract.
+
 - **`tableau-migration` (skill `2.275.0` → `2.290.0`): one unmigrated branch no longer blanks EVERY
   selection of a parameter dispatcher (#168, #171).** A Tableau control-surface calc —
   `CASE [Parameters].[P] WHEN 1 THEN <metric a> WHEN 2 THEN <metric b> … END` — was translated
