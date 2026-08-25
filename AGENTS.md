@@ -186,6 +186,21 @@ not mirrored.
   both print their admitted counts so a divergence like 86-vs-137 surfaces as a question rather than
   as agreement.
 
+  **The actionable form: write a verifier's predicate from the SUBJECT'S GRAMMAR, not from what the
+  current data happens to look like.** The gate accepts `(?:->|\u2192)` because both formats exist in
+  the file; any probe over that file must accept exactly the same, or it certifies a region it cannot
+  see. The concrete cause of the 86-vs-137 split was measured by a peer session — who reproduced it
+  *inside the message discussing it*: a PowerShell `Select-String` pattern used `.` for the arrow,
+  which matches **one** character. `\u2192` is one char; `->` is **two**. So the pattern silently
+  dropped all 51 old-format entries:
+
+  ```
+  both arrows accepted : 139     unicode only : 88     ascii '->' only : 51
+  ```
+
+  "Look at the data and write a pattern that matches it" is how both of us built a narrow verifier;
+  the grammar is what the subject actually admits, and only that is a safe predicate.
+
   **The corollary, which is a real architectural property rather than luck:** the `[Unreleased]`
   normaliser recognises only the newer format, so it absorbs the older 51 as body text and sorts them
   with whatever entry swallowed them. Those survived today only because they all sit *below* the
