@@ -350,16 +350,24 @@ def _release_commits(root):
 
 
 def _is_ancestor(root, maybe_ancestor, descendant):
-    """True iff ``maybe_ancestor`` is reachable from ``descendant``.
+    """True iff ``maybe_ancestor`` is reachable from ``descendant``. ``False`` if git cannot answer.
 
     Uses git's own reachability rather than a hand-rolled walk. A peer session BFS'd this by hand and
     got a confidently wrong answer, because paths go AROUND the anchor into all history -- the
     reported figure was absurd enough to indict the probe rather than the repo, which is the only
     reason it was caught. Let the tested thing judge.
+
+    Returning ``False`` on an unanswerable question is deliberate and is NOT fail-closed in the usual
+    sense: callers use this both to assert an invariant AND to decide whether the question is
+    decidable here, and in the latter case a git failure that looked like "reachable" would resurrect
+    the false positive the skip exists to remove.
     """
-    return subprocess.call(
-        ["git", "merge-base", "--is-ancestor", maybe_ancestor, descendant],
-        cwd=root, stdout=subprocess.PIPE, stderr=subprocess.PIPE) == 0
+    try:
+        p = subprocess.run(["git", "merge-base", "--is-ancestor", maybe_ancestor, descendant],
+                           cwd=root, capture_output=True, timeout=60)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return p.returncode == 0
 
 
 def _chain_pairs(repo):
@@ -418,6 +426,23 @@ def test_each_anchor_is_an_ancestor_of_the_release_it_anchors(repo):
         release = releases.get(made)
         if not anchor or not release:
             continue                      # absence is the sibling gate's business, not this one
+        if not _is_ancestor(repo, anchor, "HEAD"):
+            # THE ANCHOR BELONGS TO A HISTORY THIS BRANCH CANNOT SEE, so the question is undecidable
+            # here. Ported from a peer session's fix to the gate this one replaced -- the same defect
+            # was about to ship in the replacement.
+            #
+            # `refs/tags` is SHARED across every worktree; the CHANGELOG chain driving this loop is
+            # branch-local. So a lane branch sees other lanes' anchors beside its own chain, and an
+            # anchor it cannot reach can never be an ancestor of anything -- it would report a
+            # violation caused entirely outside the branch. Observed live: an anchor re-pointed by
+            # the integrator turned a lane red seconds later, through no fault of the lane.
+            #
+            # Note this is the OPPOSITE call from the sibling gate that compares an anchor against
+            # its OWN commit's VERSION. That comparison is decidable from anywhere, so filtering it
+            # by ancestry would discard signal -- and cross-lane tag hijacking is precisely what it
+            # exists to catch. The distinction is what the gate compares against: a branch-local
+            # file (skip what you cannot reach) or the anchor's own commit (judge everything).
+            continue
         judged += 1
         if not _is_ancestor(repo, anchor, release):
             violations.append(

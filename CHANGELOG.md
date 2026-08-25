@@ -12,6 +12,75 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ## [Unreleased]
 
+### Added
+
+- **`tableau-migration` (skill `2.305.0` → `2.306.0`): a measure that names a COLUMN unqualified is
+  now a hard openability failure — the model opens, and the measure fails when queried.** Found in a
+  real customer deliverable, not in the corpus. Its agent reported that a Tableau calc id "didn't
+  resolve to a column in the migrated model" and said it had therefore chosen a conservative stub.
+  Every part of that was refuted by the file itself: a sibling calc id in the same model *had*
+  resolved deterministically, the referenced calculation sat in the same table with `state: Ready`
+  and its formula attached, and the emitted body was **`VAR _val = 0`** — not `BLANK()`.
+
+  That distinction is the point, and it is why this ships as a gate rather than a note. This repo's
+  stub convention is `= BLANK()`: structurally valid, semantically absent, and it *looks* empty. A
+  hardcoded `0` run through the same measure's currency and percentage formatting renders **`$0.00`**
+  and **`0.000%`** — a confident wrong number in every visual that touches it. A customer reads
+  `$0.00` as "zero dollars", not as "we declined to translate this". The agent's own justification
+  was that it wanted to avoid *silently producing wrong outputs*, while emitting the one shape that
+  does exactly that.
+
+  The actual break was mechanical: `SWITCH([display_format], ...)` where `display_format` is a
+  **column** on `'Custom SQL Query'`. Power BI: `SemanticError`, *"The syntax for '(' is
+  incorrect"*. Five measures broken — three primary, two rebound onto them. Corrected and verified
+  against the real 17,705-row model: NSD Availability `$0.00` → **77.4%**, Outage Volume → **1.11K**,
+  HFC QC → **98.51**.
+
+  `dax_references_resolve` (2.230.0) could not see it. It accepted an unqualified `[Name]` that
+  resolved against measures **or** columns, on the reasoning that Power BI allows an unqualified
+  column reference in a row context. Both defects' names *are* columns, so both passed a check
+  written to catch exactly this class. **The allowance was measured before it was removed, not
+  after**: across 248 corpus measures exactly **one** bare reference resolves to a column and not a
+  measure — and that one is itself a defect (0088, `CALCULATE([Client per Staff Max Goal], ...)`
+  where only the column and the what-if measure `... Value` exist; Power BI: *"The value for
+  'Client per Staff Max Goal' cannot be determined."*). The same expression gets `[Start Date Value]`
+  right, so it is a dropped suffix, not a house style. False-positive rate **0/248**.
+
+  Reported as its own check, `bare_column_references_qualified`, rather than folded into
+  `dax_references_resolve`: the reference *does* resolve to a model object, so calling it
+  unresolvable would misdescribe it and send a reader hunting for a missing column that exists.
+
+  **The systemic finding is the provenance stamp.** All three primary breaks carry
+  `TranslatedBy: assisted translation (human-approved)`; the deterministic path qualifies its
+  references correctly in the same file. The approval certified *"the formula looks right"*, not
+  *"the measure compiles"* — this session's population rule applied to a **trust label**, which is
+  worse than applying it to a metric, because a metric gets re-measured and a provenance stamp gets
+  relied upon. A measure sitting in `SemanticError` shipped to a customer carrying a human's
+  approval, and the defect is specifically in the path that has a human in it, which is precisely
+  where nobody thinks to add a machine check.
+
+  Two notes for whoever extends this. The matcher must scan the **expression only**: a first cut
+  scooped `annotation TableauFormula` into the body and reported **370 violations across 248
+  known-good measures**, because a preserved Tableau formula legitimately names Tableau ids —
+  expression-plus-annotations was not the claim's population. And the check is non-vacuous by
+  injection, not by assertion: a bare reference to a real column in a clean corpus model is caught,
+  the qualified form of the same measure is not, and the same name appearing only inside an
+  annotation is not.
+
+  Shipped alongside it, in the same release: **the anchor-predecessor gate (2.299.0) no longer fires
+  on anchors this branch cannot reach** — that gate's own flaw, exposed on its own author's branch
+  within a day. It compares a **shared
+  mutable resource** (`refs/tags`, one namespace across every worktree) against a **branch-local
+  file** (`CHANGELOG.md`). When the integrator re-points an anchor for the *merged* world — the
+  correct repair this gate asks for — every lane branch immediately sees a merged-world anchor beside
+  its own lane-world chain and goes red through no fault of the lane. Observed concretely:
+  `rollback/pre-v2.299.0` was re-pointed to a commit stamped 2.298.0, right for the merged line where
+  2.296–2.298 sit between, while this branch's chain still declares 2.295.0, right here. Neither is
+  wrong; they describe different histories, and only one of them contains the anchor's commit.
+  Ancestry is what tells them apart, so an anchor whose commit is not reachable from `HEAD` is
+  skipped as undecidable — the same skip the companion test already made, arriving from the opposite
+  direction and missed when this gate was written.
+
 ### Fixed
 
 - **`tableau-migration` (skill `2.304.0` → `2.305.0`): a rollback anchor must be an ANCESTOR of the
@@ -66,9 +135,6 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
   Verified red by injection (an anchor pointed at `HEAD`, restored immediately) with the five sibling
   gates staying green, and a negative control asserting the detector distinguishes a bad pairing from
   a good one — it spends its life reporting silence, which is where a broken detector hides.
-
-
-### Fixed
 
 - **`tableau-migration` (skill `2.303.0` → `2.304.0`): a review reason now names the ROUTE, not the
   byte — the old wording was accurate and reliably sent readers the wrong way.**
@@ -3908,7 +3974,6 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
   normalised for lineage tags), and **3 corrected a wrong table**, with no case where it disagreed
   with a previously-correct answer.
 
-
 - **tableau-migration (skill `2.112.0` -> `2.113.0`): the PBIR objects and roles we emit have to be
   the ones the visual actually installs** (issue #100). Every name below was checked against the
   installed visual capabilities (`catalog describe` / `formatting describe-object`), and the result
@@ -3944,7 +4009,6 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
     PARAMETER-CONTROL slicers (a different emitter) still clipped at 44-75px. A test asserts the
     floor over every dropdown slicer, so a future third emitter is covered the day it is written.
 
-
 - **tableau-migration (skill `2.111.0` -> `2.112.0`): the report must name a measure the way the
   model does.** 2.108.0 taught the MODEL to strip DAX identifier brackets from a measure name; the
   REPORT still bound calcs by their raw Tableau caption, so the two ends disagreed and the reference
@@ -3964,7 +4028,6 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
     first-pass-vs-shipped-artifact confusion that makes `out/reports/` look wrong while the project
     beside it is correct. A dangling reference that survives the cross-check now also raises a
     warning, not just a report entry.
-
 
 - **tableau-migration (skill `2.110.0` -> `2.111.0`): a gate that proves every VISUAL's model
   references resolve.** `reference_gate` has always proved this invariant for the DAX the second
@@ -3989,7 +4052,6 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
     emitted output and assert each is caught. A check that has never fired proves nothing.
   - **It immediately found two real dangling references** on a workbook every other gate passes,
     including one introduced by 2.110.0's own predecessor — logged for fix, not silently absorbed.
-
 
 - **tableau-migration (skill `2.109.0` -> `2.110.0`): the trellis collapse, fixed for BOTH spellings
   this time.** 2.105.0 fixed only half of it. Tableau writes "another axis in the same rectangle"
@@ -4168,7 +4230,6 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
     `91` at 36%; `255` is opaque). It was ignored entirely, so every translucent Tableau mark came
     back at full strength. It now maps to `dataPoint.transparency`.
 
-
 - **tableau-migration (skill `2.102.0` -> `2.103.0`): a horizontal dual axis is still a dual axis,
   and its member names survive.** Tableau names a pane's measure axis after the shelf the measures
   sit on — `y-axis-name` / `y-index` for Rows (a vertical chart), `x-axis-name` / `x-index` for Cols
@@ -4204,7 +4265,6 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
     features): measured, a schema-valid US-state choropleth rendered as an empty rectangle on a
     default install while the same query on a `filledMap` drew a real map. Nothing in the file is
     wrong and nothing the emitter can write turns it on, so it is disclosed instead.
-
 
 - **tableau-migration (skill `2.101.0` -> `2.102.0`): a KPI title's headline number is found by what
   it RENDERS at, and rebuilt in proportion.** Tableau writes a big-number KPI INTO the worksheet
@@ -4247,7 +4307,6 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
   - Tableau's `Æ` layout sentinel was being counted as a text run by `_parse_title_style`, so a title
     whose real runs all agreed still deferred its styling.
 
-
 - **tableau-migration (skill `2.100.0` -> `2.101.0`): an axis the author hid has no title either.**
   `visual.objects.<axis>.show: false` suppresses an axis's line, ticks and labels but NOT its title —
   the code assumed otherwise and said so in a comment. Measured on a 300x300 KPI tile whose source
@@ -4256,7 +4315,6 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
   plot width. A hidden axis now also emits `showAxisTitle: false`. An authored caption is still
   preserved on the object (`titleText`) so nothing is lost from the file — it is simply not shown on
   an axis the author turned off.
-
 
 - **tableau-migration (skill `2.99.0` -> `2.100.0`): a table calc transforms the pill it sits on,
   not the first one the sheet happens to declare.** `datasource-dependencies` lists every table-calc
@@ -4277,7 +4335,6 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
   - `test_emit_pbir_projects_visual_calculation_for_a_quick_calc_worksheet` asserted the opposite
     premise ("the quick-calc token does not survive onto the resolved value pill"); it now plots the
     calc's own pill, with the disproving evidence recorded in the test.
-
 
 - **tableau-migration (skill `2.98.0` -> `2.99.0`): a second measure axis is a second SCALE, and a
   line overlaid with an area is a filled line.** Tableau spells "another measure axis in the same
@@ -4396,6 +4453,7 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
     typed double `1D`, the quoted string `'Scalar'`.
   - Verified end to end on `0085_time_series_style_palette`: all nine tiles lose their scrollbar and
     render the full 45-month series. Suite 4275 passed / 6 skipped / 1 xfailed; corpus 29/29.
+
 - **tableau-migration (skill `2.93.0` -> `2.94.0`): the workbook's own colours, on every chart.**
   Four related fixes, all verified by rendering the rebuild and comparing it to the source image.
   (1) **Flat mark colour, every visual type.** A Tableau author who colours the marks without binding
@@ -4419,6 +4477,7 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
   render catches it. Tableau allows it; the faithful rebuild keeps the legend (a series per colour
   member, which is what the source looks like) and drops the extra measures with a warning. Corpus
   29/29 openable.
+
 - **tableau-migration (skill `2.92.0` -> `2.93.0`): a model-measure rebind is authoritative over
   the caption-keyed `field_map`.** The estate runs the viz stage TWICE -- once bare to build the
   model, once rebound to it -- and only the SECOND pass ships as the openable `.pbip`. In that
@@ -4432,6 +4491,7 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
   **no visual referenced it** -- the chart showed the raw un-accumulated number and nothing warned,
   because every layer believed it had succeeded. Corpus: visuals bound to a table-calc measure
   **0 -> 4**, 29/29 still openable.
+
 - **tableau-migration (skill `2.91.0` -> `2.92.0`): container backgrounds -- the dashboard canvas
   and each chart's own canvas.** Tableau spells "the background of this whole container" exactly one
   way, a `style-rule` whose `element` is `table`, and the container it hangs from decides what
@@ -4450,6 +4510,7 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
   faithful single-hex form, and inventing one would shift every colour composited over it. Corpus
   delta: pages with a background **0 -> 12**, visuals **70 -> 90**, 29/29 still openable, and the
   rebuild verified by rendering it in Desktop and looking at it.
+
 - **tableau-migration (skill `2.90.0` -> `2.91.0`): an unplaced calc borrows addressing from its
   IDENTICAL placed twin.** Tableau recovers a table calc's Compute-Using (partition + order) from
   where the pill sits on a worksheet, so a calc authored but never dropped on a shelf has no
@@ -4465,6 +4526,7 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
   emitted twin DAX is verified byte-identical to its donor's. Fails closed both ways that could make
   it a guess: a calc with its OWN placement is never overridden, and placed twins that DISAGREE on
   addressing lend nothing rather than being resolved by picking one.
+
 - **tableau-migration (skill `2.89.0` -> `2.90.0`): the input guard now compares BYTES, not just
   names.** `input_manifest.json` already recorded a SHA256 per input and never compared them: its
   collision check keyed on the filename stem alone. So the same file staged twice under different
@@ -4475,6 +4537,7 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
   to tell a doubled ledger from a real one. New additive `duplicate_bytes` reports it, and the
   `summary.md` banner names exactly which totals are inflated. Reported, never fatal -- same
   rationale as `collisions`: one ambiguous pair must not abort an estate of 200 assets.
+
 - **tableau-migration (skill `2.88.0` -> `2.89.0`): a transfer-layer UUID prefix no longer
   becomes the asset name.** Chat/Copilot attachments, portal and ticketing downloads and SharePoint
   stamp a canonical UUID on the front of a filename. It is never part of a Tableau author's name, and
@@ -4488,6 +4551,7 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
   deliberately strict -- the canonical 8-4-4-4-12 shape, anchored at position 0, with a separator, and
   only when a non-empty remainder survives, so a date-prefixed name like `2026-08-07-Monthly Report`
   is untouched.
+
 - **tableau-migration (skill `2.87.0` -> `2.88.0`): an untranslated measure is `BLANK()`, never
   `0`.** A stub emitted as `= 0` is a MEASUREMENT: it renders on a card as a confident number, and
   nothing about "CSAT 0%" says the calculation was never migrated. Measured 2026-08-06 on a real
@@ -4497,6 +4561,7 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
   and cannot be mistaken for data. This is what a stubbed calculated COLUMN has always emitted
   (`generate_calc_column_tmdl`) -- measures were the lone inconsistency. Provenance is unchanged:
   the Tableau formula is still on the `TableauFormula` annotation.
+
 - **tableau-migration (skill `2.86.0` -> `2.87.0`): the Tier-3 work order is REMOVED.** It shipped
   across 2.84.0-2.86.0 and is deleted here, along with its tests and its `SKILL.md` entry, because
   it was never validated against the agent it exists for and the evidence we do have argues against
