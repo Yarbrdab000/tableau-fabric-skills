@@ -41,6 +41,7 @@ See the versioning section of ``AGENTS.md``.
 """
 
 import os
+import sys
 import re
 
 import pytest
@@ -63,8 +64,31 @@ def _find_repo_root():
         cur = parent
 
 
+# A SENTINEL, deliberately WIDER than ``_ENTRY_RE`` in every dimension, used to tell a PARSE FAILURE
+# apart from a genuine ABSENCE. It must not require the backtick around the skill name (this file
+# carries two entry formats and only some entries backtick it -- a sentinel keyed on that matches 99
+# of 148 and would itself go quiet on the other format), and it must not require the ``(skill ...)``
+# construct that ``_ENTRY_RE`` depends on, or sentinel and parser go to zero together and the guard is
+# silent exactly when it is needed. A sentinel narrower than the thing it guards is a second
+# instrument sharing the first one's blind spot.
+_ENTRY_SHAPE_RE = re.compile(r"^\s*-\s*\*\*`?tableau-migration`?")
+
+
 def _entries():
-    """``[(line_no, frm, to)]`` newest-first, one per skill-version bullet."""
+    """``[(line_no, frm, to)]`` newest-first, one per skill-version bullet.
+
+    ABSENT and UNPARSED must not produce the same outcome. A repo with no ``CHANGELOG.md`` -- an
+    installed-skill context -- legitimately has nothing to check, and skipping is correct. A
+    ``CHANGELOG.md`` that is *full of entry-shaped bullets* while this parser returns zero is a broken
+    parser, and skipping there turns the gate guarding every release in this repo into one more line
+    in ``6 skipped``: a number nobody reads, already non-zero for legitimate reasons.
+
+    That is the same vacuous pass this module's own verification hit from the other side -- a mangled
+    regex produced ``entries=0`` and therefore ``0 breaks, no duplicates``, every line true of an empty
+    list and indistinguishable from a healthy file. Here the parser would find *nothing* and report
+    health; a conflict marker makes it find *everything* and report health. **Both are correct answers
+    to the question the predicate encodes, and neither question was "is this file well-formed."**
+    """
     root = _find_repo_root()
     if root is None:
         pytest.skip("repo layout not present (installed-skill context)")
@@ -82,6 +106,12 @@ def _entries():
         if m:
             out.append((i, m.group("frm"), m.group("to")))
     if not out:
+        shaped = sum(1 for line in lines if _ENTRY_SHAPE_RE.search(line))
+        assert not shaped, (
+            "the CHANGELOG entry parser matched 0 entries, but %d line(s) look like release entries "
+            "-- this is a PARSE FAILURE, not an absence, and every check in this module would "
+            "otherwise report a clean pass over an empty list. Either the entry format changed or "
+            "_ENTRY_RE is broken; fix one of those before trusting any result here." % shaped)
         pytest.skip("no versioned CHANGELOG entries to check")
     return out
 
@@ -198,3 +228,64 @@ def test_the_body_check_detects_a_header_only_entry():
     empty = [(line_no, to) for line_no, to, count in bodies if count == 0]
 
     assert empty == [(1, "2.99.0")], "the predicate must flag a zero-body entry and nothing else"
+
+
+def test_a_broken_parser_fails_rather_than_skipping(tmp_path, monkeypatch):
+    """A parse failure must FAIL. An absent CHANGELOG must SKIP. They must not look the same.
+
+    Before this guard, a broken ``_ENTRY_RE`` -- a format change, or a regex mangled in transit --
+    made ``_entries()`` return nothing and skip, so the gate protecting every release in this repo
+    became one more line in ``6 skipped``. Every other check in this module then passed over an empty
+    list: ``0 breaks``, ``no duplicates``, all true, all meaningless.
+
+    Both directions from one harness, because a guard that only ever reports an absence is
+    indistinguishable from a dead one.
+    """
+    repo = tmp_path / "repo"
+    (repo / "skills").mkdir(parents=True)
+    (repo / "plugins").mkdir()
+    monkeypatch.setattr(sys.modules[__name__], "_find_repo_root", lambda: str(repo))
+
+    # 1. entry-shaped bullets present, parser matches none -> must FAIL, not skip.
+    (repo / "CHANGELOG.md").write_text(
+        "## [Unreleased]\n\n"
+        "- **`tableau-migration` (skill NOT-A-VERSION): a release the parser cannot read.**\n"
+        "  body text\n",
+        encoding="utf-8")
+    with pytest.raises(AssertionError) as excinfo:
+        _entries()
+    assert "PARSE FAILURE" in str(excinfo.value), (
+        "a broken parser must say so; it must not be mistaken for an empty changelog")
+
+    # 2. no CHANGELOG at all -> must SKIP, because there is legitimately nothing to check.
+    #
+    # ``BaseException``, not ``Exception``: ``pytest.skip()`` raises ``Skipped``, which derives from
+    # ``BaseException``. Catching ``Exception`` lets it escape, and the skip then propagates and marks
+    # THIS test skipped -- which is what happened on the first run of it. A test written to stop a
+    # vacuous skip, vacuously skipped, reporting neither pass nor failure while its first assertion
+    # had already succeeded and gone unreported.
+    (repo / "CHANGELOG.md").unlink()
+    with pytest.raises(BaseException) as excinfo:
+        _entries()
+    assert excinfo.typename == "Skipped", (
+        "an absent CHANGELOG is an installed-skill context and must skip, not fail -- got %s"
+        % excinfo.typename)
+
+
+def test_the_sentinel_is_wider_than_the_parser_it_guards(tmp_path, monkeypatch):
+    """The sentinel must match every real entry format, or it shares the parser's blind spot.
+
+    This file carries TWO entry formats -- some entries backtick the skill name and some do not. A
+    sentinel keyed on the backticked form matches 99 of 148 real entries, so it would go quiet on the
+    other format and could not distinguish "the parser broke" from "the format moved". Measured
+    against the live CHANGELOG rather than a fixture, because the formats in it are the thing at risk.
+    """
+    strict = _entries()
+    root = _find_repo_root()
+    with open(os.path.join(root, "CHANGELOG.md"), encoding="utf-8") as fh:
+        lines = fh.read().split("\n")
+    shaped = sum(1 for line in lines if _ENTRY_SHAPE_RE.search(line))
+    assert shaped >= len(strict), (
+        "the sentinel matches %d line(s) but the strict parser found %d entries -- the sentinel is "
+        "NARROWER than the parser it guards, so a format it cannot see would read as a clean absence"
+        % (shaped, len(strict)))

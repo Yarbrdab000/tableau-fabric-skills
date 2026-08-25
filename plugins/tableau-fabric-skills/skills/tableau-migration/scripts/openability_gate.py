@@ -334,11 +334,31 @@ _NON_DAX_FUNCTIONS = {
     "SIZE": None, "TOTAL": None, "LOOKUP": "LOOKUPVALUE",
 }
 
-# ``(?<![A-Za-z0-9_.\[])`` so a MEASURE whose name contains a call -- 0088 really does define
-# ``WINDOW_MAX(Avg. Days Participation)*1.2`` -- is not mistaken for one when referenced as
-# ``[WINDOW_MAX(...)]``. NOT EXERCISED by the current corpus: measured both with and without the
-# lookbehind and both return 0, because nothing references those measures from an expression. It is
-# defensive, not validated evidence, and should not be cited as though the corpus proved it.
+# ``(?<![A-Za-z0-9_.\[])`` -- a LEADING lookbehind with TWO distinct jobs, and only one of them was
+# documented. A property is not "validated" or "unvalidated" as a whole; each of its jobs is,
+# separately, and describing the guard by its weaker job under-claimed a genuinely load-bearing one.
+#
+#   1. NOT EXERCISED by the current corpus: a MEASURE whose NAME contains a call -- 0088 really does
+#      define ``WINDOW_MAX(Avg. Days Participation)*1.2`` -- must not be mistaken for one when
+#      referenced as ``[WINDOW_MAX(...)]``. Measured both with and without the lookbehind: both
+#      return 0, because nothing references those measures from an expression. Defensive, not
+#      validated evidence, and it should not be cited as though the corpus proved it.
+#   2. EXERCISED, and the uniquely load-bearing one: it blocks a LONGER IDENTIFIER ending in a
+#      denylist name. ``MYTEXT([a])`` fires without it. Pinned by
+#      ``test_a_bad_name_embedded_in_a_longer_identifier_is_not_flagged``.
+#
+# Ablated across four variants, because the trailing boundary's role was also misread:
+#
+#     variant                              TOTALYTD  LOOKUPVALUE  MYTEXT   TEXT
+#     shipped: lookbehind + \s*\( + sort     silent     silent     silent   TEXT
+#     no lookbehind, KEEPS \s*\(             silent     silent     TEXT     TEXT   <- breaks
+#     lookbehind + \b instead of \s*\(       silent     silent     silent   TEXT   <- equivalent
+#     no boundary at all                     TOTAL      LOOKUP     TEXT     TEXT   <- breaks badly
+#
+# So a TRAILING boundary is what protects ``TOTALYTD``/``LOOKUPVALUE`` from the ``TOTAL``/``LOOKUP``
+# entries -- but ``\s*\(`` is not uniquely what does it; a plain ``\b`` is equivalent. And
+# ``TEXT``/``TEXTJOIN`` is not a shadowing hazard at all: ``TEXTJOIN`` is itself an entry, so a hit
+# there is CORRECT, and the length-descending sort only makes the message name the longer one.
 _NON_DAX_CALL_RE = re.compile(
     r"(?<![A-Za-z0-9_.\[])(%s)\s*\(" % "|".join(sorted(_NON_DAX_FUNCTIONS, key=len, reverse=True)),
     re.IGNORECASE)

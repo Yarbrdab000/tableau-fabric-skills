@@ -14,6 +14,47 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ### Added
 
+- **`tableau-migration` (skill `2.313.0` → `2.314.0`): a broken CHANGELOG entry parser now FAILS
+  instead of skipping, and the denylist lookbehind is documented by both of its jobs.**
+
+  **`_entries()` skipped when it matched nothing**, conflating two states that need opposite verdicts:
+  a repo with no `CHANGELOG.md` (an installed-skill context) legitimately has nothing to check, while
+  a `CHANGELOG.md` *full of entry-shaped bullets* that the parser cannot read is a **parse failure**.
+  In the second case the gate protecting all 148 chain entries became one more line in `6 skipped` —
+  a number nobody reads, already non-zero for legitimate reasons — and every other check in the module
+  then passed over an empty list: `0 breaks`, `no duplicates`, all true, all meaningless.
+
+  That is the same vacuous pass this repo's own verification hit from the other side: a regex mangled
+  in transit produced `entries=0` and therefore a clean-looking report, caught only by an accidental
+  `IndexError`. **A conflict marker makes the parser find *everything* and report health; a broken
+  regex makes it find *nothing* and report health. Both are correct answers to the question the
+  predicate encodes, and neither question was "is this file well-formed."**
+
+  The sentinel is deliberately **wider than the parser it guards, in every dimension**. It must not
+  require the backtick around the skill name — this file carries two entry formats, and a sentinel
+  keyed on the backticked form matches **99 of 148** and would go quiet on the other one — nor the
+  `(skill …)` construct the strict parser depends on, or sentinel and parser reach zero together and
+  the guard is silent exactly when it is needed. **A sentinel narrower than its parser is a second
+  instrument sharing the first one's blind spot.** Pinned by a test that measures both against the
+  live file.
+
+  **The first version of the new test was itself vacuously skipped.** `pytest.skip()` raises
+  `Skipped`, which derives from `BaseException`, so a `pytest.raises(Exception)` let it escape and
+  marked the test skipped — while its first assertion had already succeeded and gone unreported. A
+  test written to stop a vacuous skip, vacuously skipped, on its first run.
+
+  **Also: `_NON_DAX_CALL_RE`'s leading lookbehind has two jobs and was documented by the weaker one.**
+  It was labelled *"not exercised by the current corpus, defensive not validated"* — true of the
+  measure-name case it was written for, and false of its second job, blocking a longer identifier
+  ending in a denylist name (`MYTEXT([a])`), which **is** exercised. Ablation across four variants
+  also corrects the trailing boundary's role: `\b` is equivalent to `\s*\(` for protecting
+  `TOTALYTD`/`LOOKUPVALUE`, the **leading** lookbehind is the uniquely load-bearing property, and
+  `TEXT`/`TEXTJOIN` was never a shadowing hazard because `TEXTJOIN` is itself an entry.
+
+  **A property is not validated or unvalidated as a whole — each of its jobs is, separately.**
+  Under-claiming produced by care about over-claiming, which is a failure mode with no obvious
+  defence: the disposition that prevents one causes the other.
+
 - **`tableau-migration` (skill `2.312.0` → `2.313.0`): a committed git conflict marker is now a
   test failure.** Three of them sat in `CHANGELOG.md` at the tip of an integration branch carrying
   eighteen merged releases, and **every gate stayed green**: the suite passed, the version-chain gate
