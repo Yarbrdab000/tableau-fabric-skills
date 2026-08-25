@@ -142,7 +142,6 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
   check resolves the value path rather than pattern-matching a wrapper.
 
 - **`tableau-migration` (skill `2.307.0` → `2.308.0`): a measure can render blank while its
->>>>>>> yarbrdab000-fix-measure-value-coloring
   expression is not `BLANK()` — now a hard openability failure.** Found by opening a build,
   refreshing it and looking at it. No static check in this repo could see it, and the reason is
   structural rather than careless: every stub-accounting instrument matched
@@ -213,12 +212,10 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 
 
-<<<<<<< HEAD
 
 ### Added
 
 - **`tableau-migration` (skill `2.305.0` → `2.306.0`): a measure that names a COLUMN unqualified is
->>>>>>> yarbrdab000-fix-measure-value-coloring
   now a hard openability failure — the model opens, and the measure fails when queried.** Found in a
   real customer deliverable, not in the corpus. Its agent reported that a Tableau calc id "didn't
   resolve to a column in the migrated model" and said it had therefore chosen a conservative stub.
