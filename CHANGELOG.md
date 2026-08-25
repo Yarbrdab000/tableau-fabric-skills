@@ -14,6 +14,51 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ### Fixed
 
+- **`tableau-migration` (skill `2.268.0` → `2.269.0`): a model that reads from the ORIGINAL AUTHOR'S
+  LAPTOP is no longer reported as `built`.** Found by opening all 34 corpus workbooks in Power BI
+  Desktop and looking at all 98 rendered pages — 13 workbooks had visibly broken pages that every
+  static gate had passed. The largest cluster was four workbooks rendering every page as bare
+  headers under *"Some of the tables have incomplete or no data"*, and interrogating the live model
+  gave the cause in one line:
+
+  ```
+  Could not find a part of the path
+  'C:\Users\bshonk\AppData\Local\Temp\TableauTemp\...\Clipboard_20121219T112939.xls'
+  ```
+
+  A `.twbx` records the upstream file its author originally loaded from. When the bundled payload
+  cannot be read — here a legacy `.tde` extract, which the engine has no reader for — the emitter
+  falls back to that recorded path. `0071_numerical_dates` shipped pointing at a stranger's **temp
+  folder from 2012**; `0084_rounding_minutes_to_quarters` at their **desktop**. Both models open,
+  "refresh" to zero rows, render every visual empty — and the pipeline called both plain `built`,
+  with no warning of any kind.
+
+  Nothing static could have seen it: the M is syntactically perfect and the TMDL is valid. The path
+  is wrong only relative to a filesystem, which no schema knows about. The contrast that makes the
+  gap precise: `0083_previous_workday` reaches the SAME blank pages by a different route (an
+  unfinished `TODO` partition stub) and **is** honestly reported. The defect was never the dead
+  path — it was the silence.
+
+  `openability_gate` grows `local_source_paths`, which fails definition-of-done when a partition
+  reads a path under another user's profile. Whether a path is FOREIGN is decidable from the text
+  alone, so the gate stays hermetic and the verdict travels with the model; whether it EXISTS needs
+  a filesystem and is left to the caller. Conservative in both directions — a plain data folder is
+  never judged, `Public`/`Default` are not accounts, and the current user's own profile is fine
+  (case-insensitively). Also fixes the diagnosis wording: a dead path makes a model **"open but load
+  NO DATA"**, not "not openable", and telling a reader the wrong one sends them hunting a corruption
+  that isn't there.
+
+  Corpus: flags exactly the 2 affected workbooks out of 34, 0 false positives. A/B over all 1612
+  emitted files — 3 changed, all three the summary/manifest carrying the new diagnostic.
+
+  **Instrument note (this one invalidates an earlier claim's evidence, not its conclusion).** The
+  corpus differ used `os.walk` on a bare Windows path, which SILENTLY STOPS DESCENDING past
+  MAX_PATH — no error, the tree just looks smaller. Two byte-identical builds reported 1470 vs 1579
+  files purely because their output roots differed by ONE CHARACTER. So the "all 1470 files" quoted
+  for 2.267.0 and 2.268.0 was really **1470 of 1612 (91%)**; re-run with a long-path-safe walk, both
+  conclusions are unchanged. This is the second form of this hole in the same tool — the first was
+  *reading* a long path, fixed one release earlier, and fixing the read did nothing for the walk.
+
 - **`tableau-migration` (skill `2.267.0` → `2.268.0`): a rebuilt Salesforce model no longer refuses
   to OPEN with "ambiguous paths".** Reported from the field as a Power BI Desktop frown: *"There's a
   problem with the definition content in your Power BI Project. There are ambiguous paths between

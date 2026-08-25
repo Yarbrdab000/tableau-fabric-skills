@@ -5287,6 +5287,15 @@ def _pbir_page_count(pbip_dest):
         return None
 
 
+# How to describe each self-check failure. Default is "not openable", which is right for the
+# structural defects (invalid TMDL, duplicate columns, ambiguous paths) -- but wrong for a model
+# that opens fine and simply has no data to load. Naming the outcome accurately is the difference
+# between a reader fixing the source path and hunting a corruption that does not exist.
+_OPENABILITY_LEAD = {
+    "local_source_paths": "model opens but loads NO DATA",
+}
+
+
 def _dod_openability_failure(w):
     """A loud reason a workbook's bound ``.pbip`` is structurally NOT openable, or ``None``.
 
@@ -5307,12 +5316,17 @@ def _dod_openability_failure(w):
         first = issues[0] if issues and isinstance(issues[0], dict) else {}
         detail = first.get("detail")
         table = first.get("table") or first.get("part")
+        # Say WHICH failure this is. The self-check now covers two distinct outcomes and calling
+        # both "not openable" misdiagnoses one of them: a model reading a dead path OPENS perfectly
+        # and loads nothing, so a reader told it will not open goes looking for a corruption that
+        # is not there. Both still fail definition-of-done -- only the sentence differs.
+        lead = _OPENABILITY_LEAD.get(first.get("check"), "model is not openable")
         if detail:
-            return f"model is not openable: {detail}" + (f" (table {table})" if table else "")
+            return f"{lead}: {detail}" + (f" (table {table})" if table else "")
         failed = [name for name, ok in (sc.get("checks") or {}).items() if ok is False]
         if failed:
-            return "model is not openable: failed " + ", ".join(sorted(failed))
-        return "model is not openable"
+            return f"{lead}: failed " + ", ".join(sorted(failed))
+        return lead
     # A visual that names a model object the model does not contain is the same class of defect on
     # the REPORT side: the visual renders EMPTY (or, for a conditional format, silently unpainted),
     # `powerbi-report-author validate` returns 0 errors, and the run reported success. The binding
