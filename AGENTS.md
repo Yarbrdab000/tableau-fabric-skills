@@ -76,22 +76,39 @@ not mirrored.
   trusting this line, which has been stale before).
 - Keep report-schema changes **additive** — add new keys or artifacts; do not rename or remove
   existing report keys. Add tests; never delete passing tests to make a change pass.
-- **A filter that finds nothing has told you about its own predicate, not about the world.** When
-  you measure a population by matching strings, assert the match count against the population size,
-  or you silently report on a subset. Four instruments lied this way in a single investigation, each
-  producing a confident number: a regex `([A-Z_]+)` that matched `WINDOW_MAX` and simply did not
-  match `Total`, hiding 5 of 30 stubs; `len(x) if isinstance(x, (list, tuple))` against a value that
-  is a **dict**, reporting 0 visual calculations where there were 3; comparing a `blocked_by` dict
-  against a set of name strings, reporting 8 of 8 dangling when 0 dangle; and `os.path.isdir()` on
-  `pbip_folder`, which is a relative path to a **file**, zeroing every per-workbook count. The
-  failure is not that the predicate was wrong — it is that a non-match emits nothing to notice, so
-  partial output looks complete. Count what you examined, and inject a known-bad case to watch the
-  detector go red, before believing any clean result.
+- **A filter that finds nothing has told you about its own predicate, not about the world — and a
+  filter that finds the RIGHT NUMBER of things can still be lying about what they are.** When you
+  measure a population by matching strings, assert both the match count *and the captures*, or you
+  silently report on a subset, or on a corrupted breakdown of the whole. Measured on the 34-workbook
+  corpus, the pattern `unsupported (?:function|table calculation) ([A-Z_]+)` fails **two different
+  silent ways at once** against 71 `needs_review` reasons:
+  - `unsupported function size` — lower-case, so `[A-Z_]+` matches **nothing** and the entry
+    *vanishes*. 1 case. This one moves the count.
+  - `unsupported function Total` — `[A-Z_]+` **matches**, capturing just `"T"`. The entry is present
+    and *miscategorised*. 6 cases (`Total`→`T` ×4, `Sales`→`S`, `Stage`→`S`), and note that `Sales`
+    and `Stage` **merged into one bogus `S` bucket** — distinct values collapsed, not just renamed.
+
+  Seven entries corrupted; the match count differs by **one**. So "assert the match count" is
+  necessary and **insufficient** — it would have caught 1 of the 7. Validate what you captured
+  against the values you expect to exist.
+- **Three sibling instruments failed the same way in one session, none of them raising:**
+  `len(x) if isinstance(x, (list, tuple))` against a value that is a **dict**, reporting 0 visual
+  calculations where there were 3; comparing a `blocked_by` **dict** against a set of name strings,
+  reporting 8 of 8 dangling pointers where 0 dangle; and `os.path.isdir()` on `pbip_folder`, which is
+  a relative path to a **file**, zeroing every per-workbook count. The failure is never that the
+  predicate was wrong — it is that a non-match emits nothing to notice, so partial output looks
+  complete. Count what you examined, check what you captured, and inject a known-bad case to watch
+  the detector go red, before believing any clean result.
 - **When a summary list and a payload list sit side by side, a reader measures whichever they find
   first.** `model_translation_handoff` carries `needs_review` (summary) and `requests` (payload) at
   equal length; `category_guidance`, `fields`, `formula` and `target_table` exist **only** on
   `requests`. Reading the summary and concluding "guidance is empty on all 30" was wrong — it is
-  empty on 0 of 71. If you add a field that a triaging reader needs, put it on **both** lists.
+  empty on **none of them**, in every build checked. If you add a field that changes a triaging
+  reader's decision, put it on **both** lists; you cannot fix this downstream, because the reader who
+  needs telling is precisely the one who never got to the other list.
+- **Cite the build alongside any corpus count.** The same true measurement reads as an error later:
+  `needs_review` is 71 at engine 2.275.0 and 69 at 2.291.0, the delta being two dispatchers that
+  2.290.0 rescued. A count without its engine version is a claim with a hidden expiry date.
 - Before committing, confirm packaging is valid: every `SKILL.md` frontmatter parses, the four
   JSON manifests parse, and relative links resolve.
 
