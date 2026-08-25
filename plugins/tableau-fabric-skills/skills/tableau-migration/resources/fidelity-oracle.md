@@ -299,6 +299,27 @@ py -3.11 scripts\fidelity_oracle.py `
 
 #### Render‑verify operating discipline (reload → refresh → screenshot)
 
+> **First, use the right reload.** `scripts/pbip_desktop_reload.py` pushes an edited `.pbip` —
+> report **and semantic model definition** — into the already‑running Desktop in about a second,
+> instead of the ~115 s a kill‑and‑reopen costs. The packaged `powerbi-desktop reload` CLI
+> hard‑codes `reloadModelDefinition: false`, so it returns `{"success": true}` and leaves the **old**
+> measure expressions live; that is the origin of the widely‑repeated "reload does not re‑read
+> edited TMDL". Measured 2026‑08‑24, same edit, same instant: this script landed it, the stock CLI
+> did not, and **both printed `success: true`**. Full runbook and the A/B:
+> [desktop-bridge-reload.md](desktop-bridge-reload.md).
+>
+> Two limits that keep the rules below in force. Reload **does not refresh data** and **does not
+> persist `cache.abf`** — `pbip-model-refresh` still owns both. And it does **not** replace a cold
+> open: only opening from nothing proves the file opens at all, which is the class that produced the
+> `pageOrder: []` crash and the ambiguous‑path refusal. Reload speeds up the iterations *between*
+> cold opens; land the change, then still open it cold once before believing it.
+>
+> One rule below can be relaxed *with evidence*: on a model already refreshed in this session, a
+> definition reload preserved its loaded rows (`COUNTROWS` read 9,994 before and after), so
+> edit → reload → screenshot produced correct, populated frames without re‑refreshing each time.
+> That is one model measured once. Re‑refresh whenever the partitions themselves changed, and treat
+> a blank visual after a reload as "not yet ready", never as the answer.
+
 The render bridge only yields a *trustworthy* candidate PNG if it is driven in the right order.
 These are deterministic operating rules — not judgment calls — hard‑won on a real migration
 (the Salesforce‑Nonprofit benchmark); skipping any one of them produces a **confidently wrong**

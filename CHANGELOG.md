@@ -127,7 +127,7 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
   Suite 5008 → **5014**.
 
-- **`tableau-migration` (skill `2.268.0` → `2.274.0`): a published datasource reached only as a
+- **`tableau-migration` (skill `2.270.0` → `2.274.0`): a published datasource reached only as a
   SECONDARY no longer ships silently as a `localhost` phantom (#174).** A published Tableau
   datasource connects through a federated proxy whose connection class is `sqlproxy` and whose server
   is the literal `localhost` — an internal Tableau address, not an endpoint anything can reach. When
@@ -175,6 +175,83 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
   a phantom shipping. That count *is* the measurement of the silence.
 
   Suite 5001 → **5008**.
+### Added
+
+- **`tableau-migration` (skill `2.269.0` → `2.270.0`): a capability nobody can find no longer counts
+  as shipped.** The skill carries 50+ scripts, and an agent only ever learns one exists by reading
+  `SKILL.md` or a `resources/*.md` runbook — it never reads a directory listing. So a **runnable**
+  script that no prose mentions is invisible: present, tested, paid for, and never used.
+
+  Not hypothetical. `scripts/pbip_desktop_reload.py` (2.265.0) turns a ~115 s
+  edit → restart → verify cycle into ~1 s, and the very next question asked about it was *"how do I
+  make another session aware of that?"* It **was** in SKILL.md's resource table — and still absent
+  from `fidelity-oracle.md`, which is the page an agent actually lands on when it sits down to do
+  render verification. Being listed is not the same as being findable at the moment of need.
+
+  `fidelity-oracle.md`'s render-verify section now leads with the fast reload, why the packaged CLI
+  appears not to work (`reloadModelDefinition` hard-coded false), and — equally important — what
+  reload does **not** do: no data refresh, no `cache.abf`, and **no substitute for a cold open**,
+  which is the only thing that proves a file opens at all. It also records, as one measurement on
+  one model rather than a new rule, that a definition reload preserved loaded rows
+  (`COUNTROWS` 9,994 before and after), so the refresh-every-iteration rule can be relaxed *with
+  evidence* while a blank frame after a reload still means "not ready", never "the answer".
+
+  `tests/test_capability_discoverability.py` makes it an invariant: every script with a `__main__`
+  and an argument surface must be named in the prose. Internal modules are deliberately exempt —
+  their callers are their documentation, and judging all 52 scripts alike would demand runbooks for
+  14 importables and turn the gate into noise. Four pre-existing undocumented scripts
+  (`geometry_audit`, `polish_layout`, `tmdl_lint`, `workbook_calc_usage`) sit in an explicit debt
+  ledger so the rule lands green and can only fire on something new; a second test stops that ledger
+  going stale or quietly buying back an exemption. Verified red under three injections — a new
+  undocumented script, the render runbook losing its pointer, and the reload runbook dropping a
+  stated limit — each caught by the test named for it.
+
+### Fixed
+
+- **`tableau-migration` (skill `2.268.0` → `2.269.0`): a model that reads from the ORIGINAL AUTHOR'S
+  LAPTOP is no longer reported as `built`.** Found by opening all 34 corpus workbooks in Power BI
+  Desktop and looking at all 98 rendered pages — 13 workbooks had visibly broken pages that every
+  static gate had passed. The largest cluster was four workbooks rendering every page as bare
+  headers under *"Some of the tables have incomplete or no data"*, and interrogating the live model
+  gave the cause in one line:
+
+  ```
+  Could not find a part of the path
+  'C:\Users\bshonk\AppData\Local\Temp\TableauTemp\...\Clipboard_20121219T112939.xls'
+  ```
+
+  A `.twbx` records the upstream file its author originally loaded from. When the bundled payload
+  cannot be read — here a legacy `.tde` extract, which the engine has no reader for — the emitter
+  falls back to that recorded path. `0071_numerical_dates` shipped pointing at a stranger's **temp
+  folder from 2012**; `0084_rounding_minutes_to_quarters` at their **desktop**. Both models open,
+  "refresh" to zero rows, render every visual empty — and the pipeline called both plain `built`,
+  with no warning of any kind.
+
+  Nothing static could have seen it: the M is syntactically perfect and the TMDL is valid. The path
+  is wrong only relative to a filesystem, which no schema knows about. The contrast that makes the
+  gap precise: `0083_previous_workday` reaches the SAME blank pages by a different route (an
+  unfinished `TODO` partition stub) and **is** honestly reported. The defect was never the dead
+  path — it was the silence.
+
+  `openability_gate` grows `local_source_paths`, which fails definition-of-done when a partition
+  reads a path under another user's profile. Whether a path is FOREIGN is decidable from the text
+  alone, so the gate stays hermetic and the verdict travels with the model; whether it EXISTS needs
+  a filesystem and is left to the caller. Conservative in both directions — a plain data folder is
+  never judged, `Public`/`Default` are not accounts, and the current user's own profile is fine
+  (case-insensitively). Also fixes the diagnosis wording: a dead path makes a model **"open but load
+  NO DATA"**, not "not openable", and telling a reader the wrong one sends them hunting a corruption
+  that isn't there.
+
+  Corpus: flags exactly the 2 affected workbooks out of 34, 0 false positives. A/B over all 1612
+  emitted files — 3 changed, all three the summary/manifest carrying the new diagnostic.
+
+  **Instrument note (this one invalidates an earlier claim's evidence, not its conclusion).** The
+  corpus differ used `os.walk` on a bare Windows path, which SILENTLY STOPS DESCENDING past
+  MAX_PATH — no error, the tree just looks smaller. Two byte-identical builds reported 1470 vs 1579
+  files purely because their output roots differed by ONE CHARACTER. So the "all 1470 files" quoted
+  for 2.267.0 and 2.268.0 was really **1470 of 1612 (91%)**; re-run with a long-path-safe walk, both
+  conclusions are unchanged. This is the second form of this hole in the same tool — the first was
+  *reading* a long path, fixed one release earlier, and fixing the read did nothing for the walk.
 
 - **`tableau-migration` (skill `2.267.0` → `2.268.0`): a rebuilt Salesforce model no longer refuses
   to OPEN with "ambiguous paths".** Reported from the field as a Power BI Desktop frown: *"There's a
