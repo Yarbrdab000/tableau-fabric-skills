@@ -12,6 +12,37 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ## [Unreleased]
 
+### Added
+
+- **`tableau-migration` (skill `2.269.0` → `2.270.0`): a capability nobody can find no longer counts
+  as shipped.** The skill carries 50+ scripts, and an agent only ever learns one exists by reading
+  `SKILL.md` or a `resources/*.md` runbook — it never reads a directory listing. So a **runnable**
+  script that no prose mentions is invisible: present, tested, paid for, and never used.
+
+  Not hypothetical. `scripts/pbip_desktop_reload.py` (2.265.0) turns a ~115 s
+  edit → restart → verify cycle into ~1 s, and the very next question asked about it was *"how do I
+  make another session aware of that?"* It **was** in SKILL.md's resource table — and still absent
+  from `fidelity-oracle.md`, which is the page an agent actually lands on when it sits down to do
+  render verification. Being listed is not the same as being findable at the moment of need.
+
+  `fidelity-oracle.md`'s render-verify section now leads with the fast reload, why the packaged CLI
+  appears not to work (`reloadModelDefinition` hard-coded false), and — equally important — what
+  reload does **not** do: no data refresh, no `cache.abf`, and **no substitute for a cold open**,
+  which is the only thing that proves a file opens at all. It also records, as one measurement on
+  one model rather than a new rule, that a definition reload preserved loaded rows
+  (`COUNTROWS` 9,994 before and after), so the refresh-every-iteration rule can be relaxed *with
+  evidence* while a blank frame after a reload still means "not ready", never "the answer".
+
+  `tests/test_capability_discoverability.py` makes it an invariant: every script with a `__main__`
+  and an argument surface must be named in the prose. Internal modules are deliberately exempt —
+  their callers are their documentation, and judging all 52 scripts alike would demand runbooks for
+  14 importables and turn the gate into noise. Four pre-existing undocumented scripts
+  (`geometry_audit`, `polish_layout`, `tmdl_lint`, `workbook_calc_usage`) sit in an explicit debt
+  ledger so the rule lands green and can only fire on something new; a second test stops that ledger
+  going stale or quietly buying back an exemption. Verified red under three injections — a new
+  undocumented script, the render runbook losing its pointer, and the reload runbook dropping a
+  stated limit — each caught by the test named for it.
+
 ### Fixed
 
 - **`tableau-migration` (skill `2.268.0` → `2.269.0`): a model that reads from the ORIGINAL AUTHOR'S
