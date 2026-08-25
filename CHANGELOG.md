@@ -14,6 +14,43 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ### Fixed
 
+- **`tableau-migration` (skill `2.300.0` → `2.301.0`): a comment shipped in `2.300.0` asserted
+  something measurably FALSE about why a formula table calc stubs, and the correction reframes when
+  the Visual-Calculation route is the right one.** The claim was that a formula-authored table calc
+  "carries NO addressing/partitioning intent (that lives on the worksheet)". Measured across all 34
+  corpus workbooks, over the 46 formula (`kind='field'`) usages: `ordering_type` is populated on
+  **46/46** and the rows/cols shelf layout on **46/46** — `has NEITHER: 0/46`. Both sources the
+  Tier-1 guidance names are already parsed onto every usage. `translation_router` scopes
+  `missing_addressing_intent` to what the bare **`.tds`** cannot carry, not to what is unknowable,
+  and the guidance for that category says to recover the addressing from the `.twb` and emit windowed
+  model DAX (`RANKX` over the partition, `COUNTROWS`/`RANKX` over `ALLSELECTED`, `OFFSET`).
+
+  The false version is the dangerous kind: it explains the stub, it reads as a principled refusal,
+  and nothing else in the tree contradicted it. It is now **pinned by a test** rather than only
+  corrected in prose.
+
+  The real reason the axis is a faithful substitute is narrower and still holds: a Visual Calculation
+  runs over the visual's result matrix in DISPLAY order, so the axis reproduces that worksheet's
+  addressing *structurally* rather than by inference, and stays correct when the user re-sorts — which
+  a baked model `ORDERBY` does not.
+
+  That advantage is also the limit, and the limit is now documented at both seams with the two
+  measured cases the route **cannot** serve:
+
+  * **a reference line / band.** Corpus 0088 carries **17** `<reference-line>` elements whose bounds
+    *are* these calcs (`WINDOW_MAX([Count of Engagements]) * 1.2` is a band's upper bound). A
+    reference line is not a projection, so this path correctly declines with *"displayed calc is not
+    the shown value"*. Those need model-level windowed DAX.
+  * **a model measure that references the calc.** Corpus 0074's
+    `Outliers = SUM([Sales]) < [Upper] AND SUM([Sales]) > [Lower]` is a model measure over the two
+    band calcs. DAX cannot reference a Visual Calculation, so rebuilding the bands on the view side
+    makes them render while leaving `Outliers = BLANK()` unresolvable **by that route**.
+
+  Corrects the record on a related claim too: 0088's stubs are not visually consumed **today** (the
+  emitted PBIR mentions those measure names in 0 of 174 JSON files — reference-line rebuild is an
+  unbuilt feature), which makes them *latent*, not irrelevant. Prose, comments and one new test only;
+  no behaviour change, and the corpus artifacts are unchanged from `2.300.0`.
+
 - **`tableau-migration` (skill `2.275.0` → `2.300.0`): a formula-authored table calc no longer ships
   as an inert `BLANK()` stub — it rebuilds as a Power BI **Visual Calculation**.** Corpus 0074's
   control chart projected `Upper` and `Lower`, both `= BLANK()`: the report validated clean, `pbir_lint`

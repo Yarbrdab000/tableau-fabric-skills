@@ -9160,15 +9160,22 @@ def _view_only_field_chain_index(table_calc_usages):
         over ``composit = RUNNING_SUM(...)``), which rebuilds as nested Visual Calculations;
       * a **single-level** formula table calc (``WINDOW_AVG(SUM([Sales]))``), which rebuilds as one.
 
-    Single-level usages were previously excluded and left to the model-measure path. That was the
-    wrong seam for them: a formula-authored table calc carries NO addressing/partitioning intent
-    (that lives on the worksheet), so the model path correctly refuses it as
-    ``missing_addressing_intent`` and emits an inert ``BLANK()`` stub -- structurally valid, and the
-    chart renders EMPTY. A Visual Calculation takes its partition from the visual, which is exactly
-    the intent Tableau evaluated. Admission is only a candidacy test: the compiler still fails closed
-    on anything outside its faithful subset, and the emitter still declines unless the calc is the
-    visual's shown value, so a calc the model DID translate keeps its measure whenever this path
-    cannot faithfully replace it.
+    Single-level usages were previously excluded and left to the model-measure path, where they
+    emitted an inert ``BLANK()`` stub -- structurally valid, and the chart rendered EMPTY. They are
+    admitted here because a Visual Calculation runs over the visual's result matrix in DISPLAY
+    order, so the axis reproduces that worksheet's addressing structurally and stays correct when
+    the user re-sorts.
+
+    This is NOT because the addressing is unknowable. Measured corpus-wide, ``ordering_type`` is
+    populated on 46/46 formula usages and the rows/cols shelf layout on 46/46;
+    ``translation_router`` scopes ``missing_addressing_intent`` to what the bare ``.tds`` cannot
+    carry, and the Tier-1 guidance prescribes recovering it from the ``.twb`` and emitting windowed
+    MODEL DAX. That route is the complement of this one and is required wherever the calc is not a
+    shown projection -- a reference-line bound, or a model measure that references the calc (see
+    :func:`formula_table_calc_to_visual_calc.compile_chain`).
+
+    Admission here is only a candidacy test: the compiler still fails closed on anything outside its
+    faithful subset, and the emitter still declines unless the calc is the visual's shown value.
 
     Returns ``{worksheet_name: [usage, ...]}`` -- an empty dict for ``None`` / nothing, so every
     existing caller stays byte-identical.

@@ -7566,8 +7566,8 @@ def test_nested_formula_chain_blend_secondary_base_routes_to_review():
 
 def test_single_level_formula_table_calc_now_takes_the_visual_calc_path():
     # A single-level formula table calc (references no other calc) is admitted alongside the nested
-    # chains. The model path cannot supply its addressing intent, so leaving it there produced an
-    # inert BLANK() stub and an EMPTY chart; a Visual Calculation takes the partition from the visual.
+    # chains. The model tier works from the .tds and stubbed it to an inert BLANK(), so the chart
+    # rendered EMPTY; a Visual Calculation's axis reproduces the worksheet's addressing structurally.
     usage = _TCU(
         worksheet="Sheet1", instance="[i]", column="Calculation_x", caption="Run Sales",
         kind="field", formula="RUNNING_SUM(SUM([Sales]))",

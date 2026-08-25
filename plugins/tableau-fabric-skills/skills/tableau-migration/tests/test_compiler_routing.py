@@ -30,7 +30,7 @@ from twb_to_pbir import (
     _resolved_value_fields,
     _view_only_field_chain_index,
 )
-from workbook_table_calcs import Pill, TableCalcUsage
+from workbook_table_calcs import Pill, TableCalcUsage, extract_table_calc_usages
 from storage_mode import select_storage_mode
 from table_calc_to_dax import translate_table_calc_usage
 
@@ -377,11 +377,48 @@ def test_chain_index_includes_a_nested_calc_reference_chain():
     assert "Sheet3" in idx and len(idx["Sheet3"]) == 1
 
 
+def test_formula_table_calc_usages_do_carry_worksheet_addressing():
+    """The addressing a formula-authored table calc needs IS recovered from the .twb.
+
+    A comment shipped in 2.300.0 asserted the opposite -- that such a calc "carries NO
+    addressing/partitioning intent". Measured across all 34 corpus workbooks that is false:
+    ``ordering_type`` is populated on 46/46 formula usages and the rows/cols shelf on 46/46.
+    ``missing_addressing_intent`` is scoped to what the bare ``.tds`` cannot carry, which is why the
+    Tier-1 guidance says to recover it from worksheet context rather than to give up.
+
+    Pinned here because the false version is the *plausible* one: it explains the stub, it sounds
+    like a principled refusal, and nothing else in the tree contradicts it. This asserts on the
+    extractor's own output so it holds without the corpus.
+    """
+    xml = """<workbook><worksheets><worksheet name='S'><table>
+      <view>
+        <datasource-dependencies datasource='ds'>
+          <column caption='Run Sales' datatype='real' name='[Calculation_x]' role='measure'>
+            <calculation class='tableau' formula='RUNNING_SUM(SUM([Sales]))' />
+          </column>
+          <column-instance column='[Calculation_x]' derivation='None'
+                           name='[usr:Calculation_x:qk]' pivot='key' type='quantitative'>
+            <table-calc ordering-type='Rows' />
+          </column-instance>
+          <column-instance column='[Order Date]' derivation='Year'
+                           name='[yr:Order Date:ok]' pivot='key' type='ordinal' />
+        </datasource-dependencies>
+      </view>
+      <rows>[ds].[usr:Calculation_x:qk]</rows>
+      <cols>[ds].[yr:Order Date:ok]</cols>
+    </table></worksheet></worksheets></workbook>"""
+    usages = [u for u in extract_table_calc_usages(xml) if getattr(u, "kind", None) == "field"]
+    assert usages, "the probe must actually find a formula usage before it can prove anything"
+    u = usages[0]
+    assert u.ordering_type == "Rows"
+    assert u.rows and u.cols          # the shelf layout the guidance names is carried too
+
+
 def test_chain_index_includes_single_level_formula_table_calc():
-    # A single-level formula table calc now takes the Visual-Calculation path too: the model path
-    # cannot give it addressing intent (that lives on the worksheet), so it emitted an inert
-    # BLANK() stub and the chart rendered EMPTY. Admission is candidacy only -- the compiler and the
-    # shown-value guard still decide.
+    # A single-level formula table calc now takes the Visual-Calculation path too. The model tier
+    # works from the .tds and stubbed it to BLANK(), so the chart rendered EMPTY; the visual's axis
+    # reproduces the worksheet's addressing structurally. Admission is candidacy only -- the compiler
+    # and the shown-value guard still decide.
     u = _field_usage("S", _CID_A, "Run Sales", "RUNNING_SUM(SUM([Sales]))",
                      {_CID_A: "RUNNING_SUM(SUM([Sales]))"}, {_CID_A: "Run Sales"})
     assert list(_view_only_field_chain_index([u])) == ["S"]
