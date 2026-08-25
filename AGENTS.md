@@ -126,6 +126,12 @@ not mirrored.
   shipped set, or read branches rather than tags — and note that the integrator wrote the anchor
   rule ("an anchor tells you a version is CLAIMED, never that it is unlanded") and then built a
   ledger on exactly the surface it warns about.
+- **A glob is a scope decision, and it stops covering the tip silently.** My blast-radius probe
+  filtered anchors with `rollback/pre-v2.2[6789]*` — correct when 2.29x was the top of the range, and
+  it does not match `2.30x` **at all**. So the worst anchor in the repo was never examined and the
+  probe confidently reported a maximum of 5 where the true figure was 12. It did not error, skip, or
+  warn; it answered a narrower question than the one asked. Print how many items a filter admitted,
+  and the highest one, so a range that has outgrown its pattern announces itself.
 - **Re-derive the SCOPE, not just the arithmetic.** Inheriting someone else's *question* is the same
   defect as inheriting their answer, and far harder to see, because the work you did was genuinely
   correct. Measured: one session correctly refused a reported figure and re-measured it from the
@@ -225,14 +231,24 @@ anchor to revert a bad release). Do all three, every time:
    this is a fact about **topology**. Necessary, insufficient — the same shape as a match-count
    assertion catching 1 of 7 corrupted captures.
 
-   **Re-pointing helps and does not solve it — measured, because the obvious fix looked complete.**
-   Re-pointing five anchors at the release commit of their declared predecessor (which is what the
-   anchor-predecessor gate demands) moved the worst case from **8 extra releases to 5**, and took one
-   anchor to **0**. It did not reach zero anywhere else, because **a release commit is itself on a
-   lane**: `pre-v2.293.0` now points at the dispatcher lane's 2.292.0 commit, which never contained
-   the colour lane's 2.269.0/2.270.0. Satisfying a gate about version *stamps* cannot fix a defect
-   about *reachability*. A complete fix would anchor at the integration line's own commit for that
-   version, not at the lane's.
+   **Re-pointing helps, does not solve it, and can make it WORSE — measured, because the obvious fix
+   looked complete.** Re-pointing five anchors at the release commit of their declared predecessor
+   (which is what the anchor-predecessor gate demands) moved the worst case from **8 extra releases to
+   5, measured at `1d9e389`**. Date any number here: it moves whenever any lane cuts an anchor or
+   ships, and this one was **false 117 seconds later** — invalidated by the very next action of the
+   person who measured it, cutting `pre-v2.302.0`. At the time of writing the worst case is **12**.
+
+   The reason it can worsen: **a release commit is itself on a lane.** Satisfying the gate re-points
+   an anchor at whichever lane produced its predecessor, which may be *further* from the integration
+   line than where it started. `pre-v2.302.0` moved from an integration-line commit to the table-calc
+   lane's 2.301.0 commit and went from ~0 to 12. **The anchor-predecessor gate (a claim about version
+   stamps) and the over-discard property (a claim about reachability) are not merely different — they
+   can pull in opposite directions.** Satisfying one is not evidence about the other. A complete fix
+   anchors at the integration line's own commit for that version, not the lane's.
+
+   The over-discard metric counts only releases numbered **below** the anchor's own name: `pre-vX`
+   legitimately discards X and everything after it — that is what rolling back means — so only a
+   lower-numbered casualty is a defect. Counting all of them inflates the figure and was wrong twice.
 
    **The over-discard count is worth keeping as a METRIC, not just a hazard.** An anchor's extra count
    is exactly *how much other-lane work merged since that lane forked* — a direct read on
