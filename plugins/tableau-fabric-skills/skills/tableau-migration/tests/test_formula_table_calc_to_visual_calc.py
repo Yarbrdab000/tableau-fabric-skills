@@ -9,7 +9,8 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "scripts"))
 
-from formula_table_calc_to_visual_calc import compile_chain, compile_expression  # noqa: E402
+from formula_table_calc_to_visual_calc import (  # noqa: E402
+    compile_chain, compile_expression, formula_is_table_calc)
 
 
 # -- resolver stubs -----------------------------------------------------------
@@ -249,19 +250,64 @@ def test_total_of_an_unresolvable_reference_falls_back():
 
 
 # -- the semantic line COLLAPSEALL must NOT be pushed across ---------------------------------------
-def test_window_family_is_still_unsupported_and_never_becomes_collapseall():
+def test_window_family_has_its_own_form_and_never_becomes_collapseall():
     """COLLAPSEALL is total-level RE-EVALUATION; the WINDOW_* family is per-mark aggregation.
 
     They coincide for SUM but diverge for a non-additive inner (Tableau's TOTAL(AVG([x])) averages
     all underlying rows; WINDOW_AVG(AVG([x])) averages the per-mark averages). Mapping a WINDOW_*
-    head to COLLAPSEALL would therefore ship silently wrong numbers, so the window family must keep
-    failing closed until it earns its own verified form.
+    head to COLLAPSEALL would therefore ship silently wrong numbers.
+
+    The window family now HAS its own verified form -- ``<X>(WINDOW(1, ABS, -1, ABS, axis), base)``,
+    the model seam's certified whole-partition frame transposed to the visual-calc dialect -- so this
+    asserts that form positively while keeping the COLLAPSEALL line exactly where it was.
     """
-    for formula in ("WINDOW_MAX(SUM([Sales]))", "WINDOW_SUM(SUM([Sales]))",
-                    "WINDOW_AVG(SUM([Sales]))", "WINDOW_MAX([Some Calc]) * 1.2"):
+    cases = {
+        "WINDOW_MAX(SUM([Sales]))": "MAXX(WINDOW(1, ABS, -1, ABS, ROWS), [Sum of Sales])",
+        "WINDOW_SUM(SUM([Sales]))": "SUMX(WINDOW(1, ABS, -1, ABS, ROWS), [Sum of Sales])",
+        "WINDOW_AVG(SUM([Sales]))": "AVERAGEX(WINDOW(1, ABS, -1, ABS, ROWS), [Sum of Sales])",
+        "WINDOW_STDEV(SUM([Sales]))": "STDEVX.S(WINDOW(1, ABS, -1, ABS, ROWS), [Sum of Sales])",
+        "WINDOW_MAX([Some Calc]) * 1.2":
+            "MAXX(WINDOW(1, ABS, -1, ABS, ROWS), [Some Calc]) * 1.2",
+    }
+    for formula, expected in cases.items():
         expr, _, reason = compile_expression(
             formula, axis="ROWS", resolve_aggregate=_agg_primary,
             resolve_reference=lambda n, ds: ("calc", "Some Calc"))
-        assert expr is None, formula
+        assert reason is None, formula
+        assert expr == expected, formula
         assert "COLLAPSEALL" not in (expr or ""), formula
-        assert reason
+
+
+def test_window_moving_and_multi_argument_forms_still_fail_closed():
+    """Only the WHOLE-PARTITION window form is certified; bounds / extra args keep failing closed.
+
+    A moving frame (``WINDOW_AVG(x, -2, 0)``) and the two-argument heads (``WINDOW_PERCENTILE``,
+    ``WINDOW_CORR``) are outside the transposed model mapping, so they must still route to review
+    rather than silently collapse to the whole-partition frame.
+    """
+    for formula in ("WINDOW_AVG(SUM([Sales]), -2, 0)",
+                    "WINDOW_PERCENTILE(SUM([Sales]), 0.9)",
+                    "WINDOW_CORR(SUM([Sales]), SUM([Profit]))"):
+        expr, _, reason = compile_expression(
+            formula, axis="ROWS", resolve_aggregate=_agg_primary,
+            resolve_reference=lambda n, ds: None)
+        assert expr is None, formula
+        assert reason, formula
+
+
+def test_table_calc_detector_covers_the_canonical_formula_head_catalog():
+    """``formula_is_table_calc`` must recognise every head ``table_calc_to_dax`` catalogs.
+
+    The two vocabularies are maintained apart, and a head missing HERE is the dangerous direction:
+    a real table calc would be mistaken for an ordinary calc and bound to a model measure instead of
+    rebuilding as a nested Visual Calculation.
+    """
+    from table_calc_to_dax import _FORMULA_INTENT
+
+    for head, _intent in _FORMULA_INTENT:
+        probe = head + ("SUM" if head.endswith("_") else "") + "(SUM([Sales]))"
+        assert formula_is_table_calc(probe), probe
+    assert not formula_is_table_calc("COUNTD(IF [Status] = \"Closed\" THEN [Case ID] END)")
+    assert not formula_is_table_calc("SUM([Profit]) / SUM([Sales])")
+    assert not formula_is_table_calc("")
+    assert not formula_is_table_calc(None)

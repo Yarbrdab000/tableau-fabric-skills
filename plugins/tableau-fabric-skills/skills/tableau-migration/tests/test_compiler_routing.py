@@ -377,9 +377,21 @@ def test_chain_index_includes_a_nested_calc_reference_chain():
     assert "Sheet3" in idx and len(idx["Sheet3"]) == 1
 
 
-def test_chain_index_excludes_single_level_formula_calc():
+def test_chain_index_includes_single_level_formula_table_calc():
+    # A single-level formula table calc now takes the Visual-Calculation path too: the model path
+    # cannot give it addressing intent (that lives on the worksheet), so it emitted an inert
+    # BLANK() stub and the chart rendered EMPTY. Admission is candidacy only -- the compiler and the
+    # shown-value guard still decide.
     u = _field_usage("S", _CID_A, "Run Sales", "RUNNING_SUM(SUM([Sales]))",
                      {_CID_A: "RUNNING_SUM(SUM([Sales]))"}, {_CID_A: "Run Sales"})
+    assert list(_view_only_field_chain_index([u])) == ["S"]
+
+
+def test_chain_index_excludes_a_field_calc_that_is_not_a_table_calc():
+    # The widening is scoped to TABLE calcs. An ordinary calculated field stays off the path, so the
+    # measure seam keeps owning it exactly as before.
+    u = _field_usage("S", _CID_A, "Profit Ratio", "SUM([Profit]) / SUM([Sales])",
+                     {_CID_A: "SUM([Profit]) / SUM([Sales])"}, {_CID_A: "Profit Ratio"})
     assert _view_only_field_chain_index([u]) == {}
 
 
