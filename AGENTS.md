@@ -691,6 +691,40 @@ So, for any gate whose verdict is recorded at one stage and read at another:
 Put beside the absence rule, the pair is: **an absence claim is only as good as the instrument's
 scope, and a positive result is only as good as the instrument having been consulted.**
 
+### Beware a repair whose completion signal is the damage it causes
+
+The hardest failure recorded here is not a true statement doing false work. It is a **fix whose success
+criterion and whose defect are the same observable**.
+
+`nativeQueryRef` (a projection's user-facing label) and `field.Measure.Property` (the measure it
+actually evaluates) disagree on 55 projections across 39 visuals in one corpus workbook. That reads
+exactly like a bug, and the obvious repair is to make them agree by rebinding the projection to the
+base measure. Three sessions independently reasoned toward it.
+
+**It would have been a silent data-correctness regression.** The divergence is deliberate:
+`migrate_estate._apply_row_predicate_wrapped_measures` points the projection at a
+`CALCULATE(<base>, FILTER(...))` wrapper standing in for a Tableau row-level boolean keep, and leaves
+the label as the original Tableau name on purpose. Measured: **35 of 35 wrapper measures contain a
+`FILTER(`** — unanimous, not typical. Rebinding to the base drops a live date-window predicate every
+single time, and every number on the page changes.
+
+And the report would have looked **more** correct afterwards, because the labels would finally agree.
+**Checking the result cannot catch this**, because the result is the intended one. Only checking what
+the construct is *for* can.
+
+What actually settled it, in order of decisiveness:
+
+1. **Read the code at the site of the change**, not near it. The rationale was in a comment two lines
+   above the rewrite, and in `_wrapper_measure_name`'s docstring. Several passes over that file for
+   other reasons never read it.
+2. **Ask what the artifact would lose**, not whether it looks wrong. `35/35 carry a FILTER(` is a
+   one-command question and it ends the argument.
+3. **Date the claim.** The comment asserting the labels "can never disagree" was added 38 releases
+   *after* the code that makes them disagree — answerable from `git log -S` alone, with no build.
+
+Generalised: **a measurement of an artifact cannot tell you the intent of the code that produced it.**
+Before "fixing" a systematic divergence, establish that it is not a contract.
+
 ## Commits
 
 - Make the **user** the commit author, and append the trailer:
