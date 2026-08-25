@@ -14,6 +14,41 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ### Fixed
 
+- **`tableau-migration` (skill `2.297.0` → `2.298.0`): the measurement-side gotchas section had a wrong
+  count — in the section about wrong counts (docs-only).** 2.296.0 said the uppercase-only triage regex
+  corrupted **five** entries. Re-derived over the whole population it is **seven**, and the third
+  failure mode is worse than either recorded:
+
+  ```
+  VANISHED  'unsupported function size'   -> [A-Z_]+ matches nothing         1
+  MANGLED   'unsupported function Total'  -> captures 'T'                    4
+            'unsupported function Sales'  -> captures 'S'  ┐ merged into one
+            'unsupported function Stage'  -> captures 'S'  ┘ bogus bucket    2
+  ```
+
+  `Sales` and `Stage` **collapse into a single category `S` that never existed in the source**,
+  carrying a wholly plausible count of `2`. So the tally does not merely lose or mis-file rows — it
+  **fabricates a category**, and anyone auditing the breakdown would be checking a name the instrument
+  invented. Of the seven corruptions, a match-count assertion catches exactly **one**; the rule as
+  first written was necessary and badly insufficient.
+
+  Two rules added, both earned by this correction:
+
+  * **Validate the captures, not just the match count** — assert each capture round-trips to a value
+    the source could actually have produced.
+  * **A corpus count must cite the engine version it was measured at**, or it is a claim with a hidden
+    expiry date. The same query returns 71 needs-review calcs at 2.275.0 and 69 at 2.291.0; the delta
+    is two calcs a release *fixed*. The existing corpus figure in this section is now dated.
+
+  And the meta-rule this correction is itself an instance of: **re-derive the SCOPE, not just the
+  arithmetic.** 2.296.0 correctly refused a reported “25 vs 30” and re-measured it — but re-measured
+  only the two function names the report happened to mention, so it got the arithmetic right and the
+  answer wrong. Inheriting someone else's *question* is the same defect as inheriting their answer,
+  and far harder to see, because the work you did was correct. The verifier for this release derives
+  over the whole population and names nothing in advance.
+
+### Fixed
+
 - **`tableau-migration` (skill `2.296.0` → `2.297.0`): the corrected `blocked_by` figure now names the
   PREDICATE it counts, and a test pins it there.** 2.292.0 corrected “8 of the 11” to “9 of the 11” in
   the prose and the CHANGELOG but left the same wrong figure in `_unmigrated_dependency_index`'s
