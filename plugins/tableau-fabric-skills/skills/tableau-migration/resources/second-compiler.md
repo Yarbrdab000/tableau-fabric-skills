@@ -67,7 +67,8 @@ writing DAX into `approved_dax.json`.
                               translation_router.classify_fallback(reason, role, fields)
                                                                │  category + guidance
                                                                ▼
-                         report["translation_handoff"] = { summary, needs_review, requests[] }
+                         report["translation_handoff"] = { summary, needs_review, requests[],
+                                                           triage, partial_fidelity[] }
                                                                │
                          ┌──────────────────────── Tier 1 (agent-as-second-compiler) ───────────────────┐
                          │  1. read request (category, guidance, formula, fields, target grain)          │
@@ -135,12 +136,15 @@ land a guess — the validation gate below is what enforces that, in place of a 
       "model_object_parameter": 1,
       "missing_outer_aggregation": 1,
       "dax_language_gap": 1
-    }
+    },
+    "partial_fidelity": 1,                // translated, but not for every input (see below)
+    "blocked_by_unmigrated_calc": 2       // how many stubs are waiting on ANOTHER stub
   },
   "needs_review": [                        // concise list for the check-in prompt
     { "name": "Running Sales", "role": "measure",
       "fallback_reason": "unsupported function RUNNING_SUM",
-      "category": "missing_addressing_intent", "has_suggestion": false }
+      "category": "missing_addressing_intent", "has_suggestion": false,
+      "blocked_by": [] }
   ],
   "requests": [                            // one structured record per needs-review calc
     {
@@ -154,11 +158,50 @@ land a guess — the validation gate below is what enforces that, in place of a 
       "fallback_reason": "unsupported function RUNNING_SUM",
       "category": "missing_addressing_intent",
       "category_guidance": "This is a table calculation whose partition/order/scope …",
+      "blocked_by": [],                    // referenced calcs that are THEMSELVES needs-review
       "has_suggestion": false              // + "suggestion": {pattern, dax, …} when the idiom registry matched
     }
+  ],
+  "triage": { "irreducible": {…}, "cascadable": […], "summary": {…} },
+  "partial_fidelity": [                    // live objects that do not answer for every input
+    { "name": "Selected Metric", "role": "measure", "kind": "parameter_dispatcher",
+      "live_branches": ["1", "3"],
+      "blank_branches": [ { "branch": "2", "measure": "Unmigrated LOD", "reason": "…" } ],
+      "dropped_branches": [] }
   ]
 }
 ```
+
+> ### Two ways this manifest will mislead you if you read only part of it
+>
+> **1. `needs_review` is a SUMMARY. The actionable payload is in `requests`.**
+> `category_guidance`, `fields`, `formula` and `target_table` exist **only** on `requests`. A reader
+> who greps `needs_review` for guidance finds nothing and concludes the engine shipped none — it
+> shipped 547 characters of routing advice, on a sibling list. Join the two on `name` + `role`, or
+> just work `requests` and use `needs_review` for the check-in prompt it is named for.
+>
+> **2. `fallback_reason` on a CASCADE describes the dependency, not this calc. Read `blocked_by`.**
+> When a calc falls back only because a calc it *references* is unmigrated, it reports the
+> **dependency's** translator error as its own. A parameter dispatcher pointing at an unmigrated LOD
+> reports `bare row-level field [..] not valid in a measure` while containing no row-level field at
+> all. Triage that reason literally and you go hunting inside a measure that has no such problem,
+> while the actually-broken calc is never named.
+>
+> `blocked_by` is what names it: `[{caption, name, role}]`, the referenced calcs that are themselves
+> needs-review. Follow it to the root before authoring anything — on the corpus these chain several
+> deep (`Avg Days Participation same as Goal ●` → `Avg. Days Participation vs Goal` →
+> `Avg. Days Participation`, whose real reason is `MAX(expr) must reference exactly one table`).
+> **Authoring DAX for a calc with a non-empty `blocked_by` is almost always wasted work** — fix its
+> root and the native `measure_refs` cascade usually resolves the dependents for free.
+>
+> Measured on the 34-workbook corpus: 13 of 69 needs-review calcs carry a non-empty `blocked_by`,
+> and within the single largest reason class — the 11 reporting `bare row-level field [..]` — **9 of
+> the 11 are dependents and only 2 are roots.** So **ranking stub classes by raw `fallback_reason`
+> count measures leaves, not work.** Count roots.
+>
+> `blocked_by` states a fact (*these references are also unmigrated*), never the prediction *"this
+> would translate once they are fixed"*. That prediction is `triage`'s job and it is separately
+> fallible — see the caution under *Triage* below.
 
 `fields[].kind` is one of `field` (resolved to `table`/`column`/`type`), `calc` (a reference to
 another calculated field, with its `references_formula`), `parameter` (`[Parameters].[X]`), or
@@ -174,6 +217,45 @@ have to re-parse the formula to discover its inputs.
 > *"Column 'State/Province' in table 'Orders' cannot be found."* Authoring against the resolved
 > `column` — `'Orders'[State_Province]` — binds correctly. `fields[].caption` is for *reading* the
 > original formula; `fields[].table` / `fields[].column` are what you *emit*.
+
+---
+
+## Triage — which few calcs are the roots, and why you must not trust it blindly
+
+`translation_handoff["triage"]` splits the needs-review set into `irreducible` keystones (grouped by
+rough `shape`) and `cascadable` dependents. Its purpose is effort targeting: author the few roots,
+and the engine's native `measure_refs` cascade resolves the dependents on a later pass for free.
+
+It reaches that verdict by **re-translating each stub with an optimistic seed** — every known calc
+name assumed already translated. That re-translation uses the **single global field resolver**, while
+the build itself uses a **per-calc, island-scoped, sibling-anchoring** resolver. On a
+**multi-datasource workbook** those disagree: a caption that only resolves inside its own island
+fails under the global resolver, so a calc that is genuinely a *cascade* can be reported
+**`irreducible`**. Measured on corpus `0088_salesforce_nonprofit_case_mgmt` (four datasources): the
+parameter dispatcher `Select Metric` was classified `irreducible` when its only real problem was an
+unmigrated dependency.
+
+**So: use `triage` to prioritise, never as ground truth, and never on a multi-datasource workbook.**
+When you need certainty about *why* a calc failed, derive it from the report rows —
+`blocked_by` above is computed that way precisely so it cannot inherit this. Where the two disagree,
+they are usually both right about different things: a calc can reference an unmigrated dependency
+*and* carry its own irreducible construct.
+
+---
+
+## Partial fidelity — live objects that do not answer for every input
+
+`translation_handoff["partial_fidelity"]` lists calcs that **did** translate but not at full
+fidelity — today, parameter dispatchers rebuilt from the branches that could be translated.
+
+These need their own heading because they are invisible everywhere else: a partially rebuilt
+dispatcher counts as **translated**, so it does **not** appear in `needs_review`, and its measure
+binds, lints and validates clean. Only the selections listed in `blank_branches` render empty. Each
+names the sibling measure it is waiting on — fix that sibling and the branch heals with no further
+change to the dispatcher.
+
+Do not "fix" a `partial_fidelity` entry by authoring DAX for the dispatcher itself. Author the
+calc named in `blank_branches[].measure`.
 
 ---
 
@@ -309,13 +391,19 @@ call Python. You author a JSON file and re-run the same command with `--approved
    **Read `report.json` by its exact path (`$RUN\out\report.json`) — do not *search* for it or its stub
    requests:** the run folder is outside the editor workspace and git-ignored, so a workspace/code
    search returns *"No matches"* and you spin. Every field above already lives inside this one file.
-2. **Author the DAX** for each one you can, per its category playbook above. Write column refs as
+2. **Order the work by `blocked_by` — roots first.** Partition the requests into those with an empty
+   `blocked_by` (roots) and those without (dependents), and author **only the roots** in this pass.
+   A dependent's `fallback_reason` describes its *dependency*, so authoring against it means writing
+   DAX for a problem the calc does not have; and once the root lands, the native `measure_refs`
+   cascade usually resolves the dependent with no DAX from you at all. Re-run and re-read the report
+   before touching anything that was blocked — the list will be shorter than you expect.
+3. **Author the DAX** for each one you can, per its category playbook above. Write column refs as
    **resolved MODEL identifiers** — `'Table'[Column_Sanitized]`, the sanitized names in the built
    model — never Tableau captions like `[Sales]`.
-3. **Gate every candidate:** `check_candidate_dax(dax, request=req)` must return `ok: True`. When
+4. **Gate every candidate:** `check_candidate_dax(dax, request=req)` must return `ok: True`. When
    data is landed, also reconcile against the oracle. Fix or drop anything that fails — a stub is an
    acceptable outcome; unvalidated live DAX is not.
-4. **Write `approved_dax.json`** — a single JSON **object** mapping the calc's name to the DAX you
+5. **Write `approved_dax.json`** — a single JSON **object** mapping the calc's name to the DAX you
    authored (name match is case-insensitive). Two accepted value shapes, freely mixed:
 
    ```json
@@ -330,7 +418,7 @@ call Python. You author a JSON file and re-run the same command with `--approved
    The loader is UTF-8-BOM tolerant and **fail-fast**: any other shape (a list, a bare string, a
    non-string `dax`) aborts the run rather than silently dropping an approval. So the file must be an
    object at the top level, nothing else.
-5. **Re-run the same migrate command with `--approved-dax`:**
+6. **Re-run the same migrate command with `--approved-dax`:**
 
    ```text
    py -3.11 "$SKILL\scripts\migrate_estate.py" -i <input> -o <output> --approved-dax approved_dax.json
@@ -340,7 +428,9 @@ call Python. You author a JSON file and re-run the same command with `--approved
    land-into-the-same-bundle pass and is exempt from the stale-output guard (no `--force` needed).
    Each name-matching stub is replaced by a live, audit-stamped object; every other stub stays inert
    with its `TableauFormula` preserved. Re-reading `report.json` afterward confirms
-   `needs_review_total` dropped by exactly the count you landed.
+   `needs_review_total` dropped by **at least** the count you landed — it can drop by more, because
+   every dependent whose `blocked_by` named one of your roots now translates on its own via the
+   native cascade. That over-drop is the expected result of step 2, not an anomaly.
 
 The in-process `migrate_tds_to_semantic_model(..., approved_calc_dax={...})` above and the estate
 `--approved-dax <json>` file are the **same seam** — a `{calc name -> DAX}` mapping — one as a Python

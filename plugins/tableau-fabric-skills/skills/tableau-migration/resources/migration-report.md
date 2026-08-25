@@ -184,6 +184,20 @@ name · role · category · reason · whether a suggestion is ready). Treat that
 second-compiler pass** to the user (see [second-compiler.md](second-compiler.md)); don't hand back a
 model with silent `= 0` stubs.
 
+> **Read a stub's `reason` together with its `blocked_by`, never alone.** When a calc falls back only
+> because a calc it *references* is unmigrated, it reports the **dependency's** error as its own — so
+> the reason describes a different calc, and the broken one is not named by it. Each
+> `needs_review` / `requests` entry therefore also carries `blocked_by`
+> (`[{caption, name, role}]`, the referenced calcs that are themselves needs-review), and
+> `summary.blocked_by_unmigrated_calc` counts them. Follow those to the root before triaging or
+> counting: on the reference corpus 13 of 69 stubs are dependents, and within the largest reason
+> class 9 of 11 are — leaving only 2 roots. Ranking stub classes by raw `reason` counts leaves, not
+> work. See [second-compiler.md](second-compiler.md) § *Two ways this manifest will mislead you*.
+>
+> A calc can also translate **partially** — a parameter dispatcher rebuilt from the branches that
+> worked. Those are live measures, so they are absent from `needs_review` by design; they are listed
+> in `translation_handoff["partial_fidelity"]` with the sibling measure each blank branch awaits.
+
 Likewise, when a table partition's upstream query couldn't be auto-emitted (e.g. custom SQL on a
 connector whose native query isn't yet verified), the build emits a **deploy-valid but incomplete
 scaffold** (an empty typed table) rather than failing or guessing. Those partitions are surfaced

@@ -14,6 +14,42 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ### Fixed
 
+- **`tableau-migration` (skill `2.291.0` → `2.292.0`): the handover prose now tells a reader how to
+  read the stub manifest without being misled by it (docs-only).** 2.291.0 added `blocked_by` so a
+  cascade names the calc that actually failed, but left `fallback_reason` untouched — correctly, since
+  the string is the literal translator error and is pinned by the row-level reroute router's contract.
+  The consequence was that a reader who reads only `fallback_reason` is *still* misdirected; they now
+  have to know to read `blocked_by` too, and nothing told them so.
+
+  Measured while writing it, a second and worse instance of the same adjacency defect: `category_guidance`,
+  `fields`, `formula` and `target_table` ship on `translation_handoff.requests` **only**, never on the
+  concise `needs_review` list. A reader inspecting `needs_review` for routing advice finds none and
+  concludes the engine shipped none — it ships 547 characters of it, on a sibling list. (`guidance` is
+  empty on **0 of 69** requests corpus-wide, not on 30 as reported.)
+
+  [`resources/second-compiler.md`](skills/tableau-migration/resources/second-compiler.md) gains a
+  *“Two ways this manifest will mislead you”* block, an accurate shipped-shape sample (`blocked_by`,
+  `triage`, `partial_fidelity`, `summary.blocked_by_unmigrated_calc`), a **Triage** section recording
+  that triage re-translates with the *global* resolver while the build uses a per-calc island-scoped
+  one — so on a multi-datasource workbook it can call a cascade irreducible — and a **Partial fidelity**
+  section for live-but-incomplete objects that are absent from `needs_review` by design. The estate-CLI
+  loop gains an explicit **“author roots first”** step, and its verification line now reads *at least*
+  the count landed rather than *exactly*, because clearing a root cascades its dependents.
+  [`resources/migration-report.md`](skills/tableau-migration/resources/migration-report.md) and
+  [`SKILL.md`](skills/tableau-migration/SKILL.md) get the short form at their own reader surfaces.
+
+  No code changed. `translation_router.py` was inspected and needed no fix.
+
+### Corrected
+
+- **`tableau-migration`: the 2.291.0 entry below said “8 of the 11”; the correct figure is “9 of the
+  11”.** 8 is the count of entries `triage` independently called cascadable; 9 is the count carrying a
+  non-empty `blocked_by`. Both predicates are real and they differ by one, and the sentence is about
+  `blocked_by`. Caught by a check that re-derives every numeric claim in the prose from the corpus
+  export rather than from the previous sentence. The same wrong figure remains in a code comment in
+  `assemble_model.py` (`_unmigrated_dependency_index`'s summary counter) and is being handed to the
+  session that owns that file rather than edited across an active lane boundary.
+
 - **`tableau-migration` (skill `2.290.0` → `2.291.0`): a stub now names the calc that ACTUALLY failed,
   instead of inheriting its dependency's error (#173 family).** A calc that falls back only because a
   calc it REFERENCES is unmigrated reported the dependency's translator error as its own
@@ -33,8 +69,11 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
   dependency chain is walkable to its root (corpus 0088:
   `Avg Days Participation same as Goal ●` → `Avg. Days Participation vs Goal` →
   `Avg. Days Participation`, the nested LOD). `summary.blocked_by_unmigrated_calc` counts them:
-  **13 of 69** at 2.291.0, and 8 of the 11 entries carrying `bare row-level field [..]` — so ranking
-  that class by raw `fallback_reason` count overstates the work behind it by roughly 4x.
+  **13 of 69** at 2.291.0, and **9 of the 11** entries carrying `bare row-level field [..]` — leaving
+  only 2 roots in that class, so ranking it by raw `fallback_reason` count measures leaves, not work.
+  *(Corrected in 2.292.0: this originally read “8 of the 11”, which was the count of entries `triage`
+  independently called cascadable, not the count carrying a non-empty `blocked_by`. Both predicates
+  are real and they differ by one; the sentence is about `blocked_by`, so 9 is the right number.)*
 
   `blocked_by` asserts only the FACT *“these referenced calcs are also unmigrated”*, deliberately not
   the prediction *“this would translate once they are fixed”*. That prediction is `triage`'s job, and
