@@ -4730,6 +4730,28 @@ def _parse_shelf_totals(rows_el, cols_el):
             "cols": _flag(cols_el, "total"), "cols_on_top": _flag(cols_el, "onTop")}
 
 
+def _pane_has_ring_encodings(pane):
+    """Does this pane carry the encodings that DEFINE a pie/donut ring?
+
+    A Tableau donut is several stacked Pie panes: one draws the ring, the others draw the number in
+    the hole (and any spacers). Only the ring pane binds a ``color`` (the slice dimension) or a
+    ``wedge-size`` / ``angle`` (the slice measure) -- the rest carry ``text`` alone. Those encodings,
+    not pane order, are what identify the ring.
+
+    Conservative: a pane with no ``<encodings>`` returns False and the caller falls back to the first
+    Pie pane, which is precisely the previous behaviour, so a workbook without such a pane is
+    unaffected.
+    """
+    enc = _first(pane, "encodings") if pane is not None else None
+    if enc is None:
+        return False
+    for child in list(enc):
+        tag = str(child.tag).rsplit("}", 1)[-1].lower()
+        if tag in ("color", "wedge-size", "angle"):
+            return True
+    return False
+
+
 def _parse_worksheet(ws, index, ds_caption, warnings, internal_fields=None, date_binding=None,
                      row_count_binding=None, measure_binding=None, column_binding=None,
                      measure_palette=None, ds_color_palettes=None, workbook_root=None,
@@ -4755,11 +4777,20 @@ def _parse_worksheet(ws, index, ds_caption, warnings, internal_fields=None, date
     # pane hidden behind MIN(0) spacer axes that fake a donut ring). When a Pie pane is present,
     # drive the worksheet off it so its legend (colour) + angle (wedge-size) encodings are read
     # instead of the empty spacer pane. A genuine single-pane pie is unaffected (same pane).
-    pie_pane = next(
-        (p for p in all_panes
-         if _first(p, "mark") is not None
-         and (_first(p, "mark").get("class") or "").lower() == "pie"),
-        None)
+    #
+    # PICK THE PANE THAT CARRIES THE RING, NOT MERELY THE FIRST PIE PANE. When every pane is a Pie
+    # -- which is how Tableau writes a donut whose hole holds a total -- "first with a Pie mark" is
+    # a coin toss, and it lost. Measured on the Salesforce NPSP "Engagements by Stage Total": three
+    # Pie panes, whose <encodings> are text / (color=[Stage] + wedge-size) / text. The old selector
+    # took pane 1, so the ring's colour dimension never reached ``encodings``; ``latent_color``
+    # stayed False, the pie/donut card-collapse router could not fire, and the donut shipped as a
+    # ``card`` reading "(Blank) 320". The defining encodings ARE the discriminator the comment above
+    # already names, so select on them and fall back to the first Pie pane when none stands out.
+    pie_panes = [p for p in all_panes
+                 if _first(p, "mark") is not None
+                 and (_first(p, "mark").get("class") or "").lower() == "pie"]
+    pie_pane = next((p for p in pie_panes if _pane_has_ring_encodings(p)),
+                    pie_panes[0] if pie_panes else None)
     donut_hack = pie_pane is not None and len(all_panes) > 1
     if pie_pane is not None:
         pane = pie_pane

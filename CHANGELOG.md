@@ -12,6 +12,36 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ## [Unreleased]
 
+### Fixed
+
+- **`tableau-migration` (skill `2.270.0` → `2.293.0`): a Tableau donut rebuilds as a donut instead of
+  a card reading `(Blank)`.** Reported on the Salesforce NPSP "Staff Capacity" dashboard, where the
+  *Program Engagement Stage* ring — 320 engagements across seven stages — arrived as a
+  `multiRowCard` showing `(Blank) / 1 (filtered) / 320`.
+
+  A Tableau donut is several stacked Pie panes: one draws the ring, the others draw the number in
+  the hole. The emitter already knew to drive the worksheet off a Pie pane rather than the primary
+  one — its own comment says so verbatim, "so its legend (colour) + angle (wedge-size) encodings are
+  read". But it selected the **first** pane carrying a Pie mark, and when *every* pane is a Pie that
+  is a coin toss. It lost. This worksheet's three panes carry `text` / `color=[Stage]` +
+  `wedge-size` / `text`, and pane 1 won.
+
+  So the ring's colour dimension never reached `encodings`; `latent_color` stayed False; the
+  pie/donut router in `_card_collapse_alternatives` could not fire; and the worksheet fell through to
+  `card`. Every gate passed — the JSON is well-formed, the visual type is real, the fields resolve.
+  It is wrong only against the source.
+
+  The fix selects the pane carrying the encodings that *define* a ring (`color`, `wedge-size` or
+  `angle`), falling back to the first Pie pane when none stands out, so a workbook without such a
+  pane behaves exactly as before. Render-verified on a fresh build: the donut draws its stage
+  segments with labels (85 / 26.56%, 142 / 44.38%, 25, 17, 7), matching the Tableau reference.
+
+  The hole is still empty — the `320` is `donutChart.centerValue`, which Power BI defaults off and
+  the engine does not yet emit. Separate increment, deliberately not bundled here.
+
+  (Version jumps `2.270.0` → `2.293.0`: this branch was at 2.270.0 while the integration branch had
+  reached 2.291.0, so the block was claimed above that tip at the release step.)
+
 ### Added
 
 - **`tableau-migration` (skill `2.269.0` → `2.270.0`): a capability nobody can find no longer counts
