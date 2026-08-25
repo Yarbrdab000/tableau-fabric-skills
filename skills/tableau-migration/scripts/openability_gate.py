@@ -571,6 +571,7 @@ def check_model_openability(parts, flatfile_headers=None, expected_endpoints=Non
     #   * a reference to a table the model does not declare at all is left alone here -- that is a
     #     different failure and is not this check's business to guess at.
     refs_ok = True
+    bare_col_ok = True
     all_measures = set()
     all_columns = set()
     columns_by_table = {}
@@ -608,7 +609,45 @@ def check_model_openability(parts, flatfile_headers=None, expected_endpoints=Non
                               % (owner, tbl, col),
                 })
             for name in sorted(bare):
-                if name.casefold() in all_measures or name.casefold() in all_columns:
+                if name.casefold() in all_measures:
+                    continue
+                if name.casefold() in all_columns:
+                    # RESOLVES ONLY TO A COLUMN. Power BI accepts an unqualified column reference
+                    # in a ROW CONTEXT and rejects it everywhere else -- so this branch used to pass
+                    # it, and that leniency is what let two real defects ship.
+                    #
+                    # Measured 2026-08-25, both confirmed at the artifact:
+                    #   * a customer deliverable: `SWITCH([display_format], ...)` where
+                    #     ``display_format`` is a column on 'Custom SQL Query'. Power BI:
+                    #     SemanticError, "The syntax for '(' is incorrect". Five measures broken,
+                    #     three primary and two cascaded, in a file marked human-approved.
+                    #   * this repo's own corpus, 0088: `CALCULATE([Client per Staff Max Goal], ...)`
+                    #     where only the column and the what-if measure ``... Value`` exist. Power
+                    #     BI: "The value for 'Client per Staff Max Goal' cannot be determined.
+                    #     Either the column doesn't exist, or there is no current row for this
+                    #     column." The very same expression gets ``[Start Date Value]`` right, so
+                    #     it is a dropped suffix, not a convention the author chose.
+                    #
+                    # Tightened to require a MEASURE, and the false-positive cost was measured
+                    # before changing it, not after: across 248 corpus measures exactly ONE bare
+                    # reference resolves to a column and not a measure -- and that one is the 0088
+                    # defect above. So the row-context allowance was covering nothing real here
+                    # while hiding two genuine breaks.
+                    #
+                    # Reported as its own check rather than folded into ``dax_references_resolve``:
+                    # the reference DOES resolve to a model object, so calling it unresolvable would
+                    # misdescribe it and send a reader looking for a missing column that exists.
+                    bare_col_ok = False
+                    issues.append({
+                        "check": "bare_column_references_qualified",
+                        "part": path,
+                        "detail": ("measure %r references [%s] unqualified. That name is a COLUMN, "
+                                   "not a measure, so Power BI accepts it only inside a row context "
+                                   "and errors otherwise -- the model opens and the measure fails "
+                                   "when queried. Write 'Table'[%s] (with an aggregation, or "
+                                   "SELECTEDVALUE), or name the measure that was meant"
+                                   % (owner, name, name)),
+                    })
                     continue
                 refs_ok = False
                 issues.append({
@@ -625,6 +664,7 @@ def check_model_openability(parts, flatfile_headers=None, expected_endpoints=Non
         "typed_columns_declared": typed_declared,
         "m_parameters_defined": params_ok,
         "dax_references_resolve": refs_ok,
+        "bare_column_references_qualified": bare_col_ok,
     }
     if expected_endpoints is not None and int(expected_endpoints) > 1:
         checks["endpoints_distinct"] = endpoints_ok

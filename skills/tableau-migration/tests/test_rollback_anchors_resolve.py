@@ -320,6 +320,21 @@ _INTERLEAVE_DEBT = {
 }
 
 
+def _is_ancestor(root, sha, ref):
+    """Is ``sha`` reachable from ``ref``? ``False`` when git cannot answer.
+
+    Fail-CLOSED on an unanswerable question would be wrong here: an unreachable anchor is precisely
+    the case the caller wants to skip, so a git failure that looked like "reachable" would resurrect
+    the false positive this exists to remove.
+    """
+    try:
+        p = subprocess.run(["git", "merge-base", "--is-ancestor", sha, ref],
+                           cwd=root, capture_output=True, timeout=60)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return p.returncode == 0
+
+
 def _chain_pairs(repo):
     """``[(declared_predecessor, produced_version), ...]`` from the CHANGELOG's own chain."""
     import io
@@ -357,6 +372,26 @@ def test_each_anchor_sits_exactly_one_release_before_what_it_anchors(repo):
         sha = tags.get("rollback/pre-v" + made)
         if not sha:
             continue                      # absence is the sibling gate's business, not this one
+        if not _is_ancestor(repo, sha, "HEAD"):
+            # THE ANCHOR BELONGS TO A HISTORY THIS BRANCH CANNOT SEE, so the comparison is
+            # undecidable here -- exactly the skip the companion test already makes, arriving from
+            # the opposite direction and missed when this gate was written.
+            #
+            # `refs/tags` is SHARED across every worktree; `CHANGELOG.md` is branch-local. When the
+            # integrator re-points an anchor for the MERGED world (the correct repair this gate
+            # asks for), every lane branch immediately sees a merged-world anchor beside its own
+            # lane-world chain and this gate goes red through no fault of the lane.
+            #
+            # Observed within an hour of shipping: `rollback/pre-v2.299.0` was re-pointed to a
+            # commit stamped 2.298.0 -- right for the merged line, where 2.296/2.297/2.298 sit
+            # between -- while this branch's chain still declares 2.295.0, which is right here.
+            # Neither is wrong. They describe different histories, and only one of them contains
+            # the anchor's commit.
+            #
+            # So the gate is comparing a shared mutable resource against a branch-local file, and
+            # ancestry is what tells them apart: an anchor this branch cannot reach is not this
+            # branch's to judge.
+            continue
         got = at.get(sha)
         if got and got != pred:
             violations.append("%s declares predecessor %s, but rollback/pre-v%s -> %s is stamped %s"

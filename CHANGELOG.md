@@ -14,6 +14,73 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ### Added
 
+- **`tableau-migration` (skill `2.299.0` → `2.306.0`): a measure that names a COLUMN unqualified is
+  now a hard openability failure — the model opens, and the measure fails when queried.** Found in a
+  real customer deliverable, not in the corpus. Its agent reported that a Tableau calc id "didn't
+  resolve to a column in the migrated model" and said it had therefore chosen a conservative stub.
+  Every part of that was refuted by the file itself: a sibling calc id in the same model *had*
+  resolved deterministically, the referenced calculation sat in the same table with `state: Ready`
+  and its formula attached, and the emitted body was **`VAR _val = 0`** — not `BLANK()`.
+
+  That distinction is the point, and it is why this ships as a gate rather than a note. This repo's
+  stub convention is `= BLANK()`: structurally valid, semantically absent, and it *looks* empty. A
+  hardcoded `0` run through the same measure's currency and percentage formatting renders **`$0.00`**
+  and **`0.000%`** — a confident wrong number in every visual that touches it. A customer reads
+  `$0.00` as "zero dollars", not as "we declined to translate this". The agent's own justification
+  was that it wanted to avoid *silently producing wrong outputs*, while emitting the one shape that
+  does exactly that.
+
+  The actual break was mechanical: `SWITCH([display_format], ...)` where `display_format` is a
+  **column** on `'Custom SQL Query'`. Power BI: `SemanticError`, *"The syntax for '(' is
+  incorrect"*. Five measures broken — three primary, two rebound onto them. Corrected and verified
+  against the real 17,705-row model: NSD Availability `$0.00` → **77.4%**, Outage Volume → **1.11K**,
+  HFC QC → **98.51**.
+
+  `dax_references_resolve` (2.230.0) could not see it. It accepted an unqualified `[Name]` that
+  resolved against measures **or** columns, on the reasoning that Power BI allows an unqualified
+  column reference in a row context. Both defects' names *are* columns, so both passed a check
+  written to catch exactly this class. **The allowance was measured before it was removed, not
+  after**: across 248 corpus measures exactly **one** bare reference resolves to a column and not a
+  measure — and that one is itself a defect (0088, `CALCULATE([Client per Staff Max Goal], ...)`
+  where only the column and the what-if measure `... Value` exist; Power BI: *"The value for
+  'Client per Staff Max Goal' cannot be determined."*). The same expression gets `[Start Date Value]`
+  right, so it is a dropped suffix, not a house style. False-positive rate **0/248**.
+
+  Reported as its own check, `bare_column_references_qualified`, rather than folded into
+  `dax_references_resolve`: the reference *does* resolve to a model object, so calling it
+  unresolvable would misdescribe it and send a reader hunting for a missing column that exists.
+
+  **The systemic finding is the provenance stamp.** All three primary breaks carry
+  `TranslatedBy: assisted translation (human-approved)`; the deterministic path qualifies its
+  references correctly in the same file. The approval certified *"the formula looks right"*, not
+  *"the measure compiles"* — this session's population rule applied to a **trust label**, which is
+  worse than applying it to a metric, because a metric gets re-measured and a provenance stamp gets
+  relied upon. A measure sitting in `SemanticError` shipped to a customer carrying a human's
+  approval, and the defect is specifically in the path that has a human in it, which is precisely
+  where nobody thinks to add a machine check.
+
+  Two notes for whoever extends this. The matcher must scan the **expression only**: a first cut
+  scooped `annotation TableauFormula` into the body and reported **370 violations across 248
+  known-good measures**, because a preserved Tableau formula legitimately names Tableau ids —
+  expression-plus-annotations was not the claim's population. And the check is non-vacuous by
+  injection, not by assertion: a bare reference to a real column in a clean corpus model is caught,
+  the qualified form of the same measure is not, and the same name appearing only inside an
+  annotation is not.
+
+  Shipped alongside it, in the same release: **the anchor-predecessor gate (2.299.0) no longer fires
+  on anchors this branch cannot reach** — that gate's own flaw, exposed on its own author's branch
+  within a day. It compares a **shared
+  mutable resource** (`refs/tags`, one namespace across every worktree) against a **branch-local
+  file** (`CHANGELOG.md`). When the integrator re-points an anchor for the *merged* world — the
+  correct repair this gate asks for — every lane branch immediately sees a merged-world anchor beside
+  its own lane-world chain and goes red through no fault of the lane. Observed concretely:
+  `rollback/pre-v2.299.0` was re-pointed to a commit stamped 2.298.0, right for the merged line where
+  2.296–2.298 sit between, while this branch's chain still declares 2.295.0, right here. Neither is
+  wrong; they describe different histories, and only one of them contains the anchor's commit.
+  Ancestry is what tells them apart, so an anchor whose commit is not reachable from `HEAD` is
+  skipped as undecidable — the same skip the companion test already made, arriving from the opposite
+  direction and missed when this gate was written.
+
 - **`tableau-migration` (skill `2.295.0` → `2.299.0`): an anchor left behind by an interleaved merge
   is now caught — "strictly lower" was never enough.** The existing gate (2.266.0) asserts `VERSION`
   at `rollback/pre-vX.Y.Z` is strictly *less* than `X.Y.Z`. Found by the integrator:
