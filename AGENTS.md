@@ -99,6 +99,20 @@ not mirrored.
   predicate was wrong — it is that a non-match emits nothing to notice, so partial output looks
   complete. Count what you examined, check what you captured, and inject a known-bad case to watch
   the detector go red, before believing any clean result.
+- **Re-derive the SCOPE, not just the arithmetic.** Inheriting someone else's *question* is the same
+  defect as inheriting their answer, and far harder to see, because the work you did was genuinely
+  correct. Measured: one session correctly refused a reported figure and re-measured it from the
+  corpus — but re-measured only the two function names the report happened to mention. The arithmetic
+  was right; the scope was inherited, and the answer was still wrong (5 corruptions found, 7 present,
+  and the worst one missed entirely). A verifier should derive over the **whole population and name
+  nothing in advance** — "find every reason string where the strict pattern's capture differs from
+  the permissive one's, then report what is there" surfaces the cases nobody thought to ask about.
+- **A red result is a question, not a verdict.** A verifier that fails has told you nothing until you
+  know *which side* is wrong. Three reds in one investigation: one was a genuine doc error, one was a
+  check asserting a phrase as contiguous when the document hard-wraps it across a newline, and one
+  was a regex reconstruction that was itself broken — and chasing *that* one produced the best
+  finding of the day. The corollary to "a verifier that passes immediately has told you nothing yet"
+  is that a verifier that fails has told you exactly one thing: look.
 - **When a summary list and a payload list sit side by side, a reader measures whichever they find
   first.** `model_translation_handoff` carries `needs_review` (summary) and `requests` (payload) at
   equal length; `category_guidance`, `fields`, `formula` and `target_table` exist **only** on
@@ -186,8 +200,10 @@ anchor to revert a bad release). Do all three, every time:
 ### Concurrent releases: ask the INTEGRATOR for a version number
 
 **Version allocation is centralised. Do not claim a block. At your release step, ask the integrating
-session for a number; it reads `refs/tags` and hands you one.** What follows is why, because the
-previous rule was not obviously broken and is still worth understanding.
+session for a number; it reads `refs/tags` and hands you one.** If the integrator is unavailable,
+fall back to **take the next free number above every anchor, and renumber without ceremony if you
+collide** — see "renumbering is the cheap path" below. What follows is why, because the previous rule
+was not obviously broken and is still worth understanding.
 
 The old rule was: each session claims a contiguous block above the tip, and publishes that block's
 extent by cutting **every** anchor in it at claim time — which does make the extent visible in
@@ -220,6 +236,19 @@ gone, every anchor should name a version that really exists — and only then is
 every existing gate — and still wrong, because on its own branch the state before `2.293.0` really
 was `2.270.0`, while in merged history it is `2.292.0`. Rolling back there lands you missing two
 releases. When two sessions interleave into one range, re-check what each anchor now means.
+
+**Renumbering is the cheap path; a reservation is the expensive one.** Measured across one busy
+afternoon: two collisions, both renumbered in under a minute, zero lost work, zero coordination.
+Against that, the tempting fix — cut a **marker tag** for the top of your block so the extent is
+visible — is a claim with **no expiry, in a namespace nobody prunes.** Dead blocks would accumulate
+as permanent no-go zones, which is the hidden-expiry problem (see the corpus-count rule above)
+relocated into the coordination layer, where it is worse because nothing ever re-derives it. So:
+**do not reserve ranges.** A renumber costs a minute; a stale reservation costs a version range
+forever.
+
+Two rules survive unchanged because they are decidable without any shared state, and both held twice
+under collision: **claim as late as possible** (at the release step, not the start of the lane), and
+**on a collision the committed/pushed side wins and the other renumbers.**
 
 The historical block rules, kept because old anchors and CHANGELOG entries still reflect them:
 
