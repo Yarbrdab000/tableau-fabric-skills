@@ -14,6 +14,37 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ### Fixed
 
+- **`tableau-migration` (skill `2.303.0` → `2.304.0`): a review reason now names the ROUTE, not the
+  byte — the old wording was accurate and reliably sent readers the wrong way.**
+  `unsupported character '<'` is literally true, and it produced the same wrong inference **twice in
+  one afternoon in the same reader**: *"there is a comparison-operator parsing gap, close it."* There
+  is a parsing gap — `SUM([Sales]) < 5`, with no reference at all, fails in the tokenizer before any
+  resolution runs — but **closing it would be the wrong move**, because this compiler's subset is
+  deliberately arithmetic and a calc needing boolean logic has no Visual-Calculation form here at all.
+
+  **A diagnostic that is accurate and misleading is worse than a vague one, because its precision is
+  what earns the trust.** The reason now answers the question a reader actually has — *is this a gap
+  to close, or a route I should not be on?*
+
+  ```
+  [Above avg.?]: unsupported character '>'
+  [Above avg.?]: boolean/conditional logic ('>') is outside the arithmetic Visual-Calculation
+                 subset; a calc that needs it belongs on the model measure path
+  ```
+
+  One cause was arriving as **three different-looking messages**, which is why it read as three
+  separate gaps: `'<'` / `'='` / `'>'` from the tokenizer, and `expected '('` from an `IF` lexed as a
+  function call (plus `trailing tokens after expression` for a bare `AND`). All now resolve to the
+  boundary wording. Corpus-wide that is **10 of 27** review rows.
+
+  Scoped deliberately: an LOD brace keeps the plain `unsupported character '{'`, because it is a
+  different refusal with a different remedy — over-broad diagnostics are the failure this removes,
+  not one to relocate.
+
+  Disclosure only, proven at the artifact: rebuilt all 34 corpus workbooks — `emitted_total` 11 → 11,
+  `review_total` 16 → 16, `visuals_projecting_stub_measures` 5 → 5, and every PBIR report definition
+  byte-identical (0 files differ across 0070, 0074, 0075 and 0088).
+
 - **`tableau-migration` (skill `2.302.0` → `2.303.0`): a swallowed test body is now a hard failure,
   and the gate found one already in the tree on its first run.** An edit that replaces a
   `def test_x():` line — a rename, a reorder, an insertion whose `old_str` happened to end there —
