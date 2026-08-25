@@ -99,6 +99,22 @@ not mirrored.
   predicate was wrong — it is that a non-match emits nothing to notice, so partial output looks
   complete. Count what you examined, check what you captured, and inject a known-bad case to watch
   the detector go red, before believing any clean result.
+- **A gate must not conflate a DISCLOSED state with an UNDISCLOSED one — they are semantically
+  different and only one is actionable.** Not a noise-reduction argument. *"Nobody knows this measure
+  is empty"* and *"the engine knows, has named the dependency, and it self-heals when that sibling
+  translates"* demand different responses from a reader, and a check reporting both teaches them that
+  a hit might be either — which destroys the property that makes it worth reading, that a named
+  object is **certainly** in the reported state.
+
+  Measured instance: a transitively-blank gate passed on two dispatcher measures that render blank
+  for one selection each. That looked like a gap. It was not — `partial_fidelity` already named the
+  measure, **the branch number**, the awaited sibling, the reason, and **which branches are live**, in
+  the report, the summary, and the TMDL the user opens. That is *more* specific than the gate would
+  have been: the gate would have said "this measure can be blank"; the disclosure says "blank on
+  selection 3, awaiting `Avg. Days Participation`, and 1/2/4 are fine."
+
+  The inference that failed is the familiar one: *"the gate does not flag this"* is true, and was used
+  as *"nothing flags this."*
 - **THE MOVE THAT FINDS THESE: take the confident sentence and ask what would have to be true.** Not
   "check the work" — check the **claim**. And the question is not *"is this right?"* — every statement
   below was right. It is:
