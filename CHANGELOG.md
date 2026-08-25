@@ -14,6 +14,39 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ### Fixed
 
+- **`tableau-migration` (skill `2.302.0` → `2.303.0`): a swallowed test body is now a hard failure,
+  and the gate found one already in the tree on its first run.** An edit that replaces a
+  `def test_x():` line — a rename, a reorder, an insertion whose `old_str` happened to end there —
+  deletes the header and leaves the body behind. Those statements land **inside the preceding test**
+  at the same indentation and keep running. If their assertions still hold, the suite stays green
+  and **one test has silently ceased to exist**.
+
+  The pass count is exactly the wrong signal, because orphaned assertions pass just as happily
+  inside whatever function absorbed them — and the count can go *up* while a test disappears. This
+  is the same shape as every silent defect in this collection: the output met expectation, so
+  nothing objected. **A green suite cannot tell you a test still exists.**
+
+  Measured twice within one hour. A new test in `test_compiler_routing.py` swallowed the body of the
+  test below it and **passed**, caught only by diffing collected node IDs against the previous
+  commit. Then this gate, on its first run, found a pre-existing one: the `_definition_of_done`
+  precedence and `_dod_banner` assertions in `test_migrate_estate.py` had been running as trailing
+  statements of `test_dod_openability_failure_helper_tolerates_missing_and_ok`, a test about an
+  unrelated helper. Repaired as the sibling `test_dod_status_precedence_and_warn_banner` — the
+  restored `def` is the only change; not one assertion was touched.
+
+  **The fingerprint, and why the predicate was measured before it was trusted.** Module-level
+  definitions are separated by exactly two blank lines, so an eaten `def` leaves its body after a run
+  of ≥ 2 blank lines *inside* the previous function. Swept over the whole suite the predicate flagged
+  **1 function in 4194** — and that one was a real swallowed test, not a false positive. That rate is
+  why this ships as a hard assertion rather than a warning.
+
+  Deliberately **not** an expected-count baseline: a manifest needs updating on every added test,
+  which turns it into a rubber stamp, and it cannot say *which* test vanished. This reads the source
+  and names the function and line. The gate also carries its own negative control — a synthetic
+  swallow it must detect and a clean module it must not fire on, because a check that cannot go red
+  is indistinguishable from one that found nothing — and asserts it examined > 100 functions, since a
+  sweep that reaches zero of them would look identical to success.
+
 - **`tableau-migration` (skill `2.301.0` → `2.302.0`): the interleave-debt ledger drops 4 → 1,
   because the debt was PAID rather than re-labelled.** 2.299.0 shipped the anchor-predecessor gate
   green with four known violations parked in `_INTERLEAVE_DEBT`. That was the correct sequence —

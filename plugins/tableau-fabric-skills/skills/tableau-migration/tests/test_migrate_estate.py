@@ -1903,7 +1903,11 @@ def test_dod_openability_failure_helper_tolerates_missing_and_ok():
     assert reason is not None and "typed_columns_declared" in reason
 
 
-
+def test_dod_status_precedence_and_warn_banner():
+    # Restored `def`: this block was orphaned INSIDE the openability-helper test above -- its own
+    # `def` line was lost by an edit, so its assertions ran as trailing statements of that function
+    # and kept passing. Subject and fixtures are unrelated to it; nothing here is changed but the
+    # header. Found by `test_no_test_body_was_swallowed`.
     # A hard failure still wins over a fidelity warning (failed > warn).
     mixed = me._definition_of_done(
         [{"name": "Warn WB", "pbip_status": "built",
