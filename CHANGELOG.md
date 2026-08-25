@@ -14,6 +14,43 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ### Fixed
 
+- **`tableau-migration` (skill `2.275.0` → `2.290.0`): one unmigrated branch no longer blanks EVERY
+  selection of a parameter dispatcher (#168, #171).** A Tableau control-surface calc —
+  `CASE [Parameters].[P] WHEN 1 THEN <metric a> WHEN 2 THEN <metric b> … END` — was translated
+  all-or-nothing: a single branch the translator could not render stubbed the **whole** measure to
+  `BLANK()`, so every selection rendered empty, not just the one. Structurally valid, semantically
+  absent — the measure exists, the visual binds, `pbir_lint` is clean, validation returns zero
+  errors, and the chart is blank.
+
+  Measured on corpus workbook 0088 (`salesforce_nonprofit_case_mgmt`) at 2.275.0: `Sort By` had
+  **3 of its 4** branches already translated and `Select Metric` **3 of 4**, yet both emitted
+  `BLANK()`. Between them they were **5 of the 12** visuals corpus-wide that projected a stub — the
+  single largest cause of empty charts.
+
+  The dispatcher is now rebuilt from the branches that DO translate. A failing branch that names a
+  sibling calc this model emits keeps its slot, pointing at that sibling's own measure: blank today
+  (the sibling is its own honest `BLANK()` stub) and correct for free the moment that sibling's
+  translation lands, with no further change here. Any other failing branch is pruned, so that one
+  selection returns blank while the rest work.
+
+  Fail-closed in the way that matters: a dispatcher with **no** genuinely translated branch stays a
+  stub rather than becoming a live measure that says nothing for every input — which would be the
+  same defect wearing a green badge (0088's `Select Metric Decimal`, whose only branch is blank,
+  correctly stays a stub). No DAX is composed by the new code; it prunes and re-points branches and
+  hands the result to the same parser, type check and emit guardrail as any other measure, so a
+  mistyped sibling is rejected and pruned rather than emitted.
+
+  Because a repaired dispatcher counts as translated and therefore LEAVES the needs-review list, its
+  still-blank selections are disclosed in two places or the repair would reproduce the silence it
+  fixes: the model file's `TranslatedBy` annotation names them, and an additive `partial_fidelity`
+  list (plus a `summary.partial_fidelity` count) in `model_translation_handoff` carries the
+  structured form. Both are empty on any build with no such calc.
+
+  Corpus effect, whole estate, 2.275.0 → 2.290.0: `visuals_projecting_stub_measures` **12 → 7**,
+  workbook calcs translated **216 → 218**, stubbed **71 → 69**; exactly one workbook changed and no
+  workbook lost a translated calc, gained a stub-projecting visual, or changed viz/pbip/openability
+  status.
+
 - **`tableau-migration` (skill `2.274.0` → `2.275.0`): a per-visual status now says what was actually
   CHECKED, so a false green is visible (#173).** `status: "rebuilt"` asserts only that the visual
   emitter completed without raising and without attaching a warning. It is a claim about **our code**,

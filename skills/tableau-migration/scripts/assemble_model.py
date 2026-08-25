@@ -57,6 +57,8 @@ try:  # package or scripts-on-path
         translate_tableau_calc_to_column_dax,
         translate_tableau_calc_to_column_dax_typed,
         translate_aggregated_param_row_calc,
+        translate_param_dispatcher_calc,
+        is_param_dispatcher_calc,
         suggest_assisted_dax,
         field_references,
         date_attribute_binding,
@@ -108,6 +110,8 @@ except ImportError:
         translate_tableau_calc_to_column_dax,
         translate_tableau_calc_to_column_dax_typed,
         translate_aggregated_param_row_calc,
+        translate_param_dispatcher_calc,
+        is_param_dispatcher_calc,
         suggest_assisted_dax,
         field_references,
         date_attribute_binding,
@@ -1584,6 +1588,42 @@ def _measures_part(calcs, resolve, consumed=None, param_resolver=None, *,
             else:
                 still.append(calc)
         pending = still
+    # Stub-reference pool for the parameter-DISPATCHER rescue (``translate_param_dispatcher_calc``).
+    # A dispatcher -- ``CASE [Parameters].[P] WHEN 1 THEN <metric a> WHEN 2 THEN <metric b> ...``,
+    # a dashboard's control surface -- stubs WHOLESALE when a single branch will not translate, so
+    # every selection renders blank rather than only the one. A branch naming a sibling calc that
+    # this model DOES emit (even as an inert ``BLANK()`` stub) can keep its slot pointing at that
+    # measure: it reads blank today, exactly as the whole dispatcher did, and becomes correct for
+    # free the moment that sibling's own translation lands. Keyed by caption AND internal
+    # ``Calculation_*`` token because a formula may use either form.
+    #
+    # Deliberately NARROW, and never a general reference channel: entries are handed ONLY to the
+    # dispatcher rescue, never merged into ``measure_refs``. Seeding ``measure_refs`` with stubs
+    # would let ANY measure translate into DAX that silently reads a blank -- the exact
+    # "structurally valid, semantically absent" failure this repairs. Skipped for anything not
+    # emitted as a plain measure (consumed / flag-superseded / table-calc-superseded), for anything
+    # already a real reference target, and for another DISPATCHER (whose rescued DAX is real, so
+    # pointing one at another could close a measure-reference cycle; a plain stub is always
+    # ``BLANK()`` and cannot).
+    dispatcher_stub_refs = {}
+    for _sc in (calcs or []):
+        _snm = (_sc.get("name") or "").strip()
+        if not _snm:
+            continue
+        _skey = _snm.lower()
+        _stid = str(_sc.get("internal_name") or "").strip()
+        if _skey in consumed_lower or _skey in measure_refs:
+            continue
+        if _skey in flag_source_lower or (_stid and _stid.lower() in flag_source_lower):
+            continue
+        if _superseded_by_table_calc(_sc, superseded):
+            continue
+        if is_param_dispatcher_calc(_sc.get("formula") or ""):
+            continue
+        _sentry = (dax_safe_measure_name(_snm), _tableau_dtype(_sc.get("datatype")))
+        dispatcher_stub_refs[_skey] = _sentry
+        if _stid:
+            dispatcher_stub_refs[_stid.lower()] = _sentry
     # Aggregating measures synthesized for measure-swap field parameters (a NAMEOF'd raw column is
     # grouped-by, not aggregated, so each measure-swap candidate needs a real SUM measure to point at).
     for sm in (synth_measures or []):
@@ -1649,6 +1689,25 @@ def _measures_part(calcs, resolve, consumed=None, param_resolver=None, *,
                 related_tables=related_tables, conformed_hubs=conformed_hubs)
             if _fdax:
                 dax, reason, flag_gated = _fdax, "ok", True
+        # Shape 4 -- PARAMETER DISPATCHER whose branches are all fine but one: ``CASE
+        # [Parameters].[P] WHEN 1 THEN <metric a> ... WHEN n THEN <metric n> END``. The plain
+        # translator is all-or-nothing, so ONE unrenderable branch blanks every selection -- the
+        # single largest cause of empty charts in the corpus (0088's ``Sort By`` / ``Select
+        # Metric``, 3 of 4 branches each, 5 visuals). Rebuild it from the branches that survive,
+        # keeping a branch that names an emitted sibling stub so it self-heals when that sibling
+        # lands. Fail-closed inside the recognizer: needs >=1 genuinely translated branch, so a
+        # dispatcher whose every branch is blank (0088's ``Select Metric Decimal``) stays a stub
+        # rather than becoming a translated measure that says nothing.
+        dispatcher_partial = None
+        if not dax and param_resolver:
+            _pdax, _preason, _pdetail = translate_param_dispatcher_calc(
+                formula, _arc(calc), param_resolver=param_resolver, measure_refs=measure_refs,
+                known_tables=known_tables, inline_calcs=inline_calcs,
+                related_tables=related_tables, conformed_hubs=conformed_hubs,
+                stub_measure_refs=dispatcher_stub_refs,
+                exclude_keys=(name, calc.get("internal_name")))
+            if _pdax:
+                dax, reason, dispatcher_partial = _pdax, "ok", _pdetail
         row = {
             "measure": dax_safe_measure_name(name),
             "status": "translated" if dax else "stub",
@@ -1685,6 +1744,17 @@ def _measures_part(calcs, resolve, consumed=None, param_resolver=None, *,
                 _gen_measure(
                     name, formula, dax,
                     translated_by="deterministic (default-SUM over param-gated row-level FIXED LOD)",
+                    format_string=_fmt(name))
+            elif dispatcher_partial:
+                # A rebuilt dispatcher LEAVES the needs-review list, so the selections that are
+                # still blank have to be stated here or the repair reproduces the very defect it
+                # fixes: a measure that binds, validates and lints clean while saying nothing for
+                # some of its inputs. The provenance names them in the model file itself; the
+                # report row below carries the structured form.
+                row["dispatcher_partial"] = dispatcher_partial
+                _gen_measure(
+                    name, formula, dax,
+                    translated_by=_dispatcher_provenance(dispatcher_partial),
                     format_string=_fmt(name))
             else:
                 _gen_measure(name, formula, dax,
@@ -4030,11 +4100,17 @@ def translation_handoff_artifact(measure_report, calc_column_report, resolve, *,
         native ``measure_refs`` cascade resolves once those keystones exist, so effort targets only
         the few bases. ``param_resolver`` / ``known_tables`` (the same the build used) make the
         re-translation faithful; default ``None`` -> a conservative triage.
+      * ``partial_fidelity`` -- calcs that translated but NOT at full fidelity, today the partially
+        rebuilt parameter dispatchers (``translate_param_dispatcher_calc``). They are counted as
+        translated and so never reach ``needs_review``; listing them here is what stops a repaired
+        dispatcher's still-blank selections from disappearing from the report entirely. Empty for
+        any build with no such calc.
     """
     buckets = {"translated": 0, "assisted_approved": 0, "assisted_suggested": 0, "stub": 0}
     category_counts = {}
     requests = []
     needs_review = []
+    partial_fidelity = []
 
     def _consume(rows, role, target_of):
         for row in rows or []:
@@ -4044,6 +4120,20 @@ def translation_handoff_artifact(measure_report, calc_column_report, resolve, *,
             bucket = status.replace("-", "_")
             if bucket in buckets:
                 buckets[bucket] += 1
+            # A PARTIALLY rebuilt parameter dispatcher counts as translated (its live branches are
+            # faithful DAX) and therefore never appears in ``needs_review`` -- so record it here or
+            # the selections that still read blank become invisible the moment the repair lands.
+            # This is the same "structurally valid, semantically absent" family the repair removes.
+            part = row.get("dispatcher_partial")
+            if isinstance(part, dict) and (part.get("blank") or part.get("dropped")):
+                partial_fidelity.append({
+                    "name": name,
+                    "role": role,
+                    "kind": "parameter_dispatcher",
+                    "live_branches": list(part.get("live") or ()),
+                    "blank_branches": list(part.get("blank") or ()),
+                    "dropped_branches": list(part.get("dropped") or ()),
+                })
             if status in _HANDOFF_REVIEW:
                 has_suggestion = status == "assisted-suggested"
                 resolved_fields = _handoff_fields(formula, resolve, calc_lookup)
@@ -4085,11 +4175,15 @@ def translation_handoff_artifact(measure_report, calc_column_report, resolve, *,
         "stub": buckets["stub"],
         "coverage_pct": _coverage_pct(live, total),
         "categories": category_counts,
+        # Additive: calcs that DID translate but not at full fidelity (today: partially rebuilt
+        # parameter dispatchers). Counted separately from needs_review because the object is live
+        # and useful -- it just does not answer for every input.
+        "partial_fidelity": len(partial_fidelity),
     }
     triage = _triage_stubs(requests, calc_lookup, resolve,
                            param_resolver=param_resolver, known_tables=known_tables)
     return {"summary": summary, "needs_review": needs_review, "requests": requests,
-            "triage": triage}
+            "triage": triage, "partial_fidelity": partial_fidelity}
 
 
 def _unique_source_name(base, taken_casefold):
@@ -5758,6 +5852,45 @@ def _split_calcs_by_role(calcs):
 # sync by ``test_row_level_measure_role_calc_reroutes_to_column`` -- if the message drifts, that
 # end-to-end test fails rather than the router silently going inert.
 _ROW_LEVEL_IN_MEASURE_REASON = "bare row-level field [..] not valid in a measure"
+
+
+# Tableau's declared calc datatype -> the translator's 4-value dtype vocabulary. Used to type a
+# STUBBED sibling offered to the parameter-dispatcher rescue: the rebuilt SWITCH still runs the
+# parser's return-type check across its branches, so a wrong type can only make the dispatcher fall
+# back to its existing stub, never emit mistyped DAX. Unknown/absent -> "number", the dominant
+# aggregate-measure case and the same default the approved-DAX seeding uses.
+_TABLEAU_DTYPE = {
+    "boolean": "bool",
+    "string": "text",
+    "date": "date",
+    "datetime": "date",
+    "integer": "number",
+    "real": "number",
+}
+
+
+def _tableau_dtype(datatype):
+    return _TABLEAU_DTYPE.get(str(datatype or "").strip().lower(), "number")
+
+
+def _dispatcher_provenance(detail):
+    """``TranslatedBy`` text for a partially rebuilt parameter dispatcher.
+
+    Names the live branch count AND every selection that still reads blank, in the model file
+    itself -- the one artifact a reviewer opening the .pbip actually sees. Without it a rebuilt
+    dispatcher looks indistinguishable from a fully faithful one.
+    """
+    live = list((detail or {}).get("live") or ())
+    blank = ["WHEN %s -> [%s]" % (b.get("branch"), b.get("measure"))
+             for b in ((detail or {}).get("blank") or ())]
+    dropped = ["WHEN %s" % b.get("branch") for b in ((detail or {}).get("dropped") or ())]
+    total = len(live) + len(blank) + len(dropped)
+    text = f"deterministic (parameter dispatcher; {len(live)} of {total} branches live"
+    if blank:
+        text += "; blank until its own calc translates: " + ", ".join(blank)
+    if dropped:
+        text += "; dropped " + ", ".join(dropped)
+    return text + ")"
 
 
 def _reroute_row_level_measure_calcs(measure_calcs, dim_calcs, resolve, *, known_tables,

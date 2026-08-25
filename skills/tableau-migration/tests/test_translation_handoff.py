@@ -219,5 +219,14 @@ def test_handoff_is_additive_on_assembled_report():
                 "calc_coverage", "calc_column_coverage"):
         assert key in report
     ho = report["translation_handoff"]
-    assert set(ho) == {"summary", "needs_review", "requests", "triage"}
+    # Every documented handoff key is present. Asserted as a SUPERSET, not equality: the report
+    # schema is additive-only by contract, so pinning the exact key set would make any additive
+    # key a failure -- which is the opposite of what this test is named for. The keys themselves
+    # are still pinned individually (below), so a REMOVED or RENAMED key still fails here.
+    assert {"summary", "needs_review", "requests", "triage",
+            "partial_fidelity"} <= set(ho)
     assert ho["summary"]["total"] >= 1
+    # No dispatcher in this smoke model -> the partial-fidelity channel is present but empty,
+    # so a build with nothing to disclose is unchanged.
+    assert ho["partial_fidelity"] == []
+    assert ho["summary"]["partial_fidelity"] == 0
