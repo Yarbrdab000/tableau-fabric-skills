@@ -12,6 +12,34 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ## [Unreleased]
 
+- **`tableau-migration` (skill `2.316.0` → `2.317.0`): two properties 2.312.0's merge relies on that
+  nothing asserted — test-only.** Both lanes built 2.312.0's post-wrap re-check independently; the
+  duplicate was retired. Cross-testing the retired suite against the shipped implementation found two
+  properties every existing test *assumes* and none *states*:
+
+  * **the recorded verdict is not mutated.** The merge builds a new dict and rebinds
+    `res_report["openability_selfcheck"]`, so a caller holding the assembly-time verdict still sees
+    it — but nothing said so. A refactor to update it in place satisfies **every other test in the
+    file**. Verified by injection: that regression is caught by this test **and by no other**.
+  * **a wrap that breaks nothing degrades nothing** — the clean path, true of 33 of the 34 corpus
+    workbooks. Every other test in the file drives a *defect* through the merge; a regression that
+    started failing checks on a healthy build would read downstream as a real openability failure on
+    a model that is fine.
+
+  The second is stated as **no degradation**, not as *“the verdict is unchanged”*, because the
+  re-run legitimately evaluates checks the assembly-time verdict never carried — measured, it adds
+  **9** (`bare_column_references_qualified`, `dax_references_resolve`, …) with **none degrading**.
+  The original assertion in the retired suite demanded equality and **would have failed correct
+  code**; the property that matters is directional.
+
+  Both proven red by injecting the specific regression each one guards, then restored
+  byte-identical. No production change.
+
+  **A third, found while verifying the other two: the call site is asserted to EXIST but not to be given the right model.** `test_the_wrap_site_calls_the_recheck` pins that the call is made; it cannot see *which* parts are handed over. Passing the pre-wrap `res.get("parts")` instead of `wrapped_model_parts` re-checks the model **as assembled** — exactly the artifact whose verdict 2.312.0 exists to correct — leaving the release inert and every report clean.
+
+  Measured by injecting that one-token change into **both** trees, so mirror parity could not fire for an unrelated reason: **5194 passed, 6 skipped, 1 xfailed — nothing in the suite caught it.** A one-token regression that silently reverts a release with every gate green. The new test reads the call site's argument, and is red against that injection and green against the shipped code.
+
+
 ### Added
 
 - **`tableau-migration` (skill `2.315.0` → `2.316.0`): the parse-failure guard is now pinned at the
@@ -110,6 +138,7 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
   **A property is not validated or unvalidated as a whole — each of its jobs is, separately.**
   Under-claiming produced by care about over-claiming, which is a failure mode with no obvious
   defence: the disposition that prevents one causes the other.
+### Added
 
 - **`tableau-migration` (skill `2.312.0` → `2.313.0`): a committed git conflict marker is now a
   test failure.** Three of them sat in `CHANGELOG.md` at the tip of an integration branch carrying

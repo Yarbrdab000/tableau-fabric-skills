@@ -157,3 +157,85 @@ def test_the_wrap_site_calls_the_recheck():
     assert "_recheck_openability_after_wrap(" in tail, (
         "the openability re-check is not invoked after the row-predicate wrap -- the verdict would "
         "again describe the pre-wrap model")
+# -- Two properties the merge relies on that nothing else here states ------------------------------
+# Ported from the dispatcher lane's parallel implementation of this fix (both lanes built it
+# independently; that one was retired as a duplicate). They pin the two halves of "merged, never
+# replaced" that the tests above assume rather than assert.
+
+
+def test_the_recorded_verdict_object_is_not_mutated():
+    """The caller may still be holding the assembly-time verdict; this pass must not edit it.
+
+    Today the merge builds a NEW dict and rebinds ``res_report["openability_selfcheck"]``, so the
+    original is untouched -- but nothing said so, and a future refactor to update the recorded
+    verdict in place would satisfy every other test in this file while silently corrupting a value
+    another caller had already read. That is this repo's recurring shape: a change that is correct
+    at the point of edit and wrong at a point nobody re-checked.
+    """
+    original = _before(checks={"tmdl_wellformed": True, "typed_columns_in_header": True})
+    snapshot = json.loads(json.dumps(original, sort_keys=True))
+    report = {"openability_selfcheck": original}
+    me._recheck_openability_after_wrap(
+        report, {"m.tmdl": "table T\n\tmeasure 'A' = BLANK()\n"})
+    assert original == snapshot, "the recorded verdict was mutated in place"
+    assert report["openability_selfcheck"] is not original, (
+        "the merged verdict must be a distinct object from the one recorded at assembly time")
+
+
+def test_a_wrap_that_breaks_nothing_degrades_nothing():
+    """THE CLEAN PATH -- true of 33 of the 34 corpus workbooks, and the one nobody would miss.
+
+    Every other test here drives a defect through the merge. This one drives a healthy model, which
+    is the case that actually runs almost everywhere: a regression that started failing checks on a
+    clean build would be caught by no other assertion in this file, and would read downstream as a
+    real openability failure on a model that is fine.
+
+    Stated as NO DEGRADATION rather than as "the verdict is unchanged", deliberately. The re-run
+    legitimately evaluates checks the assembly-time verdict never carried -- measured, it adds 9
+    (``bare_column_references_qualified``, ``dax_references_resolve``, ...) -- so an equality
+    assertion would fail correct code. The property that matters is directional: nothing that
+    passed may stop passing, and no issue may appear, when the wrap introduced no defect.
+    """
+    before = _before(checks={"tmdl_wellformed": True, "typed_columns_in_header": True})
+    report = {"openability_selfcheck": _before(
+        checks={"tmdl_wellformed": True, "typed_columns_in_header": True})}
+    me._recheck_openability_after_wrap(report, {"m.tmdl": "table T\n"})
+    after = report["openability_selfcheck"]
+    degraded = [name for name, was_ok in before["checks"].items()
+                if was_ok and not after["checks"].get(name)]
+    assert not degraded, "a healthy wrap degraded %s" % degraded
+    assert after["ok"] is True, "a healthy wrap must not fail an otherwise-passing verdict"
+    assert not after["issues"], "a healthy wrap must not manufacture issues"
+def test_the_wrap_site_passes_the_WRAPPED_parts_not_the_pre_wrap_ones():
+    """Asserting the call is made is not asserting it is made with the right model.
+
+    ``test_the_wrap_site_calls_the_recheck`` pins that the call exists. It cannot see WHICH parts
+    are handed over -- and handing over the pre-wrap ``res.get("parts")`` instead of
+    ``wrapped_model_parts`` re-checks the model as assembled, which is precisely the artifact whose
+    verdict 2.312.0 exists to correct. The fix would be inert and the report would be clean.
+
+    Measured, injecting exactly that one-token change into BOTH trees so mirror parity cannot fire
+    for an unrelated reason: **5194 passed, 6 skipped, 1 xfailed. Nothing in the suite caught it.**
+    A one-token regression that silently reverts a release and leaves every gate green.
+
+    So this reads the call site's ARGUMENT. Source-level, like its sibling, because the defect is
+    which value is passed at one line -- not a behaviour any fixture can exercise: both arguments
+    are valid dicts and the merge is correct for either.
+    """
+    src = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                       "scripts", "migrate_estate.py")
+    with open(src, encoding="utf-8") as fh:
+        lines = fh.readlines()
+
+    calls = [l for l in lines
+             if "_recheck_openability_after_wrap(" in l and not l.lstrip().startswith("def ")]
+    assert len(calls) == 1, (
+        "expected exactly one call site, found %d -- a second caller would need its own "
+        "argument assertion" % len(calls))
+
+    call = calls[0]
+    assert "wrapped_model_parts" in call, (
+        "the re-check must receive the WRAPPED parts; %r re-checks the model as assembled, "
+        "which makes the fix inert while every gate stays green" % call.strip())
+    assert 'res.get("parts")' not in call and "res['parts']" not in call, (
+        "the pre-wrap parts must not be passed: %r" % call.strip())
