@@ -267,8 +267,18 @@ anchor to revert a bad release). Do all three, every time:
 **Version allocation is centralised. Do not claim a block. At your release step, ask the integrating
 session for a number; it reads `refs/tags` and hands you one.** If the integrator is unavailable,
 fall back to **take the next free number above every anchor, and renumber without ceremony if you
-collide** — see "renumbering is the cheap path" below. What follows is why, because the previous rule
-was not obviously broken and is still worth understanding.
+collide** — see "renumbering is the cheap path" below.
+
+**Centralising does not delete the failure mode, it MOVES it into one actor** — a better trade, not a
+free one. Within four hours of imposing this rule the integrator cut an anchor without reading
+`refs/tags` and collided with a lane that had claimed it. The mechanism is worth naming because it is
+general: **the author of a rule holds its intent in mind and reads the intent instead of the
+artifact.** They did not check the tags because they already knew what the tags would say. That is the
+same failure as trusting a return value instead of querying the model, wearing different clothes —
+and it is why *the rules most likely to be violated are the ones you wrote*. Authoring a rule creates
+the feeling of having internalised it, which is precisely the feeling that stops you checking.
+
+What follows is why the previous rule was replaced, because it was not obviously broken.
 
 The old rule was: each session claims a contiguous block above the tip, and publishes that block's
 extent by cutting **every** anchor in it at claim time — which does make the extent visible in
