@@ -249,6 +249,53 @@ def test_total_of_an_unresolvable_reference_falls_back():
     assert reason
 
 
+def test_a_boundary_diagnostic_names_the_route_not_the_byte():
+    """A review reason must answer *is this a gap to close, or a route I should not be on?*
+
+    ``unsupported character '<'`` was literally true and reliably misleading: it reads as a parser
+    gap, so a reader concludes "add comparison parsing". Measured, it produced that wrong inference
+    twice in one afternoon in the same reader, and corpus-wide it covered 10 of 27 review rows
+    arriving as three different-looking messages with ONE cause -- ``'<'`` / ``'='`` / ``'>'`` from
+    the tokenizer, and ``expected '('`` from an ``IF`` lexed as a function call.
+
+    A diagnostic that is accurate and misleading is worse than a vague one, because its precision is
+    what earns the trust. These pin the boundary wording, not the byte.
+    """
+    cases = [
+        "SUM([Sales]) < [Some Calc]",                                   # tokenizer, comparison
+        "SUM([Sales]) = 5",
+        "SUM([Sales]) > 1",
+        "IF NOT ISNULL(SUM([Sales])) THEN RUNNING_SUM(SUM([Sales])) END",  # keyword-as-call
+        "SUM([Sales]) AND SUM([Sales])",                                # trailing connective
+        "CASE [P] WHEN 1 THEN [Some Calc] END",
+    ]
+    for formula in cases:
+        expr, _deps, reason = compile_expression(
+            formula, axis="ROWS", resolve_aggregate=_agg_primary,
+            resolve_reference=lambda n, ds: ("calc", "Some Calc"))
+        assert expr is None, formula
+        assert "boolean/conditional logic" in reason, (formula, reason)
+        assert "model measure path" in reason, (formula, reason)
+        # The three uninformative forms must be gone.
+        assert "unsupported character" not in reason, (formula, reason)
+        assert "expected '('" not in reason, (formula, reason)
+        assert "trailing tokens" not in reason, (formula, reason)
+
+
+def test_a_genuinely_unknown_character_still_says_so():
+    """The boundary message is scoped to boolean/conditional logic; it must not swallow everything.
+
+    An LOD brace is a different refusal with a different remedy, so it keeps the plain wording --
+    over-broad diagnostics are the failure this change exists to remove, not to relocate.
+    """
+    expr, _deps, reason = compile_expression(
+        "{ FIXED [Region] : SUM([Sales]) }", axis="ROWS",
+        resolve_aggregate=_agg_primary, resolve_reference=lambda n, ds: None)
+    assert expr is None
+    assert "unsupported character" in reason and "'{'" in reason
+    assert "boolean/conditional" not in reason
+
+
 # -- the semantic line COLLAPSEALL must NOT be pushed across ---------------------------------------
 def test_window_family_has_its_own_form_and_never_becomes_collapseall():
     """COLLAPSEALL is total-level RE-EVALUATION; the WINDOW_* family is per-mark aggregation.

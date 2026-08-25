@@ -145,6 +145,29 @@ class _CompileError(Exception):
     """Raised internally when the formula leaves the faithful subset; surfaced as a review reason."""
 
 
+# -- diagnostics: name the BOUNDARY, not the byte ------------------------------
+# ``unsupported character '<'`` is literally true and reliably misleading: it reads as a parser gap
+# to be closed, so a reader concludes "add comparison parsing". Measured, it produced that wrong
+# inference twice in one afternoon in the same reader. The truthful answer to the question the reader
+# actually has -- *is this a gap to close, or a route I should not be on?* -- is that this compiler's
+# subset is deliberately ARITHMETIC (see the module docstring): boolean and conditional logic has no
+# Visual-Calculation form here at all, so a calc needing it belongs on the model measure path
+# regardless of how much parsing were added. A diagnostic that is accurate and misleading is worse
+# than a vague one, because its precision is what earns the trust.
+#
+# Corpus-wide this covers 10 of 27 review rows, arriving as three different-looking messages that all
+# had one cause: ``'<'`` / ``'='`` / ``'>'`` from the tokenizer, and ``expected '('`` from an ``IF``
+# read as a function call.
+_COMPARISON_CHARS = frozenset("<>=!")
+_CONDITIONAL_KEYWORDS = frozenset({
+    "IF", "THEN", "ELSE", "ELSEIF", "END", "CASE", "WHEN", "AND", "OR", "NOT"})
+
+
+def _boundary_reason(token: str) -> str:
+    return ("boolean/conditional logic ({0!r}) is outside the arithmetic Visual-Calculation "
+            "subset; a calc that needs it belongs on the model measure path".format(token))
+
+
 # -- tokenizer (closed subset) -------------------------------------------------
 _NUM_RE = re.compile(r"\d*\.?\d+")
 _ID_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
@@ -195,6 +218,8 @@ def _tokenize(s: str) -> List[Tuple[str, object]]:
             toks.append(("id", m.group(0)))
             i = m.end()
             continue
+        if c in _COMPARISON_CHARS:
+            raise _CompileError(_boundary_reason(c))
         raise _CompileError(f"unsupported character {c!r}")
     return toks
 
@@ -238,6 +263,10 @@ class _Compiler:
     def parse(self) -> str:
         expr = self._expr()
         if self.pos != len(self.toks):
+            kind, val = self._peek()
+            if kind == "id" and str(val).upper() in _CONDITIONAL_KEYWORDS:
+                # ``SUM([x]) AND SUM([y])`` -- the operand parsed, the CONNECTIVE did not.
+                raise _CompileError(_boundary_reason(str(val)))
             raise _CompileError("trailing tokens after expression")
         return expr
 
@@ -294,6 +323,10 @@ class _Compiler:
     # -- a function call: table calc, aggregate, or ATTR passthrough --
     def _call(self, fn_raw: str) -> str:
         fn = fn_raw.upper()
+        if fn in _CONDITIONAL_KEYWORDS:
+            # ``IF ... THEN ... END`` lexes as an identifier, so without this it surfaces as
+            # ``expected '('`` -- a parser complaint about a construct that is not a call at all.
+            raise _CompileError(_boundary_reason(fn_raw))
         self._expect_op("(")
         if fn in _AGG:
             leaf = self._aggregate_leaf(fn)
