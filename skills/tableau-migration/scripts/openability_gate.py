@@ -300,6 +300,55 @@ def _forwarded_value_source(name, exprs, seen=frozenset()):
     return None
 
 
+# FUNCTIONS THAT DO NOT EXIST IN DAX, mapped to what was meant. Tableau and Excel names an
+# assisted translation reaches for, which DAX's parser rejects with a message that names neither.
+#
+# A DENYLIST, and the choice is about ERROR DIRECTION rather than maintenance: a missing entry here
+# is a false negative and tolerable, whereas an allowlist of valid DAX functions would fire on every
+# legitimate function nobody remembered to add -- fatal for a gate, and it would decay every time
+# DAX gains a function.
+#
+# Entries are only listed when DAX genuinely lacks the name. Deliberately ABSENT, because they ARE
+# DAX and an earlier draft of this list wrongly included one: INDEX, WINDOW, OFFSET, RANK and
+# ROWNUMBER (window functions), plus MID, LEFT, RIGHT, LEN, TRIM, UPPER, LOWER, SUBSTITUTE, FIND,
+# SEARCH, CONCATENATE, VALUE, MEDIAN and the PERCENTILE family.
+_NON_DAX_FUNCTIONS = {
+    # Excel names, the family that broke a real customer deliverable
+    "TEXT": "FORMAT", "IIF": "IF", "VLOOKUP": "LOOKUPVALUE", "HLOOKUP": "LOOKUPVALUE",
+    "SUMIF": "CALCULATE(SUM(...), <filter>)", "SUMIFS": "CALCULATE(SUM(...), <filters>)",
+    "COUNTIF": "CALCULATE(COUNTROWS(...), <filter>)",
+    "COUNTIFS": "CALCULATE(COUNTROWS(...), <filters>)",
+    "AVERAGEIF": "CALCULATE(AVERAGE(...), <filter>)",
+    "TEXTJOIN": "CONCATENATEX", "PROPER": None,
+    # Tableau scalar / aggregate names
+    "ISNULL": "ISBLANK", "IFNULL": "COALESCE", "ZN": "COALESCE(<expr>, 0)",
+    "ATTR": "SELECTEDVALUE", "COUNTD": "DISTINCTCOUNT",
+    "DATEPARSE": "DATEVALUE", "DATENAME": "FORMAT", "DATEPART": "YEAR / MONTH / DAY / FORMAT",
+    "SPLIT": "PATHITEM", "MAKEPOINT": None, "MAKELINE": None,
+    "REGEXP_MATCH": None, "REGEXP_EXTRACT": None, "REGEXP_REPLACE": None,
+    # Tableau TABLE CALCULATIONS -- no scalar DAX equivalent; these need a rebuilt measure
+    "WINDOW_SUM": None, "WINDOW_AVG": None, "WINDOW_MAX": None, "WINDOW_MIN": None,
+    "WINDOW_COUNT": None, "RUNNING_SUM": None, "RUNNING_AVG": None, "RUNNING_MAX": None,
+    "RUNNING_MIN": None, "RUNNING_COUNT": None, "RANK_DENSE": "RANKX", "RANK_UNIQUE": "RANKX",
+    "RANK_MODIFIED": "RANKX", "RANK_PERCENTILE": "RANKX",
+    "SIZE": None, "TOTAL": None, "LOOKUP": "LOOKUPVALUE",
+}
+
+# ``(?<![A-Za-z0-9_.\[])`` so a MEASURE whose name contains a call -- 0088 really does define
+# ``WINDOW_MAX(Avg. Days Participation)*1.2`` -- is not mistaken for one when referenced as
+# ``[WINDOW_MAX(...)]``. NOT EXERCISED by the current corpus: measured both with and without the
+# lookbehind and both return 0, because nothing references those measures from an expression. It is
+# defensive, not validated evidence, and should not be cited as though the corpus proved it.
+_NON_DAX_CALL_RE = re.compile(
+    r"(?<![A-Za-z0-9_.\[])(%s)\s*\(" % "|".join(sorted(_NON_DAX_FUNCTIONS, key=len, reverse=True)),
+    re.IGNORECASE)
+
+_CALC_COLUMN_DECL_RE = re.compile(
+    r"^\tcolumn\s+(?P<name>'(?:[^']|'')*'|[^\t\n=]+?)\s*=(?P<expr>.*?)"
+    r"(?=^\t(?:measure|column|partition|hierarchy)\s|\Z)",
+    re.MULTILINE | re.DOTALL)
+
+
 def _expression_body(text):
     """Strip metadata lines from an object body, leaving only DAX expression text.
 
@@ -685,6 +734,7 @@ def check_model_openability(parts, flatfile_headers=None, expected_endpoints=Non
     bare_col_ok = True
     value_path_ok = True
     format_kept_ok = True
+    dax_funcs_ok = True
     all_measures = set()
     all_columns = set()
     measure_exprs = {}
@@ -878,6 +928,53 @@ def check_model_openability(parts, flatfile_headers=None, expected_endpoints=Non
                        % (owner, src_name, src_name, src_fmt)),
         })
 
+    # A FUNCTION NAME THAT DOES NOT EXIST IN DAX. Nothing else here validates one: every other check
+    # resolves REFERENCES (`[Measure]`, `'Table'[Column]`), and a bad function name is neither.
+    #
+    # Measured on a real customer deliverable: all FIVE objects with a direct syntax error called
+    # `TEXT(`, which is Excel. DAX is `FORMAT`. (Two further measures were broken by cascade off
+    # those five and call nothing invalid themselves -- they clear the moment the five compile.)
+    # Power BI reports it as
+    #
+    #     The syntax for '(' is incorrect. (VAR _val = 0 RETURN SWITCH([display_format], ...))
+    #
+    # -- a message naming neither the function nor the problem, and the agent that authored it spent
+    # its whole investigation hunting an unresolved Tableau calculation id that was never involved.
+    # Its own explanation carried the defect: "STR() -> easily converts to TEXT()". It converts to
+    # FORMAT(). Naming the real cause here turns a misleading engine error into a one-line fix, and
+    # that is most of this check's value.
+    #
+    # Scanned in EXPRESSIONS ONLY. `annotation TableauFormula` preserves the Tableau source, which
+    # legitimately contains `TEXT(`, `IIF(`, `WINDOW_MAX(` -- scanning expression-plus-annotations
+    # yields 77 false positives on a clean corpus, which would have made this unreadable on its
+    # first run. Measured before the check was written rather than after it misfired.
+    #
+    # Population: 0 across 248 corpus measures -- the deterministic translator cannot emit these --
+    # against 7/7 in the customer file. This is an ASSISTED-PATH defect, like the bare-reference
+    # class, and both landed in objects marked human-approved.
+    for path in sorted(parts):
+        text = parts[path]
+        if not (isinstance(text, str) and path.endswith(".tmdl")):
+            continue
+        for decl, kind in ((_MEASURE_DECL_RE, "measure"), (_CALC_COLUMN_DECL_RE, "column")):
+            for m in decl.finditer(text):
+                owner = _unquote(m.group("name"))
+                body = _expression_body(m.group("expr"))
+                for fname in sorted({f.upper() for f in _NON_DAX_CALL_RE.findall(body)}):
+                    use = _NON_DAX_FUNCTIONS.get(fname)
+                    fix = ("use %s instead" % use) if use else (
+                        "DAX has no equivalent -- this needs a rebuilt expression, not a rename")
+                    dax_funcs_ok = False
+                    issues.append({
+                        "check": "dax_functions_exist",
+                        "part": path,
+                        "detail": ("%s %r calls %s(), which is not a DAX function -- %s. The model "
+                                   "does not open: Power BI rejects it as \"The syntax for '(' is "
+                                   "incorrect\", a message that names neither the function nor the "
+                                   "problem, so this is usually mistaken for a broken reference"
+                                   % (kind, owner, fname, fix)),
+                    })
+
     checks = {
         "tmdl_wellformed": wellformed,
         "no_duplicate_columns": no_dupes,
@@ -887,6 +984,7 @@ def check_model_openability(parts, flatfile_headers=None, expected_endpoints=Non
         "bare_column_references_qualified": bare_col_ok,
         "measure_value_path_not_blank": value_path_ok,
         "wrapper_keeps_base_format_string": format_kept_ok,
+        "dax_functions_exist": dax_funcs_ok,
     }
     if expected_endpoints is not None and int(expected_endpoints) > 1:
         checks["endpoints_distinct"] = endpoints_ok
