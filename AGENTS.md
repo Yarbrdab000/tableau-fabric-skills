@@ -225,6 +225,23 @@ anchor to revert a bad release). Do all three, every time:
    this is a fact about **topology**. Necessary, insufficient — the same shape as a match-count
    assertion catching 1 of 7 corrupted captures.
 
+   **Re-pointing helps and does not solve it — measured, because the obvious fix looked complete.**
+   Re-pointing five anchors at the release commit of their declared predecessor (which is what the
+   anchor-predecessor gate demands) moved the worst case from **8 extra releases to 5**, and took one
+   anchor to **0**. It did not reach zero anywhere else, because **a release commit is itself on a
+   lane**: `pre-v2.293.0` now points at the dispatcher lane's 2.292.0 commit, which never contained
+   the colour lane's 2.269.0/2.270.0. Satisfying a gate about version *stamps* cannot fix a defect
+   about *reachability*. A complete fix would anchor at the integration line's own commit for that
+   version, not at the lane's.
+
+   **The over-discard count is worth keeping as a METRIC, not just a hazard.** An anchor's extra count
+   is exactly *how much other-lane work merged since that lane forked* — a direct read on
+   **integration lag**. `pre-v2.299.0` scoring 8 did not mean that anchor was broken; it meant that
+   lane had run parallel for 8 releases. One `git log` per anchor computes it (never one call per
+   anchor×release — that form ran past 400s without finishing, and an instrument too slow to complete
+   is one you will skip). The gate shape this suggests, if anyone builds it, is not "is the version
+   lower" but **"does this anchor's reachable set differ from the tip by exactly what it names."**
+
 4. **Run the CHANGELOG chain gate on EVERY commit of a rebased stack, not just the tip.**
    `tests/test_changelog_version_chain.py` asserts that each entry's declared predecessor equals the
    version produced by the entry beneath it, and that the newest entry matches the shipped `VERSION`.

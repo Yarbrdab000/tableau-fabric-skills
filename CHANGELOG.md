@@ -60,7 +60,6 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
   A ledger that silently kept passing after its debt was paid would be an allowlist, which is the
   failure mode the referential formulation was rejected for.
 
-
 ### Added
 
 - **`tableau-migration` (skill `2.300.0` → `2.301.0`): a comment shipped in `2.300.0` asserted
@@ -146,6 +145,7 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
   12 → 10 (0074's `['Lower', 'Upper']` → `[]`), visual calculations emitted 10 → 11. **Exactly one
   `visual.json` in the corpus changed**; 0070, 0076 and 0088 are byte-identical and merely gained honest
   review disclosures where a silent model stub used to be the only record.
+
 - **`tableau-migration` (skill `2.298.0` → `2.299.0`): an anchor left behind by an interleaved merge
   is now caught — "strictly lower" was never enough.** The existing gate (2.266.0) asserts `VERSION`
   at `rollback/pre-vX.Y.Z` is strictly *less* than `X.Y.Z`. Found by the integrator:
@@ -229,8 +229,6 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
   answer wrong. Inheriting someone else's *question* is the same defect as inheriting their answer,
   and far harder to see, because the work you did was correct. The verifier for this release derives
   over the whole population and names nothing in advance.
-
-### Fixed
 
 - **`tableau-migration` (skill `2.296.0` → `2.297.0`): the corrected `blocked_by` figure now names the
   PREDICATE it counts, and a test pins it there.** 2.292.0 corrected “8 of the 11” to “9 of the 11” in
@@ -357,8 +355,6 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
   The `0 of 16` is the number worth keeping: not one object on that page matched the size its author
   drew, and the report validated clean throughout. Render-verified on a fresh build.
 
-### Added
-
 - **`tableau-migration` (skill `2.292.0` → `2.293.0`): a Tableau donut rebuilds as a donut instead of
   a card reading `(Blank)`.** Reported on the Salesforce NPSP "Staff Capacity" dashboard, where the
   *Program Engagement Stage* ring — 320 engagements across seven stages — arrived as a
@@ -413,7 +409,6 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
   No code changed. `translation_router.py` was inspected and needed no fix.
 
-### Corrected
 
 - **`tableau-migration`: the 2.291.0 entry below said “8 of the 11”; the correct figure is “9 of the
   11”.** 8 is the count of entries `triage` independently called cascadable; 9 is the count carrying a
@@ -422,6 +417,8 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
   export rather than from the previous sentence. The same wrong figure remains in a code comment in
   `assemble_model.py` (`_unmigrated_dependency_index`'s summary counter) and is being handed to the
   session that owns that file rather than edited across an active lane boundary.
+
+### Corrected
 
 - **`tableau-migration` (skill `2.290.0` → `2.291.0`): a stub now names the calc that ACTUALLY failed,
   instead of inheriting its dependency's error (#173 family).** A calc that falls back only because a
@@ -587,6 +584,7 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
   a phantom shipping. That count *is* the measurement of the silence.
 
   Suite 5001 → **5008**.
+
 ### Added
 
 - **`tableau-migration` (skill `2.269.0` → `2.270.0`): a capability nobody can find no longer counts
@@ -785,8 +783,6 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
   human's unsaved edits. Runbook: `resources/desktop-bridge-reload.md`; the now-corrected
   close-and-reopen advice is in `resources/migration-gotchas.md`.
 
-### Fixed
-
 - **`tableau-migration` (skill `2.262.0` → `2.264.0`): a repeatable way to ask Power BI Desktop
   which JSON a formatting feature actually writes, instead of guessing the property name.**
   PBIR `visual.objects` resolves to `DataViewObjectDefinitions`, which permits **arbitrary**
@@ -800,8 +796,6 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
   `centerValue` shape that the npm catalog behind `validate` did not. Stdlib only, offline.
   Runbook: `resources/pbir-property-discovery.md`. Verified end-to-end by recovering
   `centerValue.show` from an injected edit.
-
-### Fixed
 
 - **`tableau-migration` (skill `2.261.0` → `2.262.0`): a workbook federating TWO bundled files now
   loads data instead of none.** Power BI refuses a relative `File.Contents` path outright — *"The
@@ -994,8 +988,6 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
   names the real gap: this path has no corpus coverage at all, exactly like Custom SQL before `0136`.
 
   Suite 4988 → **4995**.
-
-### Added
 
 - **`tableau-migration` (skill `2.254.0` → `2.257.0`): a keyword search can only disprove the word you
   chose, and the block protocol gains a timing rule.** Docs-only; no code, no corpus change.
@@ -2762,8 +2754,6 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
   Corpus: 29/29 built, **zero drift** across 695 emitted files.
 
-### Fixed
-
 - **`tableau-migration` (skill `2.148.0` → `2.149.0`): the last two slicers that pre-selected
   nothing, and a duplicate filter name that a warning-only gate lets through.** Investigated from
   #130, whose reporter filed the general claim and then — commendably — filed a correction against
@@ -2804,8 +2794,6 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
   duplicate-name warning, and the corpus emits **zero** `filterConfig`-only slicers (52
   `general.filter`, 22 with no default). Drift across 695 emitted files is 3 files, all in the one
   workbook that had the defect.
-
-### Fixed
 
 - **`tableau-migration` (skill `2.147.0` → `2.148.0`): a map's basemap is a per-worksheet property,
   so a module-level constant cannot be right.** Reported in #128. `_AZURE_MAP_DEFAULT_STYLE =
@@ -2850,8 +2838,6 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
   Corpus: 29/29 built, and the diff across **695** emitted files is exactly the three maps in
   `0063_remove_null_and_all` moving `blank_accessible` → `grayscale_light`. Nothing else moved.
-
-### Fixed
 
 - **`tableau-migration` (skill `2.146.0` → `2.147.0`): a BIFF8 `.xls` navigation table has no
   `Item`/`Kind` columns, so that key can never match.** Reported in #129 as a sibling of #108 — same
@@ -3802,7 +3788,6 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
   normalised for lineage tags), and **3 corrected a wrong table**, with no case where it disagreed
   with a previously-correct answer.
 
-### Fixed
 
 - **tableau-migration (skill `2.112.0` -> `2.113.0`): the PBIR objects and roles we emit have to be
   the ones the visual actually installs** (issue #100). Every name below was checked against the
@@ -3839,7 +3824,6 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
     PARAMETER-CONTROL slicers (a different emitter) still clipped at 44-75px. A test asserts the
     floor over every dropdown slicer, so a future third emitter is covered the day it is written.
 
-### Fixed
 
 - **tableau-migration (skill `2.111.0` -> `2.112.0`): the report must name a measure the way the
   model does.** 2.108.0 taught the MODEL to strip DAX identifier brackets from a measure name; the
@@ -3861,7 +3845,6 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
     beside it is correct. A dangling reference that survives the cross-check now also raises a
     warning, not just a report entry.
 
-### Added
 
 - **tableau-migration (skill `2.110.0` -> `2.111.0`): a gate that proves every VISUAL's model
   references resolve.** `reference_gate` has always proved this invariant for the DAX the second
@@ -3887,7 +3870,6 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
   - **It immediately found two real dangling references** on a workbook every other gate passes,
     including one introduced by 2.110.0's own predecessor — logged for fix, not silently absorbed.
 
-### Fixed
 
 - **tableau-migration (skill `2.109.0` -> `2.110.0`): the trellis collapse, fixed for BOTH spellings
   this time.** 2.105.0 fixed only half of it. Tableau writes "another axis in the same rectangle"
@@ -4066,7 +4048,6 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
     `91` at 36%; `255` is opaque). It was ignored entirely, so every translucent Tableau mark came
     back at full strength. It now maps to `dataPoint.transparency`.
 
-### Fixed
 
 - **tableau-migration (skill `2.102.0` -> `2.103.0`): a horizontal dual axis is still a dual axis,
   and its member names survive.** Tableau names a pane's measure axis after the shelf the measures
@@ -4104,7 +4085,6 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
     default install while the same query on a `filledMap` drew a real map. Nothing in the file is
     wrong and nothing the emitter can write turns it on, so it is disclosed instead.
 
-### Fixed
 
 - **tableau-migration (skill `2.101.0` -> `2.102.0`): a KPI title's headline number is found by what
   it RENDERS at, and rebuilt in proportion.** Tableau writes a big-number KPI INTO the worksheet
@@ -4147,7 +4127,6 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
   - Tableau's `Æ` layout sentinel was being counted as a text run by `_parse_title_style`, so a title
     whose real runs all agreed still deferred its styling.
 
-### Fixed
 
 - **tableau-migration (skill `2.100.0` -> `2.101.0`): an axis the author hid has no title either.**
   `visual.objects.<axis>.show: false` suppresses an axis's line, ticks and labels but NOT its title —
@@ -4158,7 +4137,6 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
   preserved on the object (`titleText`) so nothing is lost from the file — it is simply not shown on
   an axis the author turned off.
 
-### Fixed
 
 - **tableau-migration (skill `2.99.0` -> `2.100.0`): a table calc transforms the pill it sits on,
   not the first one the sheet happens to declare.** `datasource-dependencies` lists every table-calc
@@ -4180,7 +4158,6 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
     premise ("the quick-calc token does not survive onto the resolved value pill"); it now plots the
     calc's own pill, with the disproving evidence recorded in the test.
 
-### Fixed
 
 - **tableau-migration (skill `2.98.0` -> `2.99.0`): a second measure axis is a second SCALE, and a
   line overlaid with an area is a filled line.** Tableau spells "another measure axis in the same
@@ -4209,7 +4186,6 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
   - Verified end to end: the Area sheet now matches its Tableau reference, the two-measure sheet
     renders both series on their own scales, and the three-line running total is unchanged. Suite
     4285 passed / 6 skipped / 1 xfailed; corpus 29/29.
-### Fixed
 
 - **tableau-migration (skill `2.97.0` -> `2.98.0`): a measure trellis fans along the shelf its
   measures sit on.** Tableau splits the pane along whichever shelf the `+`-concatenated measure pills
@@ -4228,7 +4204,6 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
     by test in all four combinations.
   - Verified end to end: the two-aggregation sheet renders as stacked panes sharing the month axis,
     matching the Tableau reference. Suite 4284 passed / 6 skipped / 1 xfailed; corpus 29/29.
-### Fixed
 
 - **tableau-migration (skill `2.96.0` -> `2.97.0`): running totals and moving averages accumulate
   again -- and a colour-split one no longer renders blank.** Two separate defects combined to defeat
@@ -4253,7 +4228,6 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
   - Verified end to end on a nine-worksheet workbook: the two running-total sheets render smooth
     cumulative curves matching the Tableau reference, and the moving-average sheet loses the spike it
     had been drawing from raw values. Suite 4281 passed / 6 skipped / 1 xfailed; corpus 29/29.
-### Fixed
 
 - **tableau-migration (skill `2.95.0` -> `2.96.0`): the author's mark colour reached a chart only if
   it was on a DASHBOARD.** A worksheet is emitted by two paths -- one per dashboard zone, one per
@@ -4273,7 +4247,6 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
   - Verified end to end on a nine-worksheet workbook: the three orange sheets render orange, the
     three Segment-coloured sheets keep their per-member greens. Suite 4277 passed / 6 skipped /
     1 xfailed; corpus 29/29.
-### Changed
 
 - **tableau-migration (skill `2.94.0` -> `2.95.0`): a date TRUNCATION is a scalar grain column, not a
   drill hierarchy -- and the scrollbar it caused was hiding half the data.** A Tableau green `t*:`
