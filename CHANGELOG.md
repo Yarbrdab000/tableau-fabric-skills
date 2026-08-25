@@ -14,6 +14,46 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ### Added
 
+- **`tableau-migration` (skill `2.308.0` → `2.309.0`): a forwarding wrapper that drops its base's
+  `formatString` renders a CORRECT value as a wrong number — now gated.** The inverse of every
+  other check here. Everything else asks whether a value is absent or wrong; this asks whether a
+  *right* value is being presented as a wrong one.
+
+  Measured on corpus workbook 0088 and verified against the running model:
+  `EXCLUDE Days Since Goal Created Date Goals Completed by (filtered)` evaluates to **0.1732** and
+  renders **`0`** on the card, because it declares no `formatString` while the measure it forwards
+  declares `0.0%`. A reader sees a zero. Every value-level instrument reports it healthy —
+  *correctly*, because it **is** healthy. Only the presentation is missing.
+
+  Worth stating beside the customer defect behind 2.306.0, because they are opposite halves of one
+  class and both read as "zero" to whoever is looking:
+
+  | | |
+  |---|---|
+  | `VAR _val = 0` through currency formatting | a **wrong** value formatted **confidently** |
+  | `0.1732` with no format at all | a **right** value formatted into a **wrong** one |
+
+  **Scoped to forwarding wrappers**, which is what makes the rule safe rather than a matter of
+  taste: `CALCULATE([X], <filters>)` returns the same *kind* of number as `X`, so inheriting its
+  format is the only correct answer. A measure that **computes** its value — `DIVIDE`, arithmetic,
+  an aggregation — legitimately owns a different format from its inputs and is never flagged.
+  Propagation is not broken in general: `Clients per Staff (filtered)` inherits `#,##0;-#,##0`
+  correctly. It is the EXCLUDE/LOD path that drops it.
+
+  **Narrowed to percent formats on measurement, not taste.** A percent format scales what the
+  reader sees by 100, so losing it turns 0.1732 into `0` — the only case where a lost format is a
+  *correctness* bug rather than a styling one. The unnarrowed rule fires **5** times on the corpus:
+  2 percent (the verified defect and its intermediate wrapper) and 3 forwarding an integer `0`
+  format, where 7 still reads as 7. Those 3 are real fidelity losses and are deliberately **not**
+  claimed — failing a build's openability for a lost thousands separator would invite exactly the
+  allowlisting this repo refuses, and would dilute a check whose entire value is that every hit is
+  a wrong number on screen. Recorded in the tests rather than dropped.
+
+  An earlier hand-measurement of this population said **1**, because it resolved only a single
+  `CALCULATE([X], ...)` level and missed both the alias form and the nested chain. Third instance
+  in one session of a one-level instrument against a multi-level structure, and the reason the
+  check resolves the value path rather than pattern-matching a wrapper.
+
 - **`tableau-migration` (skill `2.306.0` → `2.308.0`): a measure can render blank while its
   expression is not `BLANK()` — now a hard openability failure.** Found by opening a build,
   refreshing it and looking at it. No static check in this repo could see it, and the reason is
