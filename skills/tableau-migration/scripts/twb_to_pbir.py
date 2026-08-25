@@ -207,17 +207,21 @@ SLICER_CTRL_H = 40.0
 # chrome pad added) -- the emitted box tracks the SOURCE card number-for-number, per the user. A small
 # absolute floor (SLICER_DROPDOWN_MIN_H) guarantees a degenerate tiny card still renders its control.
 #
-# The floor is 76px because that is what a Power BI dropdown slicer's own chrome costs: header 28 +
-# selector 32 + padding 8/8. Below it the header or the selector is CLIPPED and the control is
-# unusable -- a validation-invisible rendering bug, since the JSON is well-formed and the report
-# opens (issue #100: 16 slicers emitted between 45px and 64px, every one clipped). The previous 64.0
-# was an estimate of where Power BI starts clipping; the 76 is the arithmetic of the chrome itself.
+# The floor is 57px: the height Tableau itself authors for a filter card, and the height a Power BI
+# dropdown demonstrably needs at the 9pt face this emitter stamps (SLICER_FONT_PT). Render-verified
+# 2026-08-25 on the Salesforce NPSP "Staff Capacity" band -- every card showed its full label AND its
+# selector, with no clipping and no dead space.
 #
-# This deliberately overrides "track the source card number-for-number" ONLY at the bottom end: a
-# Tableau filter card and a Power BI dropdown have different chrome, so a faithful pixel copy of a
-# short Tableau card produces a control the reader cannot use. Every card at or above the floor is
-# still translated directly.
-SLICER_DROPDOWN_MIN_H = 76.0
+# It was 76.0, and that number is the arithmetic of Power BI's DEFAULT (~12pt) chrome: header 28 +
+# selector 32 + padding 8/8. That was correct when it was measured (issue #100: 16 slicers between
+# 45px and 64px, every one clipped) -- and it was measured BEFORE this emitter began stamping the
+# source's 9pt point size, which is the other half of that same fix. A floor calibrated against the
+# larger face outlived the reason for it, and then overrode the authored size on every dashboard:
+# a 57px Tableau card was silently grown to 76px, i.e. a third taller than the author drew it.
+#
+# Keep a floor -- a degenerate tiny card still has to render its control -- but set it to the
+# smallest height actually shown to work at the font we emit, not to the chrome of a font we do not.
+SLICER_DROPDOWN_MIN_H = 57.0
 SLICER_PAD_X = 7.0
 SLICER_ROW_GUTTER = 8.0
 SLICER_FONT_PT = 9.0
@@ -4730,6 +4734,28 @@ def _parse_shelf_totals(rows_el, cols_el):
             "cols": _flag(cols_el, "total"), "cols_on_top": _flag(cols_el, "onTop")}
 
 
+def _pane_has_ring_encodings(pane):
+    """Does this pane carry the encodings that DEFINE a pie/donut ring?
+
+    A Tableau donut is several stacked Pie panes: one draws the ring, the others draw the number in
+    the hole (and any spacers). Only the ring pane binds a ``color`` (the slice dimension) or a
+    ``wedge-size`` / ``angle`` (the slice measure) -- the rest carry ``text`` alone. Those encodings,
+    not pane order, are what identify the ring.
+
+    Conservative: a pane with no ``<encodings>`` returns False and the caller falls back to the first
+    Pie pane, which is precisely the previous behaviour, so a workbook without such a pane is
+    unaffected.
+    """
+    enc = _first(pane, "encodings") if pane is not None else None
+    if enc is None:
+        return False
+    for child in list(enc):
+        tag = str(child.tag).rsplit("}", 1)[-1].lower()
+        if tag in ("color", "wedge-size", "angle"):
+            return True
+    return False
+
+
 def _parse_worksheet(ws, index, ds_caption, warnings, internal_fields=None, date_binding=None,
                      row_count_binding=None, measure_binding=None, column_binding=None,
                      measure_palette=None, ds_color_palettes=None, workbook_root=None,
@@ -4755,11 +4781,20 @@ def _parse_worksheet(ws, index, ds_caption, warnings, internal_fields=None, date
     # pane hidden behind MIN(0) spacer axes that fake a donut ring). When a Pie pane is present,
     # drive the worksheet off it so its legend (colour) + angle (wedge-size) encodings are read
     # instead of the empty spacer pane. A genuine single-pane pie is unaffected (same pane).
-    pie_pane = next(
-        (p for p in all_panes
-         if _first(p, "mark") is not None
-         and (_first(p, "mark").get("class") or "").lower() == "pie"),
-        None)
+    #
+    # PICK THE PANE THAT CARRIES THE RING, NOT MERELY THE FIRST PIE PANE. When every pane is a Pie
+    # -- which is how Tableau writes a donut whose hole holds a total -- "first with a Pie mark" is
+    # a coin toss, and it lost. Measured on the Salesforce NPSP "Engagements by Stage Total": three
+    # Pie panes, whose <encodings> are text / (color=[Stage] + wedge-size) / text. The old selector
+    # took pane 1, so the ring's colour dimension never reached ``encodings``; ``latent_color``
+    # stayed False, the pie/donut card-collapse router could not fire, and the donut shipped as a
+    # ``card`` reading "(Blank) 320". The defining encodings ARE the discriminator the comment above
+    # already names, so select on them and fall back to the first Pie pane when none stands out.
+    pie_panes = [p for p in all_panes
+                 if _first(p, "mark") is not None
+                 and (_first(p, "mark").get("class") or "").lower() == "pie"]
+    pie_pane = next((p for p in pie_panes if _pane_has_ring_encodings(p)),
+                    pie_panes[0] if pie_panes else None)
     donut_hack = pie_pane is not None and len(all_panes) > 1
     if pie_pane is not None:
         pane = pie_pane

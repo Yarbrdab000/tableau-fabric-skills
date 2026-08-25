@@ -36,7 +36,7 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ### Added
 
-- **`tableau-migration` (skill `2.292.0` → `2.296.0`): the measurement-side rule the day's four defects
+- **`tableau-migration` (skill `2.295.0` → `2.296.0`): the measurement-side rule the day's four defects
   all shared, recorded once (docs-only).**
   [`resources/migration-gotchas.md`](skills/tableau-migration/resources/migration-gotchas.md) gains
   *“Its mirror image: a MEASUREMENT that is well-formed and says nothing”*, directly under the existing
@@ -70,6 +70,104 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
   session's arithmetic in a permanent rules doc would have been the very failure the section describes.
 
 ### Fixed
+
+- **`tableau-migration` (skill `2.294.0` → `2.295.0`): a stale measured constant stops overriding
+  every authored filter card.** With the cross-axis fix in place the solver correctly produced the
+  authored **57px** for a Tableau filter card — and the emitter then floored it back up to **76px**,
+  so the dead band under every dropdown survived a fix that had already solved it.
+
+  The 76 was not a guess. It is the arithmetic of Power BI's **default ~12pt** dropdown chrome
+  (header 28 + selector 32 + padding 8/8), measured against a real clipping defect: issue #100, 16
+  slicers emitted between 45px and 64px, every one clipped. It was correct when it was measured.
+
+  It was measured **before this emitter began stamping the source's 9pt point size** — which was the
+  other half of that same fix, and which shrinks the chrome the floor was protecting. So a constant
+  with genuine provenance quietly outlived its premise and started doing the opposite of its job:
+  instead of rescuing a degenerate card, it grew every faithfully-sized one by a third.
+
+  **A stale measured constant is more dangerous than a guessed one**, because its provenance is the
+  reason nobody re-checks it. Render-verified at 9pt: a 57px card shows its full label *and* its
+  selector, no clipping. The floor stays — a degenerate tiny card still has to render its control —
+  but is now set to the smallest height shown to work at the font actually emitted.
+
+  `layout_solve.MIN_SLICER` moves with it: an existing test asserts the solve reserves exactly what
+  emit will use, and moving one without the other would leave the solve under-reserving and
+  overrunning whatever it seated below.
+
+  The floor test now asserts the **constant** rather than a literal, and separately asserts the floor
+  actually bound. That literal had gone stale twice already — 64 → 76 → 57 — and each time turned a
+  deliberate re-measurement into a failure that said nothing about behaviour.
+
+### Added
+
+- **`tableau-migration` (skill `2.293.0` → `2.294.0`): an object is rebuilt at the size its author
+  drew it, not stretched to fill the container it sits in.** Reported as "we STILL cannot figure out
+  how to properly size things like filters and parameters", with a screenshot of a Tableau filter
+  card next to our rebuild of it — ours a third taller, with a dead band under every dropdown. The
+  reporter's own diagnosis was exactly right: *"a massive part of the issue is us not being able to
+  distinguish objects from the containers they are in."*
+
+  Tableau states both numbers outright. On the Salesforce NPSP "Staff Capacity" dashboard
+  (1366×768, `sizing-mode='fixed'`) a filter card is authored `h=7422` → **57px**, inside a
+  `layout-flow` authored `h=12890` → **99px**. We emitted **99.12px**: the container's height, not
+  the control's. The leftover 42px is Tableau's card padding, and Tableau does not give it to the
+  control.
+
+  The cause is one line of flexbox semantics. `layout_solve.allocate` distributes a flow container's
+  box among its children **by fraction on the main axis** — and then hands every child the
+  container's **entire cross-axis extent**, which is what a CSS flex container does and what a
+  Tableau layout does not. So the defect was never specific to slicers: the KPI row's worksheets were
+  inflated from their authored 235px to the container's 257px by the same line.
+
+  Now the cross axis maps the child's own source fraction into the allocated box — the flow-axis twin
+  of what `_scale_abs` already did for a `frame`. The main axis is untouched, so every fixed/min/
+  squeeze rule above it is unchanged; this only ever affects the axis that was previously ignoring
+  the source entirely. Fail-safe: a node whose `src` extent is unusable falls back to the old
+  stretch, the size is clamped up to the child's own minimum, and the offset is clamped so
+  `offset + size <= extent` — so cross-axis containment becomes unconditional, matching the promise
+  the module already makes on the main axis.
+
+  Measured on that dashboard, authored-vs-emitted across every object that pairs unambiguously:
+
+  | | before | after |
+  |---|---|---|
+  | objects within 10px of authored **size** | **0 of 16** | 3 of 16 |
+  | median object displacement | 44px | **22px** |
+  | objects within 10px of authored **position** | 4 of 16 | **7 of 16** |
+  | emitted visuals overlapping each other | 0 | 0 |
+
+  The `0 of 16` is the number worth keeping: not one object on that page matched the size its author
+  drew, and the report validated clean throughout. Render-verified on a fresh build.
+
+### Added
+
+- **`tableau-migration` (skill `2.292.0` → `2.293.0`): a Tableau donut rebuilds as a donut instead of
+  a card reading `(Blank)`.** Reported on the Salesforce NPSP "Staff Capacity" dashboard, where the
+  *Program Engagement Stage* ring — 320 engagements across seven stages — arrived as a
+  `multiRowCard` showing `(Blank) / 1 (filtered) / 320`.
+
+  A Tableau donut is several stacked Pie panes: one draws the ring, the others draw the number in
+  the hole. The emitter already knew to drive the worksheet off a Pie pane rather than the primary
+  one — its own comment says so verbatim, "so its legend (colour) + angle (wedge-size) encodings are
+  read". But it selected the **first** pane carrying a Pie mark, and when *every* pane is a Pie that
+  is a coin toss. It lost. This worksheet's three panes carry `text` / `color=[Stage]` +
+  `wedge-size` / `text`, and pane 1 won.
+
+  So the ring's colour dimension never reached `encodings`; `latent_color` stayed False; the
+  pie/donut router in `_card_collapse_alternatives` could not fire; and the worksheet fell through to
+  `card`. Every gate passed — the JSON is well-formed, the visual type is real, the fields resolve.
+  It is wrong only against the source.
+
+  The fix selects the pane carrying the encodings that *define* a ring (`color`, `wedge-size` or
+  `angle`), falling back to the first Pie pane when none stands out, so a workbook without such a
+  pane behaves exactly as before. Render-verified on a fresh build: the donut draws its stage
+  segments with labels (85 / 26.56%, 142 / 44.38%, 25, 17, 7), matching the Tableau reference.
+
+  The hole is still empty — the `320` is `donutChart.centerValue`, which Power BI defaults off and
+  the engine does not yet emit. Separate increment, deliberately not bundled here.
+
+  (Version jumps `2.270.0` → `2.293.0`: this branch was at 2.270.0 while the integration branch had
+  reached 2.291.0, so the block was claimed above that tip at the release step.)
 
 - **`tableau-migration` (skill `2.291.0` → `2.292.0`): the handover prose now tells a reader how to
   read the stub manifest without being misled by it (docs-only).** 2.291.0 added `blocked_by` so a
