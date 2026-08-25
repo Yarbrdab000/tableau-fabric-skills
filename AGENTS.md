@@ -401,6 +401,15 @@ same failure as trusting a return value instead of querying the model, wearing d
 and it is why *the rules most likely to be violated are the ones you wrote*. Authoring a rule creates
 the feeling of having internalised it, which is precisely the feeling that stops you checking.
 
+**Allocate against ANCESTRY, not only against the tag namespace.** `refs/tags` shows what is claimed
+at the moment you read it, and a read is stale the instant it returns — a tag cut seconds ago, or a
+cold worktree ref cache, both produce a confident "free". The decisive question is not *"is this tag
+absent?"* but ***"is a commit claiming this version already in the branch that would contain the
+work?"*** — `git merge-base --is-ancestor <sha> <branch>`, which needs no coordination and cannot be
+stale about your own ancestry. This is the pure-function rule applied to allocation itself: branch
+ancestry is state you can see; another session's unpushed commit is not, which is exactly the residue
+centralising cannot remove.
+
 What follows is why the previous rule was replaced, because it was not obviously broken.
 
 The old rule was: each session claims a contiguous block above the tip, and publishes that block's
