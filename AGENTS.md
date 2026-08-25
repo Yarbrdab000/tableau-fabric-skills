@@ -337,6 +337,26 @@ anchor to revert a bad release). Do all three, every time:
    > — and optimising for the check can move the property the wrong way.** Two green anchor gates
    > currently certify a rollback path that would destroy twelve releases.
 
+   **A shared mutable ref is safe to write concurrently iff its correct value is a pure function of
+   state both writers can see.** That is the line between the two coordination decisions in this
+   file, and it explains why one had to be centralised and the other did not:
+
+   * **Version allocation FAILS the test.** An unpushed commit on another worktree's branch is
+     invisible by construction, so no amount of care lets two allocators compute the same answer.
+     Centralising was the only available fix.
+   * **Anchor targets PASS it — but only under the right formulation.** "A commit stamped with the
+     declared predecessor" is **under-determined**: merges and doc commits inherit a `VERSION` without
+     changing it, so measured over 710 commits, **112 of 329 versions are carried by more than one
+     commit**. Two integrators can both satisfy the gate and write anchors that reset to materially
+     different trees. "The commit where `VERSION` **became** X" (stamped X, no parent stamped X) is
+     near-unique: **327 of 329**, with two historic exceptions (`1.23.0`, `1.25.0`) that each have two
+     introducers.
+
+   So the hazard is not *"more than one candidate integrator"* — it is **an under-specified target
+   with more than one candidate integrator.** Fix the specification and the number of writers stops
+   mattering. Two integrators converged on the same anchor today only because both independently
+   applied the introducer rule without stating it; nothing obliged a third to.
+
    **The over-discard count is worth keeping as a METRIC, not just a hazard.** An anchor's extra count
    is exactly *how much other-lane work merged since that lane forked* — a direct read on
    **integration lag**. `pre-v2.299.0` scoring 8 did not mean that anchor was broken; it meant that
