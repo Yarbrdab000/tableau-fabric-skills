@@ -12,6 +12,41 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ## [Unreleased]
 
+### Added
+
+- **`tableau-migration` (skill `2.292.0` → `2.296.0`): the measurement-side rule the day's four defects
+  all shared, recorded once (docs-only).**
+  [`resources/migration-gotchas.md`](skills/tableau-migration/resources/migration-gotchas.md) gains
+  *“Its mirror image: a MEASUREMENT that is well-formed and says nothing”*, directly under the existing
+  silent-output section — because it is the same defect turned on the instrument. A filter over a
+  population emits partial output that is indistinguishable from complete output, since the rows it
+  failed to match emit nothing to notice.
+
+  Two rules, the second of which is a **design** constraint rather than reading advice:
+
+  1. A filter must assert its match count against its population — and check the *captures*, not just
+     the match count, because a greedy-enough pattern will match and hand back a truncated token
+     rather than fail.
+  2. **When a summary list and a payload list sit side by side, any field that changes a decision must
+     be on BOTH.** You cannot fix this downstream by telling readers to look elsewhere: the reader who
+     needs telling is precisely the one who never got there. `translation_handoff` puts `blocked_by` on
+     both `needs_review` and `requests` for this reason; `category_guidance` sits on `requests` alone,
+     and that asymmetry caused a reported defect. Cross-linked from
+     [`second-compiler.md`](skills/tableau-migration/resources/second-compiler.md).
+
+  The worked example is sharper than the one first written for it, because re-deriving it from the
+  corpus contradicted the received account. `unsupported (?:function|table calculation) ([A-Z_]+)`
+  fails **two different silent ways at once**: `unsupported function size` matches nothing and
+  vanishes, while `unsupported function Total` **does** match — `[A-Z_]+` captures just `T` — and is
+  tallied under a function named `T`. So four of the five affected stubs were *present but
+  miscategorised*, not missing, which is the harder half to notice: the total stays right and only the
+  per-name breakdown is wrong.
+
+  Written against the artifact rather than the account: the first draft of this section repeated a
+  reported “25 vs 30, `TOTAL` and `SIZE` invisible”, and the re-derivation refused to reproduce it —
+  the drop is 1, the miscapture is 4, and the source string is lower-case `size`. Enshrining another
+  session's arithmetic in a permanent rules doc would have been the very failure the section describes.
+
 ### Fixed
 
 - **`tableau-migration` (skill `2.291.0` → `2.292.0`): the handover prose now tells a reader how to

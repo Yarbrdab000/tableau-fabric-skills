@@ -304,6 +304,45 @@ nothing*. Three sightings from three unrelated lanes, all found only by reading 
 Ask *"does this emitted artifact say anything"*, not *"is it well-formed"*. The two questions have
 different answers far more often than they look like they should.
 
+### Its mirror image: a MEASUREMENT that is well-formed and says nothing
+
+The same defect turned on the instrument. A filter, query or regex over a population produces
+*partial* output that is indistinguishable from *complete* output, because the rows it silently
+failed to match emit nothing to notice. Four sightings in a single day's work, from four people
+who all knew better:
+
+* a triage regex `unsupported (?:function|table calculation) ([A-Z_]+)` run over reason strings, which
+  failed **two different silent ways at once**: `unsupported function size` (lower-case in the source)
+  matched nothing and vanished, while `unsupported function Total` **did** match — `[A-Z_]+` happily
+  captured just `T` — and was tallied under a function named `T`. Five stubs affected, four of them
+  *present but miscategorised* rather than missing, which is the harder half to notice: the total was
+  right, so only the per-name breakdown was wrong;
+* `os.path.isdir(report["pbip_folder"])` — that value is a path to a **file**, so the check was
+  always `False` and every stub count silently read as `0`;
+* a stub-class ranking that used `fallback_reason` as ground truth, when 9 of the 11 entries in the
+  largest class were dependents inheriting a *dependency's* error (see `blocked_by` in
+  [second-compiler.md](second-compiler.md));
+* a claim that `category_guidance` was empty on 30 stubs, measured against `needs_review` — a list
+  that does not carry that key at all. It is empty on **0**.
+
+Two rules, and the second is the one people miss:
+
+1. **A filter over a population must assert its match count against that population.** `matched +
+   unmatched == total`, checked, not assumed — and check the *captures*, not just the match count,
+   because a greedy-enough pattern will match and hand you a truncated token rather than fail.
+2. **When a summary list and a payload list sit side by side, a reader will measure whichever they
+   find first — so any field that changes a decision must be on BOTH.** This is a *design* rule for
+   whoever adds the field, not a reading rule for whoever consumes it; you cannot fix it downstream
+   by telling readers to look elsewhere, because the reader who needs telling is precisely the one
+   who never got there. `translation_handoff` carries `blocked_by` on both `needs_review` and
+   `requests` for exactly this reason, while `category_guidance` — on `requests` only — produced the
+   fourth sighting above.
+
+And the rule that catches all of them: **re-derive every claim from the artifact, never from the
+sentence before it.** A number that is checked only against the previous draft of the same number
+will survive any quantity of careful reading. The `9 of 11` / `8 of 11` correction in the 2.291.0
+CHANGELOG entry had passed three human reads and fell on the first automated re-derivation.
+
 ---
 
 ## Security

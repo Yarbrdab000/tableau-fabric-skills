@@ -202,6 +202,14 @@ land a guess — the validation gate below is what enforces that, in place of a 
 > `blocked_by` states a fact (*these references are also unmigrated*), never the prediction *"this
 > would translate once they are fixed"*. That prediction is `triage`'s job and it is separately
 > fallible — see the caution under *Triage* below.
+>
+> **The general rule, for whoever adds the next field:** when a summary list and a payload list sit
+> side by side, a reader measures whichever they find first — so **any field that changes a decision
+> must be on BOTH.** `blocked_by` is on both deliberately; `category_guidance` is on `requests` only,
+> and that asymmetry is what produced hazard 1 above. This is a design constraint on the emitter, not
+> advice to the reader: you cannot fix it downstream by telling people to look elsewhere, because the
+> reader who needs telling is exactly the one who never got there. See
+> [migration-gotchas.md](migration-gotchas.md) § *a MEASUREMENT that is well-formed and says nothing*.
 
 `fields[].kind` is one of `field` (resolved to `table`/`column`/`type`), `calc` (a reference to
 another calculated field, with its `references_formula`), `parameter` (`[Parameters].[X]`), or
