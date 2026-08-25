@@ -29,6 +29,8 @@ import subprocess
 
 import pytest
 
+_VERSION_PATH = "skills/tableau-migration/VERSION"
+
 
 def _repo_root():
     here = os.path.dirname(os.path.abspath(__file__))
@@ -170,3 +172,107 @@ def test_anchor_names_parse_as_semver(repo):
     pat = re.compile(r"^rollback/pre-v\d+\.\d+\.\d+(-[A-Za-z0-9._-]+)?$")
     bad = sorted(t for t in tags if not pat.match(t))
     assert not bad, "anchor names must be rollback/pre-vX.Y.Z[-label]: %s" % bad
+
+
+def _version_at(root, shas):
+    """``{commit: VERSION-file-contents}`` for many commits, in ONE ``git cat-file --batch``.
+
+    Parsed by DECLARED BYTE SIZE, never by counting lines. ``git cat-file --batch`` emits the
+    ``<size>`` content bytes AND a trailing newline, so each entry occupies THREE lines, not two.
+    A line-walking parser that advances by two desynchronises by one line per commit -- and that
+    does not look like a parse error, because every anchor still receives a plausible semver, just
+    the *next* one's. Measured while building this test: it reported 67 broken rollbacks against a
+    repo whose anchors are in fact 306/306 clean. Read the size, trust nothing about line counts.
+    """
+    if not shas:
+        return {}
+    stdin = "".join("%s:%s\n" % (s, _VERSION_PATH) for s in shas).encode("utf-8")
+    try:
+        p = subprocess.run(["git", "cat-file", "--batch"], cwd=root, input=stdin,
+                           capture_output=True, timeout=120)
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    if p.returncode != 0:
+        return {}
+    buf, pos, out = p.stdout, 0, {}
+    for sha in shas:
+        nl = buf.find(b"\n", pos)
+        if nl < 0:
+            break
+        head = buf[pos:nl].decode("utf-8", "replace").split()
+        pos = nl + 1
+        if len(head) < 3 or head[1] != "blob":
+            out[sha] = None            # "<input> missing" -- header only, no body follows
+            continue
+        size = int(head[2])
+        out[sha] = buf[pos:pos + size].decode("utf-8", "replace").strip()
+        pos += size + 1
+    return out
+
+
+def test_every_anchor_predates_the_version_it_anchors(repo):
+    """``VERSION`` at ``rollback/pre-vX.Y.Z`` must be STRICTLY LESS than ``X.Y.Z``.
+
+    The two gates above ask whether an anchor EXISTS and whether git can RESOLVE it. Neither asks
+    whether it points anywhere useful, and that is the gap where the damage happens: an anchor
+    re-pointed at a *colliding session's* commit is still present and still reachable, so both pass
+    -- while ``git reset --hard rollback/pre-vX.Y.Z`` now lands you on work that already CONTAINS
+    X.Y.Z, or on a stranger's branch entirely. Rollback silently stops meaning rollback.
+
+    WHY THIS IS THE RIGHT INVARIANT AND "anchor == parent(bump)" IS NOT. The obvious formulation --
+    the anchor must be the parent of the commit that bumped VERSION -- is too strict, and measurably
+    so: 4 of 268 anchors violate it legitimately because the parent is a PR **merge** commit, two of
+    them with a byte-identical tree. Rollback is not a claim about commit identity. It is a claim
+    about the STATE you land in, and the state is exactly what the VERSION stamp records. Comparing
+    stamps tolerates merges, rebases and renumbers, and still catches every re-point that matters.
+
+    Measured across all history at the time of writing: 306 anchors, 306 satisfy this, 0 violate it.
+    So it is an exact property of the repo, not an aspiration being retrofitted.
+
+    HOW TO PROBE THIS GATE WITHOUT DESTROYING WHAT IT PROTECTS. Verified red by re-pointing a real
+    anchor at HEAD -- which meant deleting the real one first, in the single shared ``refs/tags``
+    namespace, i.e. committing the exact damage this test exists to catch. It was recoverable only
+    because that tag happened to be on ``origin``; an unpushed one would have been gone. The
+    additive probe is strictly better and just as red: **create a bogus low-numbered anchor**
+    (``git tag rollback/pre-v2.0.0-PROBE`` is not enough -- the label suffix is skipped by design;
+    use a bare unused version) pointing at HEAD, run, then delete only the tag you created. Never
+    re-point an existing anchor to test something.
+
+    Only bare ``rollback/pre-vX.Y.Z`` names are checked. A labelled anchor
+    (``rollback/pre-v1.9.0-comparison``) belongs to a different skill with its own VERSION stamp, and
+    comparing it against ``tableau-migration``'s would be a category error -- the same class of
+    mistake as the desync documented in ``_version_at``, where a plausible-looking number came from
+    the wrong place entirely.
+    """
+    import re
+
+    tags = _tag_commits(repo)
+    bare = {t: t[len("rollback/pre-v"):] for t in tags
+            if re.match(r"^rollback/pre-v\d+\.\d+\.\d+$", t)}
+    if not bare:
+        pytest.skip("no bare rollback anchors in this checkout")
+
+    shas = [tags[t] for t in bare]
+    at = _version_at(repo, shas)
+    if not at:
+        pytest.skip("could not read VERSION at the anchor commits")
+
+    def key(v):
+        return [int(x) for x in v.split(".")]
+
+    violations = []
+    for tag, ver in sorted(bare.items(), key=lambda kv: key(kv[1])):
+        got = at.get(tags[tag])
+        if not got or not re.match(r"^\d+\.\d+\.\d+$", got):
+            continue                   # predates the VERSION file; nothing to compare
+        if key(got) >= key(ver):
+            violations.append("%s -> %s, but VERSION there is already %s"
+                              % (tag, tags[tag][:8], got))
+
+    assert not violations, (
+        "rollback anchor(s) do NOT predate the version they anchor, so resetting to them does not "
+        "undo that release:\n  " + "\n  ".join(violations)
+        + "\n\nUsual cause: a colliding release re-pointed the tag at its own commit. refs/tags is "
+          "one namespace shared by every worktree, so the tag NAME can end up owned by one session "
+          "while the VERSION it anchors belongs to another. Re-cut at a commit whose VERSION is "
+          "lower than the anchored version -- normally the release's parent.")

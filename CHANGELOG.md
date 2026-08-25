@@ -14,6 +14,331 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ### Fixed
 
+- **`tableau-migration` (skill `2.274.0` → `2.275.0`): a per-visual status now says what was actually
+  CHECKED, so a false green is visible (#173).** `status: "rebuilt"` asserts only that the visual
+  emitter completed without raising and without attaching a warning. It is a claim about **our code**,
+  not about the emitted artifact — so a visual can be reported `rebuilt` and still fail to render.
+  Reported from the field as a scatter marked `rebuilt` while Desktop showed a live
+  `DataViewMappingError_ScatterGroupingValues`.
+
+  This is the rule already recorded in `migration-gotchas.md` — *read every confirmation at the
+  artifact, never at the mechanism* — applied to **our own published verdict**, which is worse than
+  the earlier instances because downstream consumers reasonably read a per-visual status as *"this
+  visual is fine"* and gate on it.
+
+  **The honest answer was already computed and discarded.** `lint_pbir_parts` runs on the SHIPPED
+  report bytes a few lines *below* where `viz_fidelity` is built, and its findings carry the part
+  path, so they are attributable. `rebuilt` could not see them purely because of **ordering**. Each
+  fidelity row now carries `evidence`:
+
+  * `"emitted"` — the emitter ran cleanly. Everything `rebuilt` used to mean.
+  * `"emitted+linted"` — additionally, the shipped bytes were structurally linted and no finding
+    names this worksheet's visual.
+  * `"lint_failed"` — a finding **does** name it. The false-green case, now visible while `status`
+    still reads `rebuilt`.
+
+  **Additive, and `status` is deliberately NOT narrowed.** Narrowing it would be more honest still,
+  but it is a breaking change to a field other teams consume — so it was offered on the issue as
+  their choice rather than imposed. Same spirit as `tier`.
+
+  **The fail-closed refusal is the load-bearing part**: when the lint did not run, every row stays
+  `"emitted"`. Claiming `"emitted+linted"` because nothing was found, when the reason nothing was
+  found is that nothing looked, would recreate this exact defect one level up. An unattributable
+  finding also flags nobody — a wrong attribution sends someone to the wrong sheet, which is worse
+  than none.
+
+  **A closed-key-set test caught the change and that is it working.** `viz_fidelity`'s row shape is
+  asserted as an exact set, precisely so a shape change is a deliberate act with a CHANGELOG entry
+  rather than something that leaks in. It falsified the loose phrasing of "additive, nothing breaks":
+  adding a key *is* a contract change. Updated in the same way `tier` was added before it, with the
+  allowed values and the non-contradiction invariant pinned alongside.
+
+  Suite 5008 → **5014**.
+
+- **`tableau-migration` (skill `2.268.0` → `2.274.0`): a published datasource reached only as a
+  SECONDARY no longer ships silently as a `localhost` phantom (#174).** A published Tableau
+  datasource connects through a federated proxy whose connection class is `sqlproxy` and whose server
+  is the literal `localhost` — an internal Tableau address, not an endpoint anything can reach. When
+  the **primary** datasource is that proxy the estate path already gates honestly (`pbip_status:
+  skipped`, needs-storage-decision). When a **secondary** is, nothing did: the workbook built, looked
+  complete, and carried an empty disconnected table pointed at `localhost`, while three sibling
+  workbooks in the same estate gated correctly.
+
+  **Verified independently before acting**, since the report was code-level: `secondary_datasources`
+  appears **exactly once** in the whole engine — written at its construction site, read nowhere — and
+  `storage_mode.py` contains **zero** references to `secondary`. Both of the reporter's measurements
+  were exact.
+
+  The write-only field turns out to be **deliberate**: `_workbook_binding_signal` documents itself as
+  *"records a SIGNAL; changes no routing today"*, pending a cross-skill catalog contract. So the
+  inert signal is not the bug. The bug is that the workbook then **ships a phantom with no
+  disclosure** — and the engine's own handover named the dependency, so it knew and said nothing
+  actionable.
+
+  Two changes, deliberately separate:
+
+  * `binding_signal` now records **`secondary_published_datasources`** — which secondaries are
+    themselves published. `secondary_datasources` carried bare labels, so nothing downstream (or
+    anyone reading the handover) could tell a published dependency from an ordinary one. Recorded as
+    its own key rather than by widening `is_published`: widening it would relabel the workbook's
+    `kind` as published, which is **false** — its primary is embedded — and every consumer that reads
+    `kind` to choose rebind-vs-rebuild would be told the wrong thing to fix a reporting gap.
+  * a new `phantom_published_proxy_tables` finding plus a warning, read from the **emitted**
+    connection parameters rather than re-derived from the workbook, naming the datasource and saying
+    the table opens empty.
+
+  **The silence is the defect, not the stub.** The model opens, validates and binds; the table is
+  simply always empty — the same family as a `= BLANK()` measure (2.227.0) and a dangling
+  `SelectRef`: structurally valid, semantically absent. Which is also why this is *third* instance of
+  the pattern in one file: `_workbook_blend_links` carries a comment recording issue #101, where a
+  declared block nothing read left a blended secondary related to nothing at all.
+
+  **Refusals are the feature.** `localhost` alone is an ordinary local SQL Server or Postgres, so
+  keying on the host would fire on valid models constantly; only the combination with the `sqlproxy`
+  parameter suffix means a published proxy. A `_sqlproxy` parameter pointing at a **real** host is a
+  successful rebind and is not reported. Both pinned by test.
+
+  **Clause 3 clean, both trees patched from the start:** disabling the detector gives
+  `3 failed, 5005 passed` — every failure one of the new tests, so nothing else in the suite notices
+  a phantom shipping. That count *is* the measurement of the silence.
+
+  Suite 5001 → **5008**.
+
+- **`tableau-migration` (skill `2.267.0` → `2.268.0`): a rebuilt Salesforce model no longer refuses
+  to OPEN with "ambiguous paths".** Reported from the field as a Power BI Desktop frown: *"There's a
+  problem with the definition content in your Power BI Project. There are ambiguous paths between
+  'pmdm__ServiceDelivery__c' and 'Date (Service Delivery)'."* Power BI does not render this badly —
+  it declines the entire project, which takes the semantic model sitting beside the report out of
+  reach too. This ranks with invalid TMDL, not with fidelity.
+
+  **A regression from the per-datasource calendar work (2.260.0 / 2.261.0), and measured as one**:
+  the pre-change engine emitted 28 active / 11 inactive relationships and **0** ambiguous pairs; the
+  post-change engine emitted 33 active / 6 inactive and **4**. Giving every fact its own active date
+  edge is safe until two facts are joined to *each other* as well as to the same calendar — then
+  `calendar→SD` and `calendar→PE→SD` are two filter paths. Neither edge is wrong on its own; the
+  defect exists only in the *relation between* them, which is precisely the shape no per-object
+  validator can see. `powerbi-report-author validate`, `pbir_lint` and definition-of-done all
+  passed on a file that would not open.
+
+  Two independent layers now close it. The **emitter** (`_activate_without_ambiguity`) activates a
+  fact's date edge only when doing so introduces no second path, walking candidates in a stable
+  order so the active graph stays a forest by construction; a fact that loses its direct edge is
+  still date-filtered through its neighbour and gets a warning naming `USERELATIONSHIP`. The
+  **openability gate** grows `unambiguous_relationship_paths`, so an ambiguity reaching the output
+  by any other route fails the build instead of shipping.
+
+  Filter DIRECTION is the whole check, not a detail: a relationship runs many→one while a filter
+  propagates one→many. Modelled undirected, the same model reports **90** ambiguous pairs instead of
+  4 — and an ordinary star (one calendar, two facts) looks broken, so the gate would fail every
+  healthy build. A test pins that negative.
+
+  Calibrated against Desktop in both directions: the gate fires on the exact build Desktop refused
+  and passes the rebuilt one, which Desktop then **opened**. Corpus A/B over all 1470 emitted files:
+  **4 changed — 3 timestamps and only `0088`'s `relationships.tmdl`**, 0 added, 0 removed. Across all
+  23 corpus models: 1 unopenable before, **0 after**.
+
+- **`tableau-migration` (skill `2.266.0` → `2.267.0`): a Tableau donut's white "hole" colour no
+  longer paints the whole report's data invisible.** `_harvest_workbook_palette` promotes every mark
+  colour a workbook uses to the FRONT of the report theme's `dataColors`, so single-series visuals
+  rebuild in the author's colours instead of Power BI blue. But a Tableau workbook legitimately
+  contains mark colours whose entire purpose is to be **invisible** — the classic donut is a pie
+  with a white circle punched through its middle, and spacer/halo marks are painted in the canvas
+  colour on purpose. Harvested as ordinary mark colours, one of those can land at `dataColors[0]`
+  and become the default series colour for every visual in the report.
+
+  Measured on `0090_small_multiples`, whose donut hack paints `#ffffff`: that white reached
+  position 0 and silently erased **five bar charts entirely** (every mark, white on white), **the
+  donut's own fourth slice** (503.17K / 21.63%, leaving a ring that merely looked broken), and **one
+  of the two series in all four time-series panels**. The report validated clean, `pbir_lint` passed,
+  and definition-of-done reported success throughout — the defect is invisible to every gate we have,
+  because a valid hex in a valid theme is exactly what all of them check for. It was found by opening
+  the build and looking at it.
+
+  Lead colours (brand + harvested) are now dropped when they are indistinguishable from the page
+  background, by WCAG contrast ratio below 1.2. **The rule is about contrast, not about white**: on
+  a dark dashboard a white mark is the author's most visible colour and is kept, while a near-black
+  one is dropped — a plain "strip `#ffffff`" fix would have been the same defect inverted, and a test
+  asserts exactly that. The curated Tableau 10/20 tail is deliberately NOT filtered, so a workbook
+  with no brand and no harvested colours stays byte-identical (the never-regress contract).
+
+  Corpus A/B across all 34 workbooks, every one of the 1470 emitted files compared: **7 changed —
+  the 4 intended theme files, and 3 that differ only by their generation timestamp.** 0 files added
+  or removed. `0090` dropped `#ffffff` (21→20 colours, position 0 now Tableau blue); `0088` dropped
+  `#f0f0f0` and `#ffffff`, both invisible on its `#f5f5f5` canvas, with its brand colour untouched at
+  position 0. Nothing added, relative order preserved. Re-verified by cold-opening the rebuilt `.pbip`
+  and looking: all five bar charts populated, the donut whole, both time-series measures visible.
+
+### Added
+
+- **`tableau-migration` (skill `2.265.0` → `2.266.0`): a rollback anchor that points at the wrong
+  commit is now caught, not just one that is missing or unreachable.** The two existing anchor gates
+  ask whether an anchor EXISTS and whether git can RESOLVE it. Neither asks whether it points
+  anywhere *useful* — and that is the gap where the damage lands. When two parallel sessions collide
+  on a version they also collide on its anchor NAME, because `refs/tags` is one namespace shared by
+  every worktree; the loser's release step re-points the tag at its own commit. The anchor is then
+  still present and still reachable, both gates pass, and `git reset --hard rollback/pre-vX.Y.Z`
+  quietly lands you on work that already contains X.Y.Z. Rollback stops meaning rollback with no
+  signal at all. Observed live twice, most recently when a batch `git tag -d` of three
+  "obviously mine" anchors removed two whose *versions* belonged to another session.
+
+  The new gate asserts the thing that actually defines a rollback: **`VERSION` at the anchor must be
+  strictly less than the version the anchor names.** The tempting stricter rule — anchor ==
+  parent of the bump commit — was measured and rejected: 4 of 268 anchors violate it *legitimately*
+  because the parent is a PR merge commit, two with a byte-identical tree. Rollback is not a claim
+  about commit identity but about the state you land in, and the VERSION stamp is exactly that
+  state, so comparing stamps tolerates merges, rebases and renumbers while still catching every
+  re-point. Measured across all history: **306 anchors, 306 satisfy it, 0 violations** — an exact
+  property of the repo, not a rule retrofitted onto it. Two git calls total; labelled anchors
+  belonging to other skills are skipped rather than mis-compared.
+
+  Verified red under injection, with the three sibling anchor gates staying green — the standard
+  that a gate is unproven until it fails on something its neighbours miss. Also records the
+  non-destructive way to probe it: **add** a bogus low-numbered anchor, never re-point a real one.
+  The first probe re-pointed a live anchor and was recoverable only because that tag happened to be
+  on `origin`.
+
+### Fixed
+
+- **`tableau-migration` (skill `2.264.0` → `2.265.0`): an edited PBIP now reaches a running Power BI
+  Desktop in about a second, instead of costing a ~115 s restart.** The repo's recorded wisdom was
+  that `powerbi-desktop reload` "does NOT re-read edited TMDL" — it returns `{"success": true}` and
+  the old measure expressions stay live — so only closing and reopening picks up a model change.
+  That observation was accurate; the conclusion drawn from it, that Desktop cannot do this, was not.
+  The Bridge's `file.reload/v1` takes a `reloadModelDefinition` parameter Microsoft documents as
+  defaulting to **true**, and the packaged CLI
+  (`@microsoft/powerbi-desktop-bridge-cli` 0.1.2, `dist/index.js` line 561) hard-codes it **false**.
+  One flag in a wrapper hid the capability for a release. `scripts/pbip_desktop_reload.py` sends
+  `true` over the same named pipe, stdlib only and offline.
+
+  Measured 2026-08-24 on a real migrated model: the **same** measure edit, reloaded two ways, read at
+  the artifact (`INFO.MEASURES()`) rather than at the return value — this script landed it, the stock
+  CLI left the old expression live, and **both printed `success: true`**. Neither run could be told
+  apart by its own output, which is precisely why the defect went unnoticed. Loaded data survives
+  (`COUNTROWS` read 9,994 before and after), so no re-refresh is needed to keep querying. Elapsed
+  3.9 s with a definition change, 0.6 s without.
+
+  It **does not** replace the cold open, which is the only thing that proves a file opens from
+  nothing — the class that produced the `pageOrder: []` crash. It speeds up the iterations between
+  cold opens. It also refreshes no data and persists no cache; `pbip-model-refresh` still owns both.
+  Refuses to guess between multiple Desktop instances, and `--require-saved` refuses to overwrite a
+  human's unsaved edits. Runbook: `resources/desktop-bridge-reload.md`; the now-corrected
+  close-and-reopen advice is in `resources/migration-gotchas.md`.
+
+### Fixed
+
+- **`tableau-migration` (skill `2.262.0` → `2.264.0`): a repeatable way to ask Power BI Desktop
+  which JSON a formatting feature actually writes, instead of guessing the property name.**
+  PBIR `visual.objects` resolves to `DataViewObjectDefinitions`, which permits **arbitrary**
+  property names — so `powerbi-report-author validate` can never catch a wrong formatting property,
+  and a misspelled or invented name validates clean and renders nothing. Every published schema also
+  lags Desktop by at least a month, so a new feature is unnameable from the catalog on the day it
+  ships. `scripts/pbir_property_probe.py` closes that gap by treating Desktop as the oracle:
+  `snapshot` a report, toggle the feature in the UI, `snapshot` again, and `diff` names the exact
+  JSON path that changed. `schema` cross-checks a candidate name against the release-tagged theme
+  schema, which is the richer of the two oracles — it knew `outerPadding`, `accentBar` and the real
+  `centerValue` shape that the npm catalog behind `validate` did not. Stdlib only, offline.
+  Runbook: `resources/pbir-property-discovery.md`. Verified end-to-end by recovering
+  `centerValue.show` from an injected edit.
+
+### Fixed
+
+- **`tableau-migration` (skill `2.261.0` → `2.262.0`): a workbook federating TWO bundled files now
+  loads data instead of none.** Power BI refuses a relative `File.Contents` path outright — *"The
+  supplied file path must be a valid absolute path"* — so a model emitted from Tableau's in-archive
+  path opens and loads **nothing**. `materialize_bundled_flatfile_data` exists precisely to prevent
+  that, by lifting the bundled file to an absolute location.
+
+  It lifted **one**: the datasource-level `flatfile_filename`. A **federated** datasource joins tables
+  from several connections, each carrying its own bundled file, so every table belonging to any other
+  connection kept its relative path — and one unresolvable partition is enough to fail the refresh.
+
+  **Why the corpus never caught it.** `_effective_connection` returns the **descriptor** when a
+  datasource has a single named connection, and the descriptor is exactly where that one absolute
+  path was written. All 34 corpus workbooks are single-connection, so the whole corpus passed while
+  the federated shape was broken. The corpus diff for this fix is **byte-identical apart from
+  timestamps** — real evidence of no regression, and equally that the corpus gives this path **zero**
+  coverage.
+
+  Measured on a user-supplied `Date Joins.twbx` — two `excel-direct` connections
+  (`Sample - Superstore.xlsx` joined to `Book1.xlsx` **on a date column**):
+
+  | | before | after |
+  |---|---|---|
+  | bundled files landed | 1 of 2 | **2 of 2** |
+  | partitions with an absolute path | **0 of 5** | **5 of 5** |
+  | refresh | `DataFormat.Error` | **`DATA_OK + PERSISTED`**, 10,194 rows |
+
+  And the join works end to end. Filtering `Orders` directly to 30 Dec 2026 gives **8** rows;
+  filtering `Sheet11` and propagating **through the date join** gives **8** — against 10,194
+  unfiltered, so a broken relationship would look visibly different rather than merely absent.
+
+  Per-connection paths are keyed by FILENAME and stamped onto each `relation["connection"]`, because
+  that inline dict is what `_effective_connection` hands the emitter on a multi-connection source; a
+  stamp confined to `descriptor["connections"]` is never read on the one shape this exists for. Two
+  bundled files sharing a basename land on distinct paths — overwriting would give one table the
+  other's data, a model that loads, refreshes, and is wrong.
+
+  **The tests initially did not catch this.** They called the helpers directly, so disabling the call
+  site left the suite green at 5013 passed with the bug injected — proving a helper works is not
+  proving anything reads it. A test against the public `materialize_bundled_flatfile_data` was added;
+  the injection then fails exactly 2 tests, both new.
+
+  Note the Tableau join was `full` outer. A Power BI relationship is filter propagation rather than a
+  join, so unmatched rows survive on both sides — closer to Tableau's full outer than an inner join
+  would be, but not identical, and not yet disclosed.
+
+### Added
+
+- **`tableau-migration` (skill `2.260.0` → `2.261.0`): the calendar's ACTIVE date is chosen from what
+  the workbook CHARTS, not from what its columns are called.** Power BI allows one active
+  relationship between a fact and a calendar, so the model build must pick each fact's business date.
+  It picked by naming convention — literally `Date`, an `order`-date, or a `created`-date — and
+  refused when nothing matched, emitting **every** date relationship inactive.
+
+  Refusing is not neutral. A fact with no active date cannot be filtered by the calendar at all, so
+  every date-axis visual over it returns the grand total in every bucket and renders as a flat line.
+  And real schemas do not follow the convention: Salesforce writes `pmdm__StartDate__c`,
+  `pmdm__EndDate__c`, `SystemModstamp`, `caseman__AssessmentCompletedDate__c`. Nothing matched, so
+  those facts lost their time axis entirely — `Date (Client Enrollment and participation)` had **four
+  date joins and zero active**.
+
+  The workbook already answers the question the convention was approximating: **the author put the
+  business date on a shelf.** `twb_to_pbir.date_field_usage` counts, per date column, how many
+  rows/cols/filters shelves place it; `_select_primary_date` prefers the clear winner and falls back
+  to the conventions when usage cannot decide. It travels the same report → model channel that
+  `scatter_keys` and `colour_palettes` already use.
+
+  **Measured on Salesforce NPSP** — of the 10 facts the calendars relate, 5 already had an active
+  date and usage resolves the other **5**, each with exactly one of its date columns used anywhere
+  (`pmdm__StartDate__c` ×2 while `pmdm__EndDate__c` is charted nowhere), leaving **0** unresolved:
+
+  | calendar | before | after |
+  |---|---|---|
+  | Assessments | 1 active / 4 inactive | **3 / 2** |
+  | Client Enrollment and participation | **0** / 4 | **2 / 2** |
+  | Intake | 2 / 1 | 2 / 1 |
+  | Service Delivery | 2 / 2 | **3 / 1** |
+  | **total** | **5 / 11** | **10 / 6** |
+
+  Every fact now has an active date; the 6 that remain inactive are the genuine role-playing
+  secondaries (`EndDate`, `SystemModstamp`, `ClosedDate`) — correct, since only one can be active.
+  Calendar-bound field refs on that report rise 5 → **8**, with **0** cross-island flat series.
+
+  **Fail-closed where the evidence is genuinely absent.** A usage TIE does not break the tie by
+  position — it falls through to the conventions, and if those cannot decide either, every
+  relationship stays inactive. Breaking a tie arbitrarily is exactly the "silently picking the wrong
+  business date" this has always refused to do.
+
+  **Corpus of 34:** 1612 → 1612 files, 0 added, 0 removed, **7 differing** — 4 in `0088` plus 3
+  metadata. **33 workbooks untouched**, calc coverage identical at 216/287. Corpus-wide date
+  relationships go 28 active / 22 inactive → **33 / 17**, the entire delta inside `0088`.
+
+  One trap worth recording: `migrate_datasource` forwards `**kwargs`, so adding the parameter to
+  `assemble_import_model` alone made `migrate_tds_to_semantic_model` (explicit signature, no
+  `**kwargs`) raise `TypeError` — which the caller catches, marking the whole `.pbip` **skipped**
+  rather than failing loudly. 22 tests caught it; without them a threading mistake would have
+  presented as workbooks quietly not building.
+
 - **`tableau-migration` (skill `2.258.0` → `2.260.0`): separate Tableau datasources now get separate
   calendars — the months-old blocker, root-caused.** A Tableau workbook can hold several
   datasources, and Tableau never lets one datasource's filters reach another's marks. Power BI has no
@@ -1290,7 +1615,6 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
   site instead. R8 is the gate that would have caught it, and now will.
 
   Corpus unchanged (29/29, dangling 0, no visual drift).
-
 
 - **`tableau-migration` (skill `2.167.0` → `2.175.0`): the conditional-colour compiler is WIRED —
   a string-member colour calc now paints cells and marks natively, with nothing added to the
@@ -3542,6 +3866,7 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
   **The reference image remains the handoff.** `reference_images.py` and the D7 / STEP 1.6 wiring
   (2.81.0-2.83.0) are untouched: capturing the original dashboard is what the downstream agent
   demonstrably needs, and it is a fact rather than an opinion about what to do with it.
+
 ## [0.3.0] - 2026-06-10
 
 A minor, additive release on the collection's own track (independent of any upstream

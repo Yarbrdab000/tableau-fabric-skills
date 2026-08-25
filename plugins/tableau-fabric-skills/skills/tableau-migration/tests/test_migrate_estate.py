@@ -2437,9 +2437,17 @@ def test_workbook_viz_fidelity_section_shape(tmp_path):
     assert entry["reason"] is None
     assert entry["tier"] == "rebuilt"          # clean rebuild, no deferral note
     for f in fid:
-        assert set(f) == {"worksheet", "visual_type", "status", "reason", "tier"}
+        # The key set is CLOSED on purpose: it forces a shape change to be a deliberate act with a
+        # CHANGELOG entry rather than something that leaks in. It grew once before for the additive
+        # ``tier`` and grows here for the additive ``evidence`` (#173) -- updating it is the act it
+        # exists to force, not a weakening of it. It caught this change, which is the point.
+        assert set(f) == {"worksheet", "visual_type", "status", "reason", "tier", "evidence"}
         assert f["status"] in {"rebuilt", "warned"}          # status unchanged (additive tier)
         assert f["tier"] in {"rebuilt", "rebuilt_with_deferrals", "degraded", "empty"}
+        # ``evidence`` records WHAT WAS CHECKED, so ``status`` keeps meaning exactly what it meant.
+        # "emitted" alone must remain reachable: it is what an unlinted build reports, and collapsing
+        # it into "emitted+linted" would make an absent check indistinguishable from a passed one.
+        assert f["evidence"] in {"emitted", "emitted+linted", "lint_failed"}
         # the additive tier never contradicts the existing status
         if f["status"] == "rebuilt":
             assert f["tier"] in {"rebuilt", "rebuilt_with_deferrals"}

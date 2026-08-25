@@ -185,6 +185,71 @@ def test_build_date_dimension_active_and_inactive():
     assert not report["warnings"]
 
 
+# =============================================================================
+# Choosing the ACTIVE date from the workbook's own usage, not from a name.
+# =============================================================================
+def test_shelf_usage_picks_the_primary_when_no_name_convention_matches():
+    # THE Salesforce shape. Neither column matches a convention (no "date"/"order"/"created"), so the
+    # name heuristic returned None and EVERY date relationship was emitted inactive -- the calendar
+    # then cannot filter that fact at all, so a date axis over it returns the grand total in every
+    # bucket. The workbook already answers the question: it charts pmdm__StartDate__c and never
+    # charts pmdm__EndDate__c.
+    tables = [_rel("Engagement", "pmdm__StartDate__c", "pmdm__EndDate__c")]
+    _n, _p, rels, report = _build_date_dimension(
+        tables, ["Engagement"], [], date_usage={"pmdm__startdate__c": 2})
+    by_col = {r["from_col"]: r["is_active"] for r in rels}
+    assert by_col == {"pmdm__StartDate__c": True, "pmdm__EndDate__c": False}
+    assert not report["warnings"]
+
+
+def test_without_usage_the_same_shape_still_declines():
+    # The precondition, so the test above is measuring the fix rather than restating the old
+    # behaviour: with no usage supplied this pair is genuinely ambiguous and ALL stay inactive.
+    tables = [_rel("Engagement", "pmdm__StartDate__c", "pmdm__EndDate__c")]
+    _n, _p, rels, report = _build_date_dimension(tables, ["Engagement"], [])
+    assert not any(r["is_active"] for r in rels)
+    assert any("multiple date columns" in w for w in report["warnings"])
+
+
+def test_the_most_used_date_wins():
+    tables = [_rel("Orders", "Opened", "Closed")]
+    _n, _p, rels, _r = _build_date_dimension(
+        tables, ["Orders"], [], date_usage={"opened": 5, "closed": 2})
+    assert {r["from_col"]: r["is_active"] for r in rels} == {"Opened": True, "Closed": False}
+
+
+def test_a_usage_tie_falls_back_to_the_naming_convention():
+    # Equal evidence is no evidence. ``Order_Date`` then wins on the convention, not on the tie.
+    tables = [_rel("Orders", "Order_Date", "Ship_Date")]
+    _n, _p, rels, _r = _build_date_dimension(
+        tables, ["Orders"], [], date_usage={"order_date": 3, "ship_date": 3})
+    assert {r["from_col"]: r["is_active"] for r in rels} == {"Order_Date": True, "Ship_Date": False}
+
+
+def test_a_usage_tie_with_no_convention_still_declines():
+    # Fail-closed: never break a genuine tie by position. Emitting one arbitrarily is exactly the
+    # "silently picking the wrong business date" this refuses to do.
+    tables = [_rel("Engagement", "pmdm__StartDate__c", "pmdm__EndDate__c")]
+    _n, _p, rels, _r = _build_date_dimension(
+        tables, ["Engagement"], [],
+        date_usage={"pmdm__startdate__c": 2, "pmdm__enddate__c": 2})
+    assert not any(r["is_active"] for r in rels)
+
+
+def test_usage_naming_none_of_the_columns_is_ignored():
+    # A usage map from a different fact must not disturb this one; the conventions still decide.
+    tables = [_rel("Orders", "Order_Date", "Ship_Date")]
+    _n, _p, rels, _r = _build_date_dimension(
+        tables, ["Orders"], [], date_usage={"some_other_date": 9})
+    assert {r["from_col"]: r["is_active"] for r in rels} == {"Order_Date": True, "Ship_Date": False}
+
+
+def test_a_single_date_column_is_primary_regardless_of_usage():
+    tables = [_rel("Orders", "Whatever_Stamp")]
+    _n, _p, rels, _r = _build_date_dimension(tables, ["Orders"], [], date_usage={})
+    assert [r["is_active"] for r in rels] == [True]
+
+
 def test_build_date_dimension_reports_dates_on_the_tables_it_skipped():
     # A skipped table's date columns are REPORTED even though it gets no relationship, because the
     # report binder matches a date pill by column NAME: a pure dimension carrying a name that is

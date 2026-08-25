@@ -2809,25 +2809,42 @@ def _inject_field_param_tables(parts, table_names, fp_parts, fp_names):
         table_names.extend(fp_names)
 
 
-def _select_primary_date(date_cols):
+def _select_primary_date(date_cols, usage=None):
     """Pick the primary (active-relationship) date column, or None when it's ambiguous.
 
-    A single date column is always primary. With several, prefer a column carrying one of the
-    explicit primary-date naming conventions -- literally ``Date``, an ORDER_DATE-like name, or a
-    record-CREATION date (``CreatedDate`` / ``Created Date`` / ``Date Created``, the canonical event
-    date in essentially every CRM / case / ticketing schema). If exactly one convention matches it is
-    primary; otherwise the choice is ambiguous and we return None so EVERY date relationship is
-    emitted inactive -- never silently picking the wrong business date (e.g. defaulting the calendar
-    to Ship Date over Order Date).
+    A single date column is always primary. With several, the workbook's OWN USAGE decides first:
+    ``usage`` maps a date column name to the number of shelves the author placed it on (see
+    ``twb_to_pbir.date_field_usage``). The column the workbook actually charts IS its business date,
+    which is the fact a naming convention was only ever approximating.
 
-    Recognising the creation-date convention matters because leaving them ALL inactive is not a
-    neutral outcome: the calendar then cannot filter that fact at all, so every date-axis visual over
-    it returns the grand total in every bucket and renders as a flat line / solid block. A fact whose
-    dates are ``CreatedDate`` + ``ClosedDate`` (no ``Date``/``Order Date`` anywhere) previously hit
-    exactly that, losing its whole time axis.
+    Falls back to the naming conventions when usage cannot decide -- literally ``Date``, an
+    ORDER_DATE-like name, or a record-CREATION date (``CreatedDate`` / ``Created Date`` /
+    ``Date Created``, the canonical event date in essentially every CRM / case / ticketing schema).
+    If exactly one convention matches it is primary; otherwise the choice is ambiguous and we return
+    None so EVERY date relationship is emitted inactive -- never silently picking the wrong business
+    date (e.g. defaulting the calendar to Ship Date over Order Date).
+
+    Leaving them ALL inactive is not a neutral outcome: the calendar then cannot filter that fact at
+    all, so every date-axis visual over it returns the grand total in every bucket and renders as a
+    flat line / solid block. Recognising the creation-date convention fixed one shape of that; usage
+    fixes the rest. Measured on Salesforce NPSP, whose schema matches NO convention
+    (``pmdm__StartDate__c``, ``SystemModstamp``, ``caseman__AssessmentCompletedDate__c``): of the 10
+    facts the calendar relates, 5 already had an active date and usage resolves the other **5**, each
+    with exactly one of its date columns used anywhere. ``pmdm__EndDate__c`` is used on no shelf and
+    correctly stays the inactive role-playing secondary.
     """
     if len(date_cols) == 1:
         return date_cols[0]
+
+    # 1. The workbook's own usage. A single clear winner is the author's business date; a TIE is a
+    #    genuine ambiguity and falls through rather than being broken arbitrarily.
+    if usage:
+        scored = [(c, usage.get((c or "").strip().lower(), 0)) for c in date_cols]
+        best = max((n for _c, n in scored), default=0)
+        if best > 0:
+            winners = [c for c, n in scored if n == best]
+            if len(winners) == 1:
+                return winners[0]
 
     def _norm(s):
         return (s or "").strip().lower().replace("_", " ").replace("-", " ")
@@ -2925,7 +2942,7 @@ def _stub_backed_tables(tables):
 
 
 def _build_date_dimensions(tables, emitted_names, relationships, *, mark_as_date=True,
-                           mode="import", date_range=None):
+                           mode="import", date_range=None, date_usage=None):
     """One Date dimension PER DATASOURCE ISLAND -> ``([(name, part)], rels, report)``.
 
     A workbook with several datasources keeps them as ISLANDS: Tableau never lets one datasource's
@@ -2955,7 +2972,7 @@ def _build_date_dimensions(tables, emitted_names, relationships, *, mark_as_date
     if not PER_ISLAND_DATE_ENABLED or len(islands) < 2:
         name, part, rels, report = _build_date_dimension(
             tables, emitted_names, relationships, mark_as_date=mark_as_date, mode=mode,
-            date_range=date_range)
+            date_range=date_range, date_usage=date_usage)
         return ([(name, part)] if part is not None else []), rels, report
 
     built, all_rels, reports = [], [], []
@@ -2966,7 +2983,8 @@ def _build_date_dimensions(tables, emitted_names, relationships, *, mark_as_date
             continue
         name, part, rels, report = _build_date_dimension(
             own, taken, relationships, mark_as_date=mark_as_date,
-            name_pref="Date (%s)" % ds, mode=mode, date_range=date_range)
+            name_pref="Date (%s)" % ds, mode=mode, date_range=date_range,
+            date_usage=date_usage)
         if part is None:
             continue
         built.append((name, part))
@@ -2984,8 +3002,74 @@ def _build_date_dimensions(tables, emitted_names, relationships, *, mark_as_date
                              "tables": [n for n, _ in built], "islands": reports}
 
 
+def _filter_reach(adjacency, start):
+    """Every table a filter placed on ``start`` can reach, following ``adjacency``."""
+    seen, stack = set(), [start]
+    while stack:
+        node = stack.pop()
+        for nxt in adjacency.get(node, ()):  # noqa: SIM118 - dict.get on a defaultdict-free map
+            if nxt not in seen:
+                seen.add(nxt)
+                stack.append(nxt)
+    return seen
+
+
+def _activate_without_ambiguity(candidates, relationships, date_name):
+    """Which tables may keep an ACTIVE calendar relationship -> ``{display_name, ...}``.
+
+    POWER BI REFUSES TO OPEN A PROJECT THAT HAS TWO ACTIVE FILTER PATHS BETWEEN ANY TWO TABLES.
+    Not "renders oddly" -- the whole ``.pbip`` fails to load with *"There are ambiguous paths between
+    'X' and 'Y'"*, which also takes the model beside it out of reach. Giving every fact its own
+    active date edge is therefore not safe on its own: two facts joined to EACH OTHER and both joined
+    to the SAME calendar form a diamond, and the second path appears without either edge looking
+    wrong in isolation.
+
+    Measured on Salesforce NPSP: ``Date (Service Delivery)`` reached ``pmdm__ServiceDelivery__c``
+    both directly and through ``pmdm__ProgramEngagement__c``, and Desktop refused the project. Four
+    such pairs existed in one model. The per-island calendar split already removes the CROSS-island
+    form of this (one hub touching every island manufactures routes between otherwise clean stars);
+    this closes the WITHIN-island form, which the split cannot.
+
+    Greedy and order-deterministic: candidates are considered in a stable order and one is activated
+    only when doing so introduces no second path. Because an edge is added only when its whole
+    downstream set is currently unreachable from the calendar, the active graph stays a forest by
+    construction -- there is no second pass and no possibility of ending ambiguous.
+
+    Filter direction matters and inverting it inverts the answer. A relationship runs
+    ``from`` (MANY) -> ``to`` (ONE), while a filter propagates ONE -> MANY, i.e. ``to`` -> ``from``.
+    Modelling this undirected reports ambiguity everywhere a date table touches two facts, which is
+    the normal, legal star shape.
+    """
+    adjacency = {}
+    for rel in (relationships or []):
+        if rel.get("is_active") is False:
+            continue
+        src, dst = rel.get("to_table"), rel.get("from_table")
+        if not src or not dst:
+            continue
+        adjacency.setdefault(src, set()).add(dst)
+        if rel.get("cross_filter") == "both":
+            adjacency.setdefault(dst, set()).add(src)
+
+    # Stable order: a table whose primary date the workbook actually charts wins the direct edge,
+    # then alphabetical so the outcome never depends on dict iteration order.
+    ordered = sorted((c for c in candidates if c[2] is not None), key=lambda c: c[0])
+
+    activated = set()
+    for disp, _cols, _primary in ordered:
+        reachable_now = _filter_reach(adjacency, date_name)
+        if disp in reachable_now:
+            continue  # a second path -- leave this one inactive
+        downstream = _filter_reach(adjacency, disp) | {disp}
+        if downstream & reachable_now:
+            continue  # activating would create a second path to something further down
+        adjacency.setdefault(date_name, set()).add(disp)
+        activated.add(disp)
+    return activated
+
+
 def _build_date_dimension(tables, emitted_names, relationships, *, mark_as_date=True,
-                          name_pref="Date", mode="import", date_range=None):
+                          name_pref="Date", mode="import", date_range=None, date_usage=None):
     """Detect fact date columns and build a shared Date dimension + its relationships.
 
     Returns ``(date_table_name|None, date_table_tmdl|None, date_relationships, report)``. Only
@@ -3052,15 +3136,30 @@ def _build_date_dimension(tables, emitted_names, relationships, *, mark_as_date=
         date_name = f"{name_pref} {i}"
 
     rels, warnings, details = [], [], []
+    # Which fact keeps its DIRECT calendar edge is decided by an ambiguity-avoiding pass below, not
+    # by iteration order, so the candidate primaries are collected first.
+    candidates = []
     for disp, date_cols in by_table:
-        primary = _select_primary_date(date_cols)
+        primary = _select_primary_date(date_cols, usage=date_usage)
         if primary is None:
             warnings.append(
                 f"table '{disp}' has multiple date columns with no clearly primary one "
                 f"({', '.join(date_cols)}); all emitted inactive -- set the active date via "
                 f"USERELATIONSHIP or a model edit.")
+        candidates.append((disp, date_cols, primary))
+
+    activated = _activate_without_ambiguity(candidates, relationships, date_name)
+    for disp, date_cols, primary in candidates:
+        if primary is not None and disp not in activated:
+            warnings.append(
+                f"table '{disp}' date column '{primary}' is emitted INACTIVE: activating it would "
+                f"give '{date_name}' two filter paths to '{disp}' (the second runs through another "
+                f"fact already joined to this calendar), and Power BI REFUSES TO OPEN a project with "
+                f"an ambiguous path. '{disp}' is still date-filtered through that other fact; use "
+                f"USERELATIONSHIP to aggregate on its own date.")
+    for disp, date_cols, primary in candidates:
         for col in date_cols:
-            active = col == primary
+            active = (col == primary and disp in activated)
             rel = {
                 "from_table": disp, "from_col": col,
                 "to_table": date_name, "to_col": "Date",
@@ -4161,7 +4260,7 @@ def assemble_import_model(descriptor, *, model_name, calcs=None, dim_calcs=None,
                           calc_lookup=None, approved_calc_dax=None, date_range=None,
                           parameters=None, table_calc_usages=None, calc_outer_aggs=None,
                           scatter_keys=None, storage_decision=None,
-                          colour_palettes=None, semantic_colours=False):
+                          colour_palettes=None, semantic_colours=False, date_usage=None):
     """Assemble the Import/DirectQuery semantic model definition for a parsed descriptor.
 
     Returns ``{"parts": {path: text}, "report": {...}}``. Raises ``ValueError`` if the
@@ -4310,7 +4409,7 @@ def assemble_import_model(descriptor, *, model_name, calcs=None, dim_calcs=None,
     if date_table:
         _date_built, date_rels, date_report = _build_date_dimensions(
             tables, table_names, all_rels, mark_as_date=mark_as_date, mode=mode,
-            date_range=date_range)
+            date_range=date_range, date_usage=date_usage)
         for _dn, _dp in _date_built:
             parts[f"definition/tables/{_dn}.tmdl"] = _dp
             table_names.append(_dn)
@@ -5273,7 +5372,8 @@ def migrate_tds_to_semantic_model(tds_text, *, model_name, calcs=None, dim_calcs
                                   parameters=None, table_calc_usages=None, descriptor=None,
                                   emit_linguistic=False, calc_outer_aggs=None,
                                   scatter_keys=None, storage_decision=None,
-                                  colour_palettes=None, semantic_colours=False):
+                                  colour_palettes=None, semantic_colours=False,
+                                  date_usage=None):
     """One-call convenience: parse ``.tds``/``.twb`` text and assemble the Import/DirectQuery model.
 
     ``calcs`` are the MEASURE-role calculated fields and ``dim_calcs`` the DIMENSION/row-level ones
@@ -5383,7 +5483,8 @@ def migrate_tds_to_semantic_model(tds_text, *, model_name, calcs=None, dim_calcs
                                    calc_outer_aggs=calc_outer_aggs,
                                    scatter_keys=scatter_keys, storage_decision=storage_decision,
                                    colour_palettes=colour_palettes,
-                                   semantic_colours=semantic_colours)
+                                   semantic_colours=semantic_colours,
+                                   date_usage=date_usage)
     # Splice harvested Group/Bin calc columns onto their resolved home tables -- the same additive
     # pre-partition injection as dim_calcs (byte-for-byte unchanged when there are no groups/bins).
     harvest_parts = result.get("parts") if isinstance(result, dict) else None
@@ -5980,6 +6081,101 @@ def _extract_csv_paths_by_relation(hr, arc_path, descriptor, hyper_members, out_
     return out
 
 
+def _materialize_connection_flatfiles(packaged_source, descriptor, dest_dir):
+    """``{normalised bundled filename: absolute path}`` for every flat file this datasource carries.
+
+    A FEDERATED datasource joins tables from several connections, and each connection carries its own
+    bundled file. The datasource-level ``flatfile_filename`` names only ONE of them, so lifting that
+    alone leaves every other connection's tables pointing at their in-archive RELATIVE path -- and
+    Power BI refuses a relative ``File.Contents`` outright (*"The supplied file path must be a valid
+    absolute path"*), so the model opens and loads nothing at all.
+
+    Measured on a user's ``Date Joins.twbx``: two ``excel-direct`` connections
+    (``Sample - Superstore.xlsx`` and ``Book1.xlsx``), only the first landed, and every one of the
+    five tables emitted a relative path. The single-connection case never showed it because
+    ``_effective_connection`` returns the DESCRIPTOR when there is one connection, and the descriptor
+    is exactly where the one absolute path was written.
+
+    Keyed by FILENAME rather than by connection key, because the emitter does not read
+    ``descriptor["connections"]`` at all: for a multi-connection source ``_effective_connection``
+    hands it ``relation["connection"]``, an inline facts dict. The filename is the one field both
+    carry, so it is what the two sides can actually be joined on.
+
+    Fail-closed and never raises: a file that cannot be lifted is simply absent from the map and its
+    tables keep their previous (relative) path.
+    """
+    out = {}
+
+    def _add(fn, directory):
+        if not fn:
+            return
+        key = str(fn).replace("\\", "/").strip().lower()
+        if key in out:
+            return
+        try:
+            p = extract_bundled_flatfile(packaged_source, descriptor, dest_dir,
+                                         filename=fn, directory=directory or "")
+        except Exception:
+            p = None
+        if p:
+            out[key] = p
+
+    conns = (descriptor or {}).get("connections") or {}
+    for _k, conn in (conns.items() if isinstance(conns, dict) else enumerate(conns)):
+        if isinstance(conn, dict):
+            _add(conn.get("flatfile_filename") or conn.get("filename"),
+                 conn.get("flatfile_directory") or conn.get("directory"))
+    # A relation can carry its own inline connection facts that never appear in ``connections``.
+    for rel in (descriptor or {}).get("relations") or []:
+        rc = rel.get("connection") if isinstance(rel, dict) else None
+        if isinstance(rc, dict):
+            _add(rc.get("flatfile_filename") or rc.get("filename"),
+                 rc.get("flatfile_directory") or rc.get("directory"))
+    return out
+
+
+def _descriptor_with_connection_flatfile_paths(descriptor, connection_paths):
+    """A COPY of ``descriptor`` whose connection facts carry their materialised absolute paths.
+
+    Stamps BOTH ``descriptor["connections"]`` and each ``relation["connection"]`` inline dict, matched
+    on the bundled filename. The relation-level stamp is the one that does the work:
+    ``_effective_connection`` hands the emitter ``relation["connection"]`` whenever the datasource has
+    more than one named connection, so a stamp confined to ``descriptor["connections"]`` is never
+    read on exactly the federated shape this exists for.
+
+    Copied rather than mutated because the caller's descriptor is shared with the estate's own
+    reporting; stamping in place would leak an absolute build path into records that outlive it.
+    """
+    if not connection_paths:
+        return descriptor
+
+    def _key(d):
+        fn = d.get("flatfile_filename") or d.get("filename")
+        return str(fn).replace("\\", "/").strip().lower() if fn else None
+
+    def _stamp(d):
+        k = _key(d) if isinstance(d, dict) else None
+        return dict(d, flatfile_path=connection_paths[k]) if k in connection_paths else d
+
+    out = dict(descriptor)
+    conns = descriptor.get("connections") or {}
+    if isinstance(conns, dict):
+        out["connections"] = {k: _stamp(v) for k, v in conns.items()}
+    elif conns:
+        out["connections"] = [_stamp(v) for v in conns]
+    rels = descriptor.get("relations") or []
+    if rels:
+        new_rels = []
+        for rel in rels:
+            rc = rel.get("connection") if isinstance(rel, dict) else None
+            if isinstance(rc, dict):
+                stamped = _stamp(rc)
+                rel = dict(rel, connection=stamped) if stamped is not rc else rel
+            new_rels.append(rel)
+        out["relations"] = new_rels
+    return out
+
+
 def materialize_bundled_flatfile_data(packaged_source, descriptor, dest_dir, *, model_name="model"):
     """Land a flat-file datasource's BUNDLED data to ABSOLUTE on-disk paths so the emitted Import
     model loads in Power BI Desktop -- a relative ``File.Contents`` path opens but loads nothing
@@ -6005,7 +6201,7 @@ def materialize_bundled_flatfile_data(packaged_source, descriptor, dest_dir, *, 
     import os as _os
     import tempfile as _tf
     result = {"kind": None, "reason": None, "hyper_present": False,
-              "flatfile_path": None, "table_csv_paths": None}
+              "flatfile_path": None, "table_csv_paths": None, "connection_paths": {}}
     # A flat-file source is identified by its bundled filename; an extract-backed source (including a
     # SaaS connector such as Salesforce that has no first-party Power BI rebuild) carries only a
     # .hyper and no named file, so ``is_extract`` also engages the materializer -- step 1 no-ops (no
@@ -6025,7 +6221,9 @@ def materialize_bundled_flatfile_data(packaged_source, descriptor, dest_dir, *, 
     except Exception:
         ff = None
     if ff:
-        result.update(kind="flatfile", flatfile_path=ff)
+        result.update(kind="flatfile", flatfile_path=ff,
+                      connection_paths=_materialize_connection_flatfiles(
+                          effective_source, descriptor, dest_dir))
         return result
 
     # 2. Extract case: the named flat file is not packaged, but a .hyper may be. Resolve a usable
@@ -6194,6 +6392,13 @@ def migrate_datasource(source, *, model_name, write_to=None, as_pbip=False, data
                 packaged_source or source, descriptor, _ff_dest, model_name=model_name)
             if _ff_mat.get("kind") == "flatfile":
                 kwargs["flatfile_path"] = _ff_mat.get("flatfile_path")
+                # A FEDERATED datasource bundles one file PER CONNECTION; the datasource-level path
+                # above names only one of them. Stamp each connection's own materialised absolute
+                # path so ``_flatfile_path_for(conn)`` resolves it -- without this, every table from
+                # any other connection keeps its in-archive RELATIVE path and Power BI loads nothing
+                # ("The supplied file path must be a valid absolute path").
+                descriptor = _descriptor_with_connection_flatfile_paths(
+                    descriptor, _ff_mat.get("connection_paths"))
             elif _ff_mat.get("kind") == "csv":
                 local_data = _ff_mat.get("table_csv_paths")
 

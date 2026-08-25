@@ -2620,6 +2620,21 @@ def _workbook_binding_signal(twb_text, ir):
         return None
     primary, secondaries = _rank_primary_datasource(inventory, ir)
     is_published = (primary.get("connection_class") or "").strip().lower() == "sqlproxy"
+    # Which SECONDARIES are themselves published (#174). ``is_published`` above is deliberately
+    # about the PRIMARY -- that is what ``kind`` describes -- but a workbook can have an EMBEDDED
+    # primary and a PUBLISHED secondary, and that shape used to be invisible: ``secondary_datasources``
+    # carried bare labels, so nothing downstream (or reading the handover) could tell a published
+    # dependency from an ordinary one. The workbook then built with an empty ``sqlproxy`` proxy table
+    # pointed at ``localhost``, while sibling workbooks whose PRIMARY was published gated honestly.
+    # Recorded as its own key rather than by widening ``is_published``: widening it would relabel the
+    # workbook's ``kind`` as published, which is false -- its primary is embedded, and every consumer
+    # that reads ``kind`` to decide rebind-vs-rebuild would be told the wrong thing to fix a
+    # reporting gap.
+    secondary_published = [
+        s.get("label") or s.get("caption") or s.get("name")
+        for s in secondaries
+        if (s.get("connection_class") or "").strip().lower() == "sqlproxy"
+    ]
     label = primary.get("label") or primary.get("caption") or primary.get("name")
 
     view_local_calcs = []
@@ -2657,6 +2672,7 @@ def _workbook_binding_signal(twb_text, ir):
         "primary_datasource": label,
         "published_ds_name": label if is_published else None,
         "secondary_datasources": [s.get("label") for s in secondaries],
+        "secondary_published_datasources": secondary_published,
         "view_local_calcs": view_local_calcs,
         "recommendation": recommendation,
         "note": note,
@@ -3218,6 +3234,30 @@ def _scatter_keys_from_ir(result):
         return []
 
 
+def _date_usage_from_ir(result):
+    """``{date column (lowered): shelf uses}`` this workbook's IR reports, or ``{}``.
+
+    Pure reader of the first viz pass, mirroring ``_scatter_keys_from_ir`` / ``_colour_palettes_from_ir``:
+    only the report layer can see which date field the author actually put on a shelf, and only the
+    model can choose the calendar's ACTIVE relationship, so the fact travels report -> model.
+
+    This is what lets ``assemble_model._select_primary_date`` stop guessing from naming conventions.
+    Never raises: an IR that cannot be read supplies no usage, and the model build falls back to the
+    conventions exactly as before.
+    """
+    try:
+        ir = (result or {}).get("ir") if isinstance(result, dict) else None
+        if not ir:
+            return {}
+        try:
+            from . import twb_to_pbir as _tp
+        except ImportError:
+            import twb_to_pbir as _tp
+        return _tp.date_field_usage(ir) or {}
+    except Exception:
+        return {}
+
+
 def _colour_palettes_from_ir(result):
     """The AUTHORED discrete-colour palettes this workbook's IR carries, or ``{}``.
 
@@ -3242,6 +3282,109 @@ def _colour_palettes_from_ir(result):
 
 _COLOUR_TWIN_SUFFIX = " (colour)"
 _COLOUR_TWIN_DECL_RE = re.compile(r"^\tmeasure '([^']+ \(colour\))'\s*=", re.M)
+
+
+def _annotate_fidelity_evidence(fidelity, lint_problems, candidate_records, linted):
+    """Stamp each per-worksheet fidelity row with WHAT WAS ACTUALLY CHECKED (#173).
+
+    ``status: "rebuilt"`` asserts only that the visual emitter completed without raising and without
+    attaching a warning. It is a statement about OUR CODE, not about the emitted artifact -- so a
+    visual can be reported ``rebuilt`` and still fail to render, which is a false green at the source
+    and silently defeats any downstream gate keyed on that field. Reported from the field as a
+    scatter marked ``rebuilt`` carrying a live ``DataViewMappingError_ScatterGroupingValues``.
+
+    The honest answer was already being computed and discarded: ``lint_pbir_parts`` runs on the
+    SHIPPED report bytes a few lines below where ``viz_fidelity`` is built, and its problems are
+    prefixed with the part path, so they are attributable. ``rebuilt`` could not see them purely
+    because of ORDERING. This closes that by adding evidence AFTER the lint:
+
+      * ``"emitted"``        -- the emitter ran cleanly. All ``rebuilt`` used to mean.
+      * ``"emitted+linted"`` -- additionally: the shipped bytes were structurally linted and no
+                                finding names this worksheet's visual.
+      * ``"lint_failed"``    -- a lint finding DOES name it. The false-green case, now visible even
+                                though ``status`` still reads ``rebuilt``.
+
+    ADDITIVE, in the same spirit as ``tier``: ``status`` is not narrowed and no existing key changes,
+    so a consumer reading ``status`` is byte-identical. Narrowing ``rebuilt`` would be the more
+    honest end state but it is a breaking change to a field other teams consume, so it is theirs to
+    opt into rather than ours to impose.
+
+    FAIL-CLOSED ON THE CLAIM, which is the whole point: when the lint did not run (``linted`` false)
+    every row stays ``"emitted"``. Claiming ``"emitted+linted"`` because no problems were found, when
+    the reason no problems were found is that nothing looked, would recreate exactly the defect this
+    fixes one level up.
+    """
+    rows = fidelity if isinstance(fidelity, list) else []
+    if not rows:
+        return rows
+    if not linted:
+        for row in rows:
+            if isinstance(row, dict):
+                row.setdefault("evidence", "emitted")
+        return rows
+
+    # visual name -> worksheet, from the viz stage's own record of what it emitted for what.
+    ws_by_visual = {}
+    for rec in (candidate_records or []):
+        if isinstance(rec, dict) and rec.get("visual") and rec.get("worksheet"):
+            ws_by_visual[str(rec["visual"])] = str(rec["worksheet"])
+
+    # A lint problem is prefixed with the part PATH; the visual name is its parent directory.
+    flagged = set()
+    for problem in (lint_problems or []):
+        text = str(problem)
+        for visual, worksheet in ws_by_visual.items():
+            if visual and visual in text:
+                flagged.add(worksheet)
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        row["evidence"] = "lint_failed" if row.get("worksheet") in flagged else "emitted+linted"
+    return rows
+
+
+def _phantom_published_proxy_tables(model_parts):
+    """Emitted tables bound to a published datasource's ``sqlproxy`` proxy rather than to real data.
+
+    A published Tableau datasource connects through a federated proxy whose connection class is
+    ``sqlproxy`` and whose server is the literal ``localhost`` -- an internal Tableau address, not an
+    endpoint anything can reach. When the PRIMARY datasource is that proxy the estate path already
+    gates honestly (``pbip_status: skipped``, needs-storage-decision). When a SECONDARY is, nothing
+    did: the workbook built, looked complete, and carried an empty disconnected table whose M points
+    at ``localhost`` (#174, on a 12-workbook estate where sibling workbooks gated correctly).
+
+    THE SILENCE IS THE DEFECT. The model opens, validates, and binds; the table is simply always
+    empty. That is the same family as a ``= BLANK()`` measure (2.227.0) and a dangling ``SelectRef``:
+    structurally valid, semantically absent, and invisible to every structural check. So this reads
+    the EMITTED artifact -- the connection parameters actually written -- rather than re-deriving
+    intent from the workbook, because what ships is what matters.
+
+    Keyed on the ``sqlproxy`` parameter suffix that ``emit_connection_parameters`` writes for a
+    federated proxy connection, together with the ``localhost`` server value. Both must be present:
+    a real connector that happens to be on localhost is a legitimate local database, and a
+    ``_sqlproxy`` parameter with a real host is a resolved rebind rather than a phantom.
+
+    Returns ``[{"parameter", "database"}]`` sorted, empty when nothing qualifies -- so a build with
+    no published secondary is unaffected.
+    """
+    if not isinstance(model_parts, dict):
+        return []
+    out = []
+    for path, text in sorted(model_parts.items()):
+        if not (isinstance(path, str) and path.endswith("expressions.tmdl")
+                and isinstance(text, str)):
+            continue
+        # ``expression Server_sqlproxy = "localhost" meta [...]`` and its Database_ sibling.
+        servers = dict(re.findall(
+            r'(?m)^expression\s+(Server_sqlproxy\w*)\s*=\s*"([^"]*)"', text))
+        dbs = dict(re.findall(
+            r'(?m)^expression\s+(Database_sqlproxy\w*)\s*=\s*"([^"]*)"', text))
+        for name, host in sorted(servers.items()):
+            if host.strip().lower() != "localhost":
+                continue
+            suffix = name[len("Server"):]
+            out.append({"parameter": name, "database": dbs.get("Database" + suffix)})
+    return out
 
 
 def _visuals_projecting_stub_measures(model_parts, report_parts):
@@ -3526,6 +3669,14 @@ def _build_datasource_pbip(entry, wb_detail, twb_text, result, ds, *, label, mod
                                  # default categorical ramp, which is what an unauthored worksheet
                                  # renders.
                                  colour_palettes=_colour_palettes_from_ir(result),
+                                 # Which date field the author actually put on a SHELF, read from the
+                                 # first viz pass. The model build uses it to pick each fact's ACTIVE
+                                 # calendar relationship instead of guessing from a naming
+                                 # convention -- Salesforce writes pmdm__StartDate__c /
+                                 # SystemModstamp, which match no convention, so those facts got NO
+                                 # active date and lost their whole calendar hierarchy. Empty -> the
+                                 # naming conventions, byte-for-byte as before.
+                                 date_usage=_date_usage_from_ir(result),
                                  semantic_colours=semantic_colours)
     except Exception as exc:
         warns.append(_PBIP_WARN + f"could not rebuild embedded datasource {label!r} "
@@ -3818,6 +3969,19 @@ def _build_datasource_pbip(entry, wb_detail, twb_text, result, ds, *, label, mod
     _stub_visuals = _visuals_projecting_stub_measures(res.get("parts"), report_parts)
     if _stub_visuals:
         entry["visuals_projecting_stub_measures"] = _stub_visuals
+    # A published datasource reached only as a SECONDARY used to land as an empty table pointed at
+    # localhost, with no gate and no flag, while sibling workbooks whose PRIMARY was published gated
+    # honestly (#174). Read on the SHIPPING model parts so it describes what the user opens.
+    _phantom = _phantom_published_proxy_tables(res.get("parts"))
+    if _phantom:
+        entry["phantom_published_proxy_tables"] = _phantom
+        _names = ", ".join(sorted({str(p.get("database")) for p in _phantom if p.get("database")}))
+        warns.append(
+            _PBIP_WARN + "the model carries a published-datasource proxy bound to 'localhost' "
+            f"({_names or 'unnamed'}) -- an internal Tableau address, not a reachable endpoint, so "
+            "that table opens EMPTY and every visual over it is blank. Co-migrate the published "
+            "datasource and rebind, or remove the dependency; a workbook whose PRIMARY datasource is "
+            "published is gated for this reason, and this one reached it as a SECONDARY")
     # PROVE the cross-check above actually left nothing dangling, on the BYTES THAT SHIP.
     # ``_crosscheck_report_refs`` is supposed to drop or rebind every reference the model did not
     # emit; this asserts the result rather than trusting it. reference_gate proves the same invariant
@@ -3872,6 +4036,13 @@ def _build_datasource_pbip(entry, wb_detail, twb_text, result, ds, *, label, mod
         entry["viz_lint"] = {"count": len(_lint), "problems": _lint[:20]}
         warns.append(_PBIP_WARN + f"{len(_lint)} PBIR validity violation(s) in the emitted report "
                      f"(pbir_lint R3-R9); first: {_lint[0]}")
+    # Now that the SHIPPED bytes have been linted, say so per worksheet (#173). ``status: rebuilt``
+    # is a claim about the emitter; this records what was actually checked, so a visual that lints
+    # dirty is visible even while ``status`` still reads ``rebuilt``. ``linted`` is keyed on there
+    # being report bytes to lint -- never on the absence of findings.
+    _annotate_fidelity_evidence(entry.get("viz_fidelity"), _lint,
+                                (result or {}).get("candidate_records"),
+                                bool(report_parts))
     projected = _longest_projected_path(dest, model_safe, res.get("parts"), report_base, report_parts)
     if os.name == "nt" and len(projected) >= MAX_PATH:
         # 1a (long-path era): the writer lifts MAX_PATH via ``\\?\`` so the build no longer FAILS on a

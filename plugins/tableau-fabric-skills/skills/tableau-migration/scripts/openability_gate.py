@@ -216,6 +216,82 @@ def _dax_references(expr):
     return qualified, bare
 
 
+def _split_qualified(token):
+    """``'Date (Service Delivery)'.Date`` or ``Table.Column`` -> ``(table, column)``.
+
+    TMDL quotes any name containing a space or punctuation, so a naive split on the first ``.``
+    truncates ``'Date (Service Delivery)'`` and silently attributes the relationship to a table that
+    does not exist -- which makes the ambiguity check report confident nonsense rather than fail.
+    """
+    token = (token or "").strip()
+    if token.startswith("'"):
+        end = token.find("'", 1)
+        if end < 0:
+            return token.strip("'"), ""
+        table, rest = token[1:end], token[end + 1:].lstrip(".")
+    else:
+        table, _, rest = token.partition(".")
+    rest = rest.strip()
+    if rest.startswith("'") and rest.endswith("'") and len(rest) > 1:
+        rest = rest[1:-1]
+    return table, rest
+
+
+def _parse_relationships(text):
+    """``relationships.tmdl`` -> ``[{from_table, to_table, active, both}, ...]``. Never raises."""
+    out = []
+    for blk in re.split(r"(?m)^relationship\s+", text or "")[1:]:
+        fm = re.search(r"(?m)^\s*fromColumn:\s*(.+)$", blk)
+        tm = re.search(r"(?m)^\s*toColumn:\s*(.+)$", blk)
+        if not (fm and tm):
+            continue
+        out.append({
+            "from_table": _split_qualified(fm.group(1))[0],
+            "to_table": _split_qualified(tm.group(1))[0],
+            "active": not re.search(r"(?m)^\s*isActive:\s*false", blk),
+            "both": bool(re.search(r"(?m)^\s*crossFilteringBehavior:\s*bothDirections", blk)),
+        })
+    return out
+
+
+def _ambiguous_relationship_pairs(text, limit=12):
+    """``[(source, target, [path_a, path_b]), ...]`` for pairs with >1 ACTIVE filter path.
+
+    Filter propagation runs ONE -> MANY, i.e. ``toColumn``'s table -> ``fromColumn``'s table, with a
+    bidirectional relationship traversable both ways. Paths are capped in length and count so a
+    dense model cannot make this expensive; the goal is to name the defect, not to enumerate it.
+    """
+    adjacency = {}
+    for rel in _parse_relationships(text):
+        if not (rel["active"] and rel["from_table"] and rel["to_table"]):
+            continue
+        adjacency.setdefault(rel["to_table"], set()).add(rel["from_table"])
+        if rel["both"]:
+            adjacency.setdefault(rel["from_table"], set()).add(rel["to_table"])
+
+    nodes = sorted(set(adjacency) | {t for v in adjacency.values() for t in v})
+    found = []
+    for src in nodes:
+        for dst in nodes:
+            if src == dst or len(found) >= limit:
+                continue
+            paths, stack = [], [(src, [src])]
+            while stack and len(paths) < 2:
+                node, path = stack.pop()
+                for nxt in sorted(adjacency.get(node, ())):
+                    if nxt in path:
+                        continue
+                    if nxt == dst:
+                        paths.append(path + [nxt])
+                        if len(paths) >= 2:
+                            break
+                    elif len(path) < 6:
+                        stack.append((nxt, path + [nxt]))
+            if len(paths) > 1:
+                found.append((src, dst, paths))
+    return found
+
+
 def check_model_openability(parts, flatfile_headers=None, expected_endpoints=None):
     """Structurally validate a built model's ``parts`` dict; return a verdict.
 
@@ -607,6 +683,39 @@ def check_model_openability(parts, flatfile_headers=None, expected_endpoints=Non
                         % (owner, ref_table, ref_col, ref_col, ref_table)),
                 })
         checks["eager_calc_refs_resolve"] = eager_ok
+
+    # ``unambiguous_relationship_paths`` -- Power BI REFUSES TO OPEN a project in which two tables
+    # have more than one ACTIVE filter path between them: *"There's a problem with the definition
+    # content in your Power BI Project. There are ambiguous paths between 'X' and 'Y'"*. The model
+    # sitting beside that report becomes unreachable too, so this is the same severity as invalid
+    # TMDL, not a fidelity nit.
+    #
+    # Reported from the field on a Salesforce NPSP rebuild: `Date (Service Delivery)` reached
+    # `pmdm__ServiceDelivery__c` BOTH directly and through `pmdm__ProgramEngagement__c`. Nothing was
+    # malformed -- every relationship was individually correct and correctly typed, and the defect
+    # existed only in the RELATION BETWEEN two of them, which is precisely the shape no per-object
+    # check can see. `validate` passed, `pbir_lint` passed, definition-of-done said warn/ok, and the
+    # file did not open.
+    #
+    # Direction is the whole check: a relationship runs `from` (MANY) -> `to` (ONE), and a filter
+    # propagates the other way, ONE -> MANY. Modelled undirected, a legal star (one calendar, two
+    # facts) looks ambiguous and this gate would fail every healthy model -- measured, 90 false pairs
+    # on the very model that has 4 real ones.
+    rel_text = "\n".join(parts[p] or "" for p in sorted(parts)
+                         if p.endswith("relationships.tmdl"))
+    unambiguous = True
+    if rel_text.strip():
+        for a, b, paths in _ambiguous_relationship_pairs(rel_text):
+            unambiguous = False
+            issues.append({
+                "check": "unambiguous_relationship_paths",
+                "table": a,
+                "detail": ("two active filter paths reach %r from %r (%s | %s) -- Power BI refuses "
+                           "to OPEN a project with an ambiguous path; make one of the relationships "
+                           "on the second route inactive"
+                           % (b, a, " -> ".join(paths[0]), " -> ".join(paths[1]))),
+            })
+    checks["unambiguous_relationship_paths"] = unambiguous
 
     # ``not_evaluated`` (#141) states a NON-ANSWER positively instead of leaving it to be inferred.
     # Additive by construction: ``ok``, ``checks`` and ``issues`` are untouched and keep their exact
