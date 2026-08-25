@@ -14,6 +14,62 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ### Fixed
 
+- **`tableau-migration` (skill `2.304.0` → `2.305.0`): a rollback anchor must be an ANCESTOR of the
+  release it anchors — the previous invariant was wrong and its repair advice damaged six anchors.**
+  2.299.0 asserted that `VERSION` at `rollback/pre-vX` equals the predecessor X's CHANGELOG entry
+  declares, and told the integrator to fix any mismatch by re-pointing at the merged parent. That
+  advice was followed. It broke every anchor it touched.
+
+  ```
+  archived original -> re-pointed value      is it an ancestor of its own release?
+  2.274.0  9d822fc7 -> 181d3bbd                       True -> False
+  2.293.0  181d3bbd -> c0c3b30d                       True -> False
+  2.296.0  c0c3b30d -> bb4026d2                       True -> False
+  2.299.0  bb4026d2 -> 026c83d0                       True -> False
+  2.300.0  c55e6644 -> 0e5fbf1b                       True -> False
+  2.302.0  84345a3f -> 3c3a9818                       True -> False
+  ```
+
+  **Six for six.** `git reset --hard rollback/pre-v2.302.0` landed on a parallel lane, not on any
+  history leading to 2.302.0 — and **the stamp gate went green the whole time.** This is the sharpest
+  instance of a rule this repo already carries: *satisfying a check is not evidence about the
+  property, and optimising for the check can move the property the wrong way.*
+
+  **Why the two disagree.** An interleaved merge leaves the repo carrying **two orders**: the
+  **narrative** order (the CHANGELOG chain, which readers and version gates use) and the **causal**
+  order (git ancestry, which `reset --hard` obeys). *"One release before"* is well defined in each
+  and they **name different commits**. A stamp comparison silently picks the narrative order for a
+  tag whose only executable meaning is causal. The founding defect that motivated 2.299.0 —
+  `pre-v2.293.0` "landing two releases short" — was itself measured on the narrative chain:
+  2.291.0 and 2.292.0 are absent from that anchor **and equally absent from 2.293.0's own release
+  ancestry**, so relative to 2.293.0 the original lost nothing.
+
+  Blast radius was tried as a tie-breaker and **does not discriminate** — narrative 69 vs causal 67
+  over the 14 most recent pairs, each winning on different anchors — because both candidate targets
+  sit on lanes. Recorded so the next reader does not re-litigate it by "just measuring".
+
+  **The replacement is stated in ancestry alone**, so it needs no choice between the two orders and
+  **no exception ledger**: the anchor must be an ancestor of its own release commit. 139 chain pairs
+  judged, 139 satisfy. The two historic double-introduced versions (`1.23.0`, `1.25.0`) that any
+  introducer-based formulation would have had to except are simply not a special case here — the
+  invariant never asks a version to have a unique introducer.
+
+  **`_INTERLEAVE_DEBT` is retired, and its existence was the tell.** It was a ledger of exceptions to
+  a proxy, designed to shrink as they were "paid" — and every payment made the repo worse. *A gate
+  that needs no exceptions is usually stating the property; one that accumulates them is usually
+  stating a proxy.* The failure message now explicitly warns against the repair that caused this.
+
+  Also fixes `_chain_pairs`, which matched only the Unicode arrow and so judged **88 of 139** entries
+  while reporting nothing amiss — the same narrow-verifier defect that this module's sibling gate
+  exists to catch, living inside this module. Both arrow forms now, per the subject's grammar.
+
+  Verified red by injection (an anchor pointed at `HEAD`, restored immediately) with the five sibling
+  gates staying green, and a negative control asserting the detector distinguishes a bad pairing from
+  a good one — it spends its life reporting silence, which is where a broken detector hides.
+
+
+### Fixed
+
 - **`tableau-migration` (skill `2.303.0` → `2.304.0`): a review reason now names the ROUTE, not the
   byte — the old wording was accurate and reliably sent readers the wrong way.**
   `unsupported character '<'` is literally true, and it produced the same wrong inference **twice in

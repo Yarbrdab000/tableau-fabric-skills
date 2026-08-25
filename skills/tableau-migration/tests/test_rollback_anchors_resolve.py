@@ -312,21 +312,65 @@ def test_every_anchor_predates_the_version_it_anchors(repo):
 #
 # The ledger below is debt, not exemption. Each entry is a real interleave boundary whose anchor
 # still means what it meant on its lane. Unlike the 35 orphans it is finite and shrinking.
-_INTERLEAVE_DEBT = {
-    "2.143.0",   # predates centralised allocation; owner unknown, and no merge in this series
-                 # created it -- left alone deliberately rather than re-pointed on speculation.
-    # 2.274.0 / 2.293.0 / 2.296.0 were PAID by the integrator on 2026-08-25: each anchor re-pointed
-    # at the release commit of its declared predecessor, in the same pass that re-chained the
-    # CHANGELOG. Originals preserved as archive/anchor-pre-vX-preintegration, because re-pointing is
-    # the only irreversible step in the ritual and each old target was ACCURATE on the lane it was
-    # cut on. Deleting them from this ledger is what hands them to the gate, and the companion test
-    # demanding that deletion is what proved the repair -- the count going 4 -> 1 is the evidence,
-    # not the fact that the suite went green.
-}
+_INTERLEAVE_DEBT_REMOVED = """RETIRED 2026-08-25, and the removal is the record.
+
+This set parked anchors failing a stamp-equality assertion (`VERSION` at the anchor must equal the
+predecessor the CHANGELOG declares). That assertion has since been measured wrong, and its
+remediation advice -- "re-point the anchor at the merged parent" -- was followed and DAMAGED six
+anchors: each was moved onto a parallel lane, so `git reset --hard` on it no longer landed on any
+history leading to its own release. All six archived originals satisfied the ancestry invariant that
+replaced it; all six re-points broke it, while the stamp gate went green throughout.
+
+The ledger itself was the tell, in hindsight. It existed because the assertion had exceptions, and it
+was designed to shrink as they were "paid". They were paid, the count went 4 -> 1, and every payment
+made the repo worse. A gate that needs no exceptions is usually stating the property; one that
+accumulates them is usually stating a proxy for it."""
+
+
+_HISTORIC_NOTE = """The interleave-debt ledger that used to live here is gone, and its absence is
+the point. It existed to park anchors that failed the stamp-equality assertion -- an assertion since
+measured wrong, whose remediation advice damaged six anchors. The ancestry invariant that replaced it
+needs no ledger: every one of the 139 chain pairs satisfies it, including the two historic
+double-introduced versions (1.23.0, 1.25.0) that any introducer-based formulation would have needed
+to except. A gate that needs no exceptions is usually stating the property; one that accumulates them
+is usually stating a proxy."""
+
+
+def _release_commits(root):
+    """``{version: sha}`` for each release commit reachable from HEAD, newest wins."""
+    import re
+
+    out = {}
+    for line in _git(root, "log", "HEAD", "--format=%H%x09%s").splitlines():
+        sha, _, subj = line.partition("\t")
+        m = re.match(r"tableau-migration (\d+\.\d+\.\d+):", subj)
+        if m:
+            out.setdefault(m.group(1), sha)
+    return out
+
+
+def _is_ancestor(root, maybe_ancestor, descendant):
+    """True iff ``maybe_ancestor`` is reachable from ``descendant``.
+
+    Uses git's own reachability rather than a hand-rolled walk. A peer session BFS'd this by hand and
+    got a confidently wrong answer, because paths go AROUND the anchor into all history -- the
+    reported figure was absurd enough to indict the probe rather than the repo, which is the only
+    reason it was caught. Let the tested thing judge.
+    """
+    return subprocess.call(
+        ["git", "merge-base", "--is-ancestor", maybe_ancestor, descendant],
+        cwd=root, stdout=subprocess.PIPE, stderr=subprocess.PIPE) == 0
 
 
 def _chain_pairs(repo):
-    """``[(declared_predecessor, produced_version), ...]`` from the CHANGELOG's own chain."""
+    """``[(declared_predecessor, produced_version), ...]`` from the CHANGELOG's own chain.
+
+    Accepts BOTH arrow forms. The file carries two entry formats -- 88 newer entries using a
+    Unicode arrow and 51 older ones using ASCII ``->`` -- and a Unicode-only pattern judged 88 of
+    139 while reporting nothing amiss. That is a verifier narrower than its subject, which does not
+    merely miss the region it cannot see: it CERTIFIES it. Write the predicate from the subject's
+    grammar, which is what the chain gate itself accepts.
+    """
     import io
     import re
 
@@ -335,91 +379,96 @@ def _chain_pairs(repo):
         return []
     text = io.open(path, encoding="utf-8").read()
     return [(m.group(1), m.group(2)) for m in
-            re.finditer(r"\(skill\s+`(\d+\.\d+\.\d+)`\s*\u2192\s*`(\d+\.\d+\.\d+)`\)", text)]
+            re.finditer(r"\(skill\s+`(\d+\.\d+\.\d+)`\s*(?:->|\u2192)\s*`(\d+\.\d+\.\d+)`\)", text)]
 
 
-def test_each_anchor_sits_exactly_one_release_before_what_it_anchors(repo):
-    """``VERSION`` at ``rollback/pre-vX`` must EQUAL the predecessor its CHANGELOG entry declares.
+def test_each_anchor_is_an_ancestor_of_the_release_it_anchors(repo):
+    """``rollback/pre-vX`` must be an ANCESTOR of X's own release commit.
 
-    "Strictly less" is not enough, and that gap is the whole point: an anchor left behind by an
-    interleaved merge is still lower, still reachable, still resolvable -- and restores a state two
-    releases short of the one it names. Equality is what makes a rollback land where it claims.
+    This replaces an earlier assertion that ``VERSION`` at the anchor equal the predecessor the
+    CHANGELOG declares. That assertion was measured wrong, and its remediation advice actively
+    damaged the repo: following it re-pointed six anchors onto parallel lanes, so
+    ``git reset --hard rollback/pre-vX`` no longer landed on any history leading to X. All six
+    archived originals satisfied THIS invariant; all six re-points broke it. The stamp gate went
+    green while doing it -- optimising for a check moved the property the check stood in for.
+
+    The reason the two disagree is that an interleaved merge leaves the repo carrying TWO orders:
+
+    * the NARRATIVE order -- the CHANGELOG chain, which is what a reader and the version gates use;
+    * the CAUSAL order -- git ancestry, which is what ``git reset --hard`` actually obeys.
+
+    "One release before" is well defined in each and they name DIFFERENT commits. A stamp comparison
+    silently picks the narrative order for a tag whose only executable meaning is causal.
+
+    Stated in ancestry alone, this needs no choice between them, and needs no exception ledger: it
+    never asks a version to have a unique introducer, so the two historic double-introduced versions
+    (``1.23.0``, ``1.25.0``) are simply not a special case.
+
+    Measured over the full history at the time of writing: 139 chain pairs judged, 139 satisfy.
     """
     pairs = _chain_pairs(repo)
     if not pairs:
         pytest.skip("no versioned CHANGELOG entries in this checkout")
+    releases = _release_commits(repo)
     tags = _tag_commits(repo)
-    wanted = [tags["rollback/pre-v" + made] for _pred, made in pairs
-              if ("rollback/pre-v" + made) in tags]
-    at = _version_at(repo, wanted)
-    if not at:
-        pytest.skip("could not read VERSION at the anchor commits")
 
-    violations = []
-    for pred, made in pairs:
-        if made in _INTERLEAVE_DEBT:
-            continue
-        sha = tags.get("rollback/pre-v" + made)
-        if not sha:
+    judged, violations = 0, []
+    for _pred, made in pairs:
+        anchor = tags.get("rollback/pre-v" + made)
+        release = releases.get(made)
+        if not anchor or not release:
             continue                      # absence is the sibling gate's business, not this one
-        got = at.get(sha)
-        if got and got != pred:
-            violations.append("%s declares predecessor %s, but rollback/pre-v%s -> %s is stamped %s"
-                              % (made, pred, made, sha[:8], got))
+        judged += 1
+        if not _is_ancestor(repo, anchor, release):
+            violations.append(
+                "%s: anchor rollback/pre-v%s -> %s is NOT an ancestor of its own release %s"
+                % (made, made, anchor[:8], release[:8]))
 
+    assert judged, "judged no anchor/release pair -- a sweep that reached zero looks like success"
     assert not violations, (
-        "anchor(s) do not sit exactly one release before the version they name, so resetting to "
-        "them lands short of what the tag claims:\n  " + "\n  ".join(violations)
-        + "\n\nUsual cause: the anchor was cut on a lane branch and an interleaved merge inserted "
-          "other releases between it and its own. The fix is the INTEGRATOR's: re-point the anchor "
-          "at the merged parent, in the same operation that re-chains the CHANGELOG.")
+        "anchor(s) do not sit on the history that leads to the release they name, so "
+        "`git reset --hard` on them lands on a parallel lane:\n  " + "\n  ".join(violations)
+        + "\n\nDo NOT 'fix' this by re-pointing at whatever commit is stamped with the declared "
+          "predecessor -- that is the narrative order, and doing it is what broke six anchors here. "
+          "An anchor is correct where it was CUT; if it looks wrong after an interleaved merge, the "
+          "CHANGELOG chain and git ancestry have diverged and the chain is the thing that moved.")
 
 
-def test_the_interleave_debt_ledger_stays_honest(repo):
-    """Flag debt that has been PAID -- but only where that is decidable.
+def test_the_ancestry_detector_can_actually_see_a_violation(repo):
+    """Negative control: the invariant above spends its life reporting silence, so prove it fires.
 
-    Two earlier formulations were wrong, and both are worth keeping because they are the same
-    mistake in opposite directions:
+    A check that cannot go red is indistinguishable from one that found nothing -- and this one
+    currently passes on every pair, which is exactly the condition under which a broken detector is
+    invisible. Feeds it a known-bad pairing (an anchor from an unrelated release) and requires a
+    violation, and a known-good one and requires none.
 
-      * *"every ledgered version appears in the chain"* -- fails on every lane branch. 2.274.0 and
-        2.296.0 are other lanes' boundaries and do not exist in this CHANGELOG until the merge
-        brings them. Absence here means "not merged yet", not "stale".
-      * *"every ledgered version currently mismatches"* -- fails on a lane too, in reverse: on its
-        own lane 2.293.0 declares predecessor 2.270.0 and its anchor stamps 2.270.0, so it
-        SATISFIES the invariant there. It only breaks once the merge inserts 2.291.0/2.292.0
-        between. The debt is latent on the lane and active after the merge.
-
-    So the honest scope: a boundary's status is only decidable once the interleave has actually
-    happened, i.e. on a chain containing the whole ledger. Anywhere else this skips rather than
-    guessing -- the same discipline as the rest of this module.
-
-    Where it IS decidable, this is how the integrator's repair proves itself: re-pointing an anchor
-    makes it satisfy the invariant, this test then demands its ledger entry be removed, and the
-    count drops for real rather than quietly staying put.
+    Additive and destroys nothing: it never writes a ref, it evaluates the predicate directly.
     """
-    pairs = _chain_pairs(repo)
-    if not pairs:
-        pytest.skip("no versioned CHANGELOG entries in this checkout")
-    produced = {made for _pred, made in pairs}
-    if not _INTERLEAVE_DEBT.issubset(produced):
-        pytest.skip("this chain does not yet contain every ledgered boundary (lane branch), so "
-                    "whether a boundary's debt is paid is not decidable here")
-
+    releases = _release_commits(repo)
     tags = _tag_commits(repo)
-    wanted = [tags["rollback/pre-v" + made] for _p, made in pairs
-              if ("rollback/pre-v" + made) in tags]
-    at = _version_at(repo, wanted)
-    if not at:
-        pytest.skip("could not read VERSION at the anchor commits")
+    pairs = _chain_pairs(repo)
+    if not pairs or len(releases) < 3:
+        pytest.skip("not enough history in this checkout to construct a control")
 
-    paid = []
-    for pred, made in pairs:
-        if made not in _INTERLEAVE_DEBT:
-            continue
-        sha = tags.get("rollback/pre-v" + made)
-        if sha and at.get(sha) == pred:
-            paid.append("%s (anchor now stamps %s, its declared predecessor)" % (made, pred))
+    good = [(made, tags.get("rollback/pre-v" + made), releases.get(made))
+            for _p, made in pairs
+            if tags.get("rollback/pre-v" + made) and releases.get(made)]
+    assert good, "no anchor/release pair available -- the control cannot run"
 
-    assert not paid, (
-        "interleave-debt ledger names version(s) whose anchor now satisfies the invariant -- the "
-        "debt is paid, so delete the entry and let the gate protect it:\n  " + "\n  ".join(paid))
+    made, anchor, release = good[0]
+    assert _is_ancestor(repo, anchor, release), (
+        "control precondition failed: %s's own anchor is not an ancestor of its release" % made)
+
+    # A release far newer than the anchor's own is not an ancestor of it -- the known-bad pairing.
+    newest = max(releases, key=lambda v: tuple(int(p) for p in v.split(".")))
+    oldest_anchor = min(
+        (m for m, a, r in good), key=lambda v: tuple(int(p) for p in v.split(".")))
+    bogus = tags.get("rollback/pre-v" + newest)
+    target = releases.get(oldest_anchor)
+    if not bogus or not target or bogus == tags.get("rollback/pre-v" + oldest_anchor):
+        pytest.skip("could not construct a distinct bad pairing in this checkout")
+
+    assert not _is_ancestor(repo, bogus, target), (
+        "the detector did NOT fire on a deliberately wrong pairing (anchor of %s against the release "
+        "of %s) -- it cannot distinguish a violation from a clean result, so its green runs mean "
+        "nothing" % (newest, oldest_anchor))
