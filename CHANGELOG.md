@@ -14,6 +14,52 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ### Fixed
 
+- **`tableau-migration` (skill `2.298.0` → `2.300.0`): a formula-authored table calc no longer ships
+  as an inert `BLANK()` stub — it rebuilds as a Power BI **Visual Calculation**.** Corpus 0074's
+  control chart projected `Upper` and `Lower`, both `= BLANK()`: the report validated clean, `pbir_lint`
+  was clean, and **both bands rendered EMPTY**. Structurally valid, semantically absent — the family a
+  green suite cannot see.
+
+  The model layer's refusal was *correct*. A table calc written inside a calculated field's formula
+  carries no addressing/partitioning intent, because that intent lives on the **worksheet**; a model
+  measure is one expression, so if several worksheets consume the calc with different partitions there
+  is no single right answer. `missing_addressing_intent` is the honest verdict. What was missing is
+  that a **Visual Calculation takes its partition from the visual for free**, which is exactly the
+  intent Tableau evaluated — so the calc had a faithful home the whole time and never reached it.
+
+  Three seams were closed, and only together do they change an artifact (each was measured alone and
+  moved nothing):
+
+  * **The `WINDOW_*` family had no visual-calc form at all.** The compiler's closed subset was
+    `RUNNING_SUM` / `RANK` / `RANK_DENSE` / `TOTAL`, so 14 of the corpus's 24 order-independent
+    formula table calcs died on `unsupported function WINDOW_MAX` before any other question arose.
+    The whole-partition heads now render as `<X>(WINDOW(1, ABS, -1, ABS, axis), base)` — the model
+    seam's certified frame (`resources/calc-to-dax.md`) transposed to the view dialect by swapping the
+    addressing spec for the axis, exactly as `RUNNINGSUM(m, axis)` already does. The moving form,
+    `WINDOW_PERCENTILE` and `WINDOW_CORR` still fail closed, and the `COLLAPSEALL` line is untouched:
+    `TOTAL` re-evaluates over underlying rows, `WINDOW_*` aggregates per-mark, and the two diverge for
+    a non-additive inner.
+  * **Every in-scope calc was recursed into as a nested Visual Calculation, even when it was not a
+    table calc.** `WINDOW_MAX([Count of Engagements])` failed entirely because its dependency was
+    `COUNTD(IF [Status] = "Closed" THEN [Case ID] END)` — a construct that has no view-layer form and
+    never needed one. Tableau evaluates a non-table-calc field in the **query that produces the marks**,
+    so it now binds to the model measure the visual already projects. Fails over to the previous
+    nested-calc behaviour when no measure resolves, so every chain that compiled before still does.
+  * **Single-level formula table calcs never reached the path**, which admitted only calc-references-calc
+    chains, and only the **first** usage per worksheet was ever attempted — so a control chart could
+    never rebuild both of its bands. Admission is candidacy only; the compiler and the shown-value guard
+    still decide. `[Parameters].[X]` now resolves to the what-if parameter's `SELECTEDVALUE` measure,
+    added as a hidden projection so the calc can read it and the slider stays live.
+
+  A reused base measure is now hidden **only when it is not a plotted axis series**. The reuse-then-hide
+  rule was written for a nested chain whose bases are encoding-only feeders; applied to a control chart
+  it hid `SUM([Sales])` — trading two blank bands for a missing line, the same defect class in the
+  opposite direction.
+
+  Measured on all 34 corpus workbooks at engine `2.275.0` → this build: `visuals_projecting_stub_measures`
+  12 → 10 (0074's `['Lower', 'Upper']` → `[]`), visual calculations emitted 10 → 11. **Exactly one
+  `visual.json` in the corpus changed**; 0070, 0076 and 0088 are byte-identical and merely gained honest
+  review disclosures where a silent model stub used to be the only record.
 - **`tableau-migration` (skill `2.297.0` → `2.298.0`): the measurement-side gotchas section had a wrong
   count — in the section about wrong counts (docs-only).** 2.296.0 said the uppercase-only triage regex
   corrupted **five** entries. Re-derived over the whole population it is **seven**, and the third

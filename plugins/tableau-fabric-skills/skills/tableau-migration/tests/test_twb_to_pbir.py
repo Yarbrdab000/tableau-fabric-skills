@@ -7564,14 +7564,25 @@ def test_nested_formula_chain_blend_secondary_base_routes_to_review():
     assert any("routed to review" in w["reason"] for w in warnings)
 
 
-def test_single_level_formula_table_calc_is_not_a_nested_chain():
-    # A single-level formula table calc (references no other calc) stays OFF the nested path -> the
-    # measure path keeps owning it, so existing output is unchanged.
+def test_single_level_formula_table_calc_now_takes_the_visual_calc_path():
+    # A single-level formula table calc (references no other calc) is admitted alongside the nested
+    # chains. The model path cannot supply its addressing intent, so leaving it there produced an
+    # inert BLANK() stub and an EMPTY chart; a Visual Calculation takes the partition from the visual.
     usage = _TCU(
         worksheet="Sheet1", instance="[i]", column="Calculation_x", caption="Run Sales",
         kind="field", formula="RUNNING_SUM(SUM([Sales]))",
         scope_formulas={"Calculation_x": "RUNNING_SUM(SUM([Sales]))"},
         scope_captions={"Calculation_x": "Run Sales"})
+    assert list(_view_only_field_chain_index([usage])) == ["Sheet1"]
+
+
+def test_plain_field_calc_without_a_table_calc_head_is_not_admitted():
+    # The widening is scoped to TABLE calcs; an ordinary calculated field is untouched.
+    usage = _TCU(
+        worksheet="Sheet1", instance="[i]", column="Calculation_y", caption="Ratio",
+        kind="field", formula="SUM([Profit]) / SUM([Sales])",
+        scope_formulas={"Calculation_y": "SUM([Profit]) / SUM([Sales])"},
+        scope_captions={"Calculation_y": "Ratio"})
     assert _view_only_field_chain_index([usage]) == {}
 
 
@@ -7579,6 +7590,125 @@ def test_quick_table_calc_usage_is_never_a_nested_chain():
     usage = _TCU(worksheet="S", instance="[i]", column="[Profit]", caption="Profit",
                  kind="quick", calc_type="RunningSum")
     assert _view_only_field_chain_index([usage]) == {}
+
+
+# -- single-level formula table calcs on the visual-calc path (control-chart shape) ----------------
+# Corpus 0074: a control chart whose Upper and Lower bands are BOTH formula table calcs over the
+# same plotted line, each scaled by a what-if parameter. Before this path they were inert BLANK()
+# model stubs -- the report validated clean and the bands rendered EMPTY.
+_CID_UPPER, _CID_LOWER = "Calculation_upper", "Calculation_lower"
+_BAND_SCOPE = {
+    _CID_UPPER: "WINDOW_AVG(SUM([Sales])) + ( WINDOW_STDEV(SUM([Sales])) * [Parameters].[P4] )",
+    _CID_LOWER: "WINDOW_AVG(SUM([Sales])) - ( WINDOW_STDEV(SUM([Sales])) * [Parameters].[P4] )",
+}
+_BAND_CAPS = {_CID_UPPER: "Upper", _CID_LOWER: "Lower"}
+
+
+def _band_usage(cid):
+    return _TCU(worksheet="Bands", instance="[i_%s]" % cid, column=cid, caption=_BAND_CAPS[cid],
+                kind="field", formula=_BAND_SCOPE[cid],
+                scope_formulas=dict(_BAND_SCOPE), scope_captions=dict(_BAND_CAPS))
+
+
+def _band_ws_state():
+    ws = {"name": "Bands", "visual_type": "table",
+          "rows": [_agg_value("Sales", "Sales")],
+          "cols": [{"kind": "category", "binding": "column", "aggregation": None,
+                    "entity": "Orders", "property": "Month", "caption": "Month"}],
+          "encodings": {}}
+    state = {"Values": {"projections": [
+        {"field": {"Aggregation": {"Expression": {"Column": {
+            "Expression": {"SourceRef": {"Entity": "Orders"}}, "Property": "Sales"}},
+            "Function": 0}}, "queryRef": "Sum(Orders.Sales)", "nativeQueryRef": "Sum of Sales"},
+        {"field": {"Measure": {"Expression": {"SourceRef": {"Entity": "_Measures"}},
+                               "Property": "Upper"}}, "queryRef": "_Measures.Upper",
+         "nativeQueryRef": "Upper"},
+        {"field": {"Measure": {"Expression": {"SourceRef": {"Entity": "_Measures"}},
+                               "Property": "Lower"}}, "queryRef": "_Measures.Lower",
+         "nativeQueryRef": "Lower"}]}}
+    return ws, state
+
+
+_BAND_PARAMS = {"p4": {"table": "Std Devs", "measure": "Std Devs Value"}}
+
+
+def test_two_single_level_band_calcs_both_rebuild_as_visual_calculations():
+    ws, state = _band_ws_state()
+    chain_index = _view_only_field_chain_index([_band_usage(_CID_UPPER), _band_usage(_CID_LOWER)])
+    assert len(chain_index["Bands"]) == 2       # BOTH usages are admitted, not just the first
+
+    warnings = []
+    handled, fact = _apply_formula_table_calc_chain(
+        ws, state, chain_index, "Orders", {}, warnings, _BAND_PARAMS)
+    assert handled is True
+
+    projs = state["Values"]["projections"]
+    by_nref = {p["nativeQueryRef"]: p for p in projs}
+    # Both bands are now Visual Calculations, and neither plain BLANK() measure is projected.
+    for name, op in (("Upper", "+"), ("Lower", "-")):
+        vc = by_nref[name]["field"]["NativeVisualCalculation"]
+        assert vc["Expression"] == (
+            "AVERAGEX(WINDOW(1, ABS, -1, ABS, ROWS), [Sum of Sales]) {0} "
+            "(STDEVX.S(WINDOW(1, ABS, -1, ABS, ROWS), [Sum of Sales]) * [Std Devs Value])".format(op))
+        assert not by_nref[name].get("hidden")
+    assert not any("Measure" in p.get("field", {}) and
+                   p["field"]["Measure"]["Property"] in ("Upper", "Lower") for p in projs)
+    # The plotted line stays VISIBLE -- it is an axis series, not a feeder for the bands.
+    assert not by_nref["Sum of Sales"].get("hidden")
+    # The what-if parameter rides along as a HIDDEN projection so the Visual Calculation can read it.
+    assert by_nref["Std Devs Value"]["hidden"] is True
+    assert by_nref["Std Devs Value"]["field"]["Measure"] == {
+        "Expression": {"SourceRef": {"Entity": "Std Devs"}}, "Property": "Std Devs Value"}
+    # queryRefs stay unique across the two independently-rebuilt usages.
+    qrefs = [p["queryRef"] for p in projs]
+    assert len(qrefs) == len(set(qrefs))
+    assert fact["status"] == "emitted"
+    assert sorted(fact["entries"]) == ["Lower", "Upper"]
+
+
+def test_band_calc_without_a_resolvable_parameter_routes_to_review():
+    # No what-if table for the parameter -> no object in the model holds that value -> fail closed,
+    # base visual byte-identical.
+    ws, state = _band_ws_state()
+    before = json.dumps(state, sort_keys=True)
+    chain_index = _view_only_field_chain_index([_band_usage(_CID_UPPER)])
+    warnings = []
+    handled, fact = _apply_formula_table_calc_chain(
+        ws, state, chain_index, "Orders", {}, warnings, {})
+    assert handled is False
+    assert fact["status"] == "review"
+    assert json.dumps(state, sort_keys=True) == before
+
+
+def test_non_table_calc_dependency_binds_to_its_projected_measure():
+    # ``WINDOW_MAX([Count of Engagements]) * 1.2`` over a dependency that is NOT a table calc
+    # (``COUNTD(IF ... END)``): the dependency must bind to the measure the visual already projects
+    # rather than recurse as a nested Visual Calculation, which would fail the whole chain.
+    cid_band, cid_dep = "Calculation_band", "Calculation_dep"
+    scope = {cid_band: "WINDOW_MAX([%s]) * 1.2" % cid_dep,
+             cid_dep: 'COUNTD(IF [Status] = "Open" THEN [Case ID] END)'}
+    caps = {cid_band: "Band", cid_dep: "Count of Engagements"}
+    usage = _TCU(worksheet="W", instance="[i]", column=cid_band, caption="Band", kind="field",
+                 formula=scope[cid_band], scope_formulas=scope, scope_captions=caps)
+    ws = {"name": "W", "visual_type": "table", "rows": [], "cols": [], "encodings": {}}
+    state = {"Values": {"projections": [
+        {"field": {"Measure": {"Expression": {"SourceRef": {"Entity": "_Measures"}},
+                               "Property": "Count of Engagements"}},
+         "queryRef": "_Measures.Count of Engagements",
+         "nativeQueryRef": "Count of Engagements"},
+        {"field": {"Measure": {"Expression": {"SourceRef": {"Entity": "_Measures"}},
+                               "Property": "Band"}}, "queryRef": "_Measures.Band",
+         "nativeQueryRef": "Band"}]}}
+    warnings = []
+    handled, fact = _apply_formula_table_calc_chain(
+        ws, state, _view_only_field_chain_index([usage]), "Orders", {}, warnings)
+    assert handled is True
+    by_nref = {p["nativeQueryRef"]: p for p in state["Values"]["projections"]}
+    assert by_nref["Band"]["field"]["NativeVisualCalculation"]["Expression"] == (
+        "MAXX(WINDOW(1, ABS, -1, ABS, ROWS), [Count of Engagements]) * 1.2")
+    # The dependency is NOT rebuilt as a nested Visual Calculation.
+    assert "NativeVisualCalculation" not in by_nref["Count of Engagements"]["field"]
+    assert fact["base_measures"] == ["Count of Engagements"]
 
 
 

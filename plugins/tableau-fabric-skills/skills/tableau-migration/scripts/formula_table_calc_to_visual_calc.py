@@ -21,9 +21,11 @@ the exact DAX conventions of :mod:`visual_calc_emitter`.
 Closed, **fail-closed** subset (v1 -- the surface proven faithful cell-for-cell):
 
   * table-calc functions ``RUNNING_SUM`` -> ``RUNNINGSUM``, ``RANK`` / ``RANK_DENSE`` ->
-    ``RANK(SKIP|DENSE, ORDERBY(x, DESC|ASC))`` (Tableau defaults: competition ties, descending), and
+    ``RANK(SKIP|DENSE, ORDERBY(x, DESC|ASC))`` (Tableau defaults: competition ties, descending),
     ``TOTAL`` -> ``COLLAPSEALL(x, axis)`` (the partition total, re-evaluated at the axis's highest
-    level -- see the ``_TOTAL`` note on why this maps TOTAL only and never the WINDOW_* family);
+    level -- see the ``_TOTAL`` note on why this maps TOTAL only and never the WINDOW_* family), and
+    the WHOLE-PARTITION ``WINDOW_*`` aggregates -> ``<X>(WINDOW(1, ABS, -1, ABS, axis), x)`` (see
+    ``_WINDOW_X``; the moving form and ``WINDOW_PERCENTILE`` fail closed);
   * the aggregates ``SUM`` / ``AVG`` / ``MIN`` / ``MAX`` / ``COUNT`` / ``COUNTD`` of a *single*
     column, each resolved by the caller to a base measure present in the visual;
   * ``+ - * /``, unary minus, numeric constants, and parentheses;
@@ -69,12 +71,67 @@ _RANK = {"RANK": "SKIP", "RANK_DENSE": "DENSE"}
 # underlying rows, while `WINDOW_AVG(AVG([x]))` averages the per-mark averages). So COLLAPSEALL maps
 # TOTAL only -- never WINDOW_MAX/WINDOW_SUM, whose per-mark semantics it would silently break.
 _TOTAL = "TOTAL"
+# WINDOW_* family, WHOLE-PARTITION form only -> ``<X>(WINDOW(1, ABS, -1, ABS, axis), <base>)``.
+#
+# This is the model-layer mapping of :mod:`calc_to_dax` (``resources/calc-to-dax.md`` line "WINDOW_
+# SUM/AVG/MIN/MAX(agg) -> ...(WINDOW(1, ABS, -1, ABS, spec), CALCULATE(agg))") transposed into the
+# visual-calculation dialect: the addressing ``spec`` is replaced by the AXIS, exactly as
+# ``RUNNINGSUM(m, axis)`` / ``COLLAPSEALL(m, axis)`` already do above. That substitution is the whole
+# point of this path -- a formula-authored table calc carries NO addressing/partitioning intent (that
+# lives on the worksheet, which is why the model path correctly refuses it as
+# ``missing_addressing_intent``), while a Visual Calculation gets the partition from the visual for
+# free. The ``CALCULATE(...)`` wrapper the model form needs is absent here because the argument is
+# already a resolved base MEASURE reference, which performs its own context transition -- the same
+# reason the emitter passes a bare ``[m]`` to ``RUNNINGSUM``.
+#
+# Order-independence: a whole-partition window aggregate covers every mark in the partition, so its
+# value cannot depend on the visit order -- the same reasoning ``table_calc_to_dax``
+# ``_ORDER_INSENSITIVE_HEADS`` records for the model path. The statistical members (MEDIAN / STDEV /
+# VAR) are order-independent for that identical reason and are included; STDEV/VAR default to
+# Tableau's SAMPLE estimators (``*.S``), with the population forms mapping to ``*.P``.
+#
+# Deliberately NOT here, and each fails closed:
+#   * the MOVING form ``WINDOW_AVG(x, -2, 0)`` -- the trailing bounds trip the ``')'`` check in
+#     :meth:`_Compiler._call`, matching the model seam's identical guard for the stat family;
+#   * ``WINDOW_PERCENTILE(x, k)`` -- two arguments, so the same ``')'`` check refuses it;
+#   * ``WINDOW_CORR`` / ``WINDOW_COVAR`` -- two column arguments, outside the single-column subset.
+_WINDOW_X = {
+    "WINDOW_SUM": "SUMX", "WINDOW_AVG": "AVERAGEX",
+    "WINDOW_MIN": "MINX", "WINDOW_MAX": "MAXX",
+    "WINDOW_COUNT": "COUNTX",
+    "WINDOW_MEDIAN": "MEDIANX",
+    "WINDOW_STDEV": "STDEVX.S", "WINDOW_STDEVP": "STDEVX.P",
+    "WINDOW_VAR": "VARX.S", "WINDOW_VARP": "VARX.P",
+}
+# The whole-partition frame: first row -> last row of the partition, on the visual's axis.
+_WHOLE_PARTITION_FRAME = "WINDOW(1, ABS, -1, ABS, {axis})"
 # Aggregations the caller can resolve to a base measure. The set the deterministic measure engine
 # already treats as faithful column aggregates.
 _AGG = {"SUM", "AVG", "MIN", "MAX", "COUNT", "COUNTD", "MEDIAN", "STDEV", "STDEVP", "VAR", "VARP"}
 _ATTR = "ATTR"   # ATTR(x) is Tableau's "assume one value"; transparent for a single-column ref.
 
 _RANK_DIR = {"asc": "ASC", "desc": "DESC"}
+
+# Tableau's TABLE-CALCULATION function vocabulary, as a formula-level detector. A calc field whose
+# formula calls one of these computes over the VISUAL's result matrix, so a dependency on it must
+# rebuild as a nested Visual Calculation. A calc field that calls NONE of them is an ordinary
+# calculated field -- Tableau evaluates it in the query that produces the marks -- so its faithful
+# counterpart is the MODEL MEASURE the model build already emitted, not a Visual Calculation.
+#
+# The head list mirrors ``table_calc_to_dax._FORMULA_INTENT`` (the canonical catalog of formula-level
+# table-calc heads); ``test_formula_table_calc_to_visual_calc`` asserts the two cannot drift apart.
+# Deliberately over-inclusive: a FALSE POSITIVE here just keeps the pre-existing nested-calc
+# behaviour, whereas a false negative would send a real table calc down the measure path.
+_TABLE_CALC_HEAD_RE = re.compile(
+    r"\b(?:RUNNING_[A-Z]+|WINDOW_[A-Z]+|RANK(?:_[A-Z]+)?|TOTAL|INDEX|SIZE|FIRST|LAST|LOOKUP"
+    r"|PREVIOUS_VALUE)\s*\(",
+    re.I,
+)
+
+
+def formula_is_table_calc(formula: Optional[str]) -> bool:
+    """True iff ``formula`` calls at least one Tableau table-calculation function."""
+    return bool(_TABLE_CALC_HEAD_RE.search(formula or ""))
 
 
 class _CompileError(Exception):
@@ -266,6 +323,16 @@ class _Compiler:
                 raise _CompileError(f"{fn} argument must be a single aggregate or field reference")
             self._next()
             return f"COLLAPSEALL({arg}, {self.axis})"
+        if fn in _WINDOW_X:
+            # Whole-partition window aggregate. A trailing ',' (the MOVING form, or
+            # WINDOW_PERCENTILE's k) trips the ')' check and falls back -- only the certified
+            # whole-partition frame is emitted here.
+            arg = self._single_column_arg(fn)
+            if self._peek() != ("op", ")"):
+                raise _CompileError(f"{fn} argument must be a single aggregate or field reference")
+            self._next()
+            frame = _WHOLE_PARTITION_FRAME.format(axis=self.axis)
+            return f"{_WINDOW_X[fn]}({frame}, {arg})"
         raise _CompileError(f"unsupported function {fn_raw}")
 
     # -- SUM([field]) etc: the aggregate wraps exactly one column, resolved to a base measure --
@@ -366,6 +433,20 @@ def compile_chain(
 
     def _resolve_reference(name: str, ds: Optional[str]):
         if ds is None and name in calc_formulas:
+            # A dependency that is ITSELF a table calc rebuilds as a nested Visual Calculation --
+            # its value depends on the visual's result matrix, so it has to live on the view side.
+            # A dependency that is NOT a table calc is an ordinary calculated field, which Tableau
+            # evaluates in the QUERY that produces the marks; its faithful counterpart is the model
+            # measure the model build already emitted (and which the visual already projects). This
+            # matters because such a field is routinely outside the view-layer subset --
+            # ``COUNTD(IF [Status] = "Closed" THEN [Case ID] END)`` -- so recursing into it failed the
+            # WHOLE chain for a construct that never needed to be a Visual Calculation at all.
+            # Falling through to ``("calc", name)`` when no measure resolves keeps every chain that
+            # compiles today byte-identical.
+            if not formula_is_table_calc(calc_formulas[name]):
+                base = resolve_measure(name, ds)
+                if base:
+                    return ("measure", base)
             return ("calc", name)
         base = resolve_measure(name, ds)
         return ("measure", base) if base else None

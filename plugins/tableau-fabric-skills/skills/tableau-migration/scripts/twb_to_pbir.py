@@ -58,6 +58,7 @@ try:
                                    FAMILY_PERCENT_OF_TOTAL)
     from .visual_calc_emitter import emit_visual_calc
     from .formula_table_calc_to_visual_calc import (compile_chain as compile_formula_chain,
+                                                    formula_is_table_calc,
                                                     rename_calc_references)
 except ImportError:  # pragma: no cover - flat scripts-on-path
     try:
@@ -66,6 +67,7 @@ except ImportError:  # pragma: no cover - flat scripts-on-path
                                        FAMILY_PERCENT_OF_TOTAL)
         from visual_calc_emitter import emit_visual_calc
         from formula_table_calc_to_visual_calc import (compile_chain as compile_formula_chain,
+                                                       formula_is_table_calc,
                                                        rename_calc_references)
     except ImportError:
         extract_table_calc_usages = None
@@ -75,6 +77,7 @@ except ImportError:  # pragma: no cover - flat scripts-on-path
         emit_visual_calc = None
         compile_formula_chain = None
         rename_calc_references = None
+        formula_is_table_calc = None
 
 # Report-layer formatting emit builders (additive; PBIR analytics/format objects grounded on the
 # Power BI formatting inventory). Optional-safe so a partial checkout still emits everything else.
@@ -9183,12 +9186,27 @@ _FORMULA_AGG_TOKEN = {
 
 
 def _view_only_field_chain_index(table_calc_usages):
-    """Group **nested** formula table-calc usages by worksheet -- a ``kind == "field"`` calc whose
-    formula references ANOTHER in-scope calc field (``RANK([composit])`` over
-    ``composit = RUNNING_SUM(...)``). These calc-references-calc chains are the only usages that take
-    the additive nested-Visual-Calculation path; a single-level formula table calc is left to the
-    model measure path (its output is unchanged). Returns ``{worksheet_name: [usage, ...]}`` -- an
-    empty dict for ``None`` / nothing, so every existing caller stays byte-identical.
+    """Group formula-authored table-calc usages by worksheet -- a ``kind == "field"`` calc whose
+    formula calls a Tableau table-calculation function.
+
+    Two shapes qualify and both take the Visual-Calculation path:
+
+      * a **nested** chain -- the calc references ANOTHER in-scope calc field (``RANK([composit])``
+        over ``composit = RUNNING_SUM(...)``), which rebuilds as nested Visual Calculations;
+      * a **single-level** formula table calc (``WINDOW_AVG(SUM([Sales]))``), which rebuilds as one.
+
+    Single-level usages were previously excluded and left to the model-measure path. That was the
+    wrong seam for them: a formula-authored table calc carries NO addressing/partitioning intent
+    (that lives on the worksheet), so the model path correctly refuses it as
+    ``missing_addressing_intent`` and emits an inert ``BLANK()`` stub -- structurally valid, and the
+    chart renders EMPTY. A Visual Calculation takes its partition from the visual, which is exactly
+    the intent Tableau evaluated. Admission is only a candidacy test: the compiler still fails closed
+    on anything outside its faithful subset, and the emitter still declines unless the calc is the
+    visual's shown value, so a calc the model DID translate keeps its measure whenever this path
+    cannot faithfully replace it.
+
+    Returns ``{worksheet_name: [usage, ...]}`` -- an empty dict for ``None`` / nothing, so every
+    existing caller stays byte-identical.
     """
     index = {}
     for usage in (table_calc_usages or []):
@@ -9200,7 +9218,8 @@ def _view_only_field_chain_index(table_calc_usages):
         if not formula or not scope:
             continue
         refs = set(_CALC_REF_TOKEN.findall(formula))
-        if any(rid in scope and rid != col for rid in refs):
+        nested = any(rid in scope and rid != col for rid in refs)
+        if nested or (formula_is_table_calc is not None and formula_is_table_calc(formula)):
             index.setdefault(getattr(usage, "worksheet", None), []).append(usage)
     index.pop(None, None)
     return index
@@ -9230,7 +9249,27 @@ def _resolved_value_fields(ws):
     return out
 
 
-def _apply_formula_table_calc_chain(ws, state, chain_index, model_table, field_map, warnings):
+def _axis_value_field_names(ws):
+    """``{name_lower}`` for the aggregation value pills carried on the ROWS/COLS shelves.
+
+    These are the visual's PLOTTED measures. A base measure the chain reuses is hidden only when it
+    is *not* one of them: an encoding-only pill (detail / tooltip) exists purely to feed the calc, so
+    hiding it is right, whereas a plotted measure is a displayed series in its own right -- a control
+    chart's ``SUM([Sales])`` line under its Upper/Lower bands. Hiding that would trade two blank
+    bands for a missing line, which is the same "structurally valid, semantically absent" failure
+    this path exists to remove.
+    """
+    out = set()
+    for f in list(ws.get("rows") or []) + list(ws.get("cols") or []):
+        if isinstance(f, dict) and f.get("kind") == "value" and f.get("binding") == "aggregation":
+            for key in (f.get("caption"), f.get("property")):
+                if key:
+                    out.add(str(key).strip().lower())
+    return out
+
+
+def _apply_formula_table_calc_chain(ws, state, chain_index, model_table, field_map, warnings,
+                                    param_values=None):
     """Rebuild a **nested** formula table-calc chain (a calc field that references another calc field)
     as nested Power BI Visual Calculations. Returns ``(handled, vc_fact_or_None)``.
 
@@ -9246,10 +9285,43 @@ def _apply_formula_table_calc_chain(ws, state, chain_index, model_table, field_m
     usages = chain_index.get(ws["name"])
     if not usages:
         return False, None
-    usage = usages[0]
 
     is_chart = ws.get("visual_type") in _VC_CHART_TYPES
     value_key = "Y" if is_chart else "Values"
+    values = (state.get(value_key) or {}).get("projections", [])
+    if not values:
+        return False, None
+
+    # A worksheet can display SEVERAL formula table calcs at once -- a control chart shows an Upper
+    # AND a Lower band -- so every admitted usage is attempted, not just the first. Each attempt is
+    # independent and fail-closed: one that leaves the faithful subset routes to review and leaves
+    # the others (and the base visual) untouched.
+    emitted_facts, review_fact = [], None
+    for usage in usages:
+        handled, fact = _apply_one_formula_table_calc(
+            ws, state, usage, value_key, model_table, field_map, warnings, param_values)
+        if handled:
+            emitted_facts.append(fact)
+        elif fact is not None and review_fact is None:
+            review_fact = fact
+    if not emitted_facts:
+        return False, review_fact
+    head = dict(emitted_facts[0])
+    if len(emitted_facts) > 1:
+        # Additive disclosure: every entry this visual rebuilt, and the union of their calcs.
+        head["entries"] = [f["entry"] for f in emitted_facts]
+        head["base_measures"] = sorted({m for f in emitted_facts for m in f["base_measures"]})
+        head["visual_calcs"] = [vc for f in emitted_facts for vc in f["visual_calcs"]]
+    return True, head
+
+
+def _apply_one_formula_table_calc(ws, state, usage, value_key, model_table, field_map, warnings,
+                                  param_values=None):
+    """Rebuild ONE formula table-calc usage on ``ws`` as Visual Calculation(s).
+
+    Returns ``(handled, fact)`` exactly as :func:`_apply_formula_table_calc_chain` does for a single
+    usage; the caller folds several of these together.
+    """
     values = (state.get(value_key) or {}).get("projections", [])
     if not values:
         return False, None
@@ -9261,11 +9333,69 @@ def _apply_formula_table_calc_chain(ws, state, chain_index, model_table, field_m
         cap = id2cap.get(cid, cid)
         calc_formulas[cap] = rename_calc_references(f, id2cap)
         summaries[cap] = f
+    if entry_caption not in calc_formulas:
+        # The displayed calc's own formula must be in scope for the chain to have an entry point.
+        return False, None
 
     resolved_values = _resolved_value_fields(ws)
+    axis_value_names = _axis_value_field_names(ws)
     used_refs = {p.get("queryRef") for p in values if p.get("queryRef")}
     base_projected = {}   # nativeQueryRef -> hidden projection to append
     base_nrefs = set()    # every base measure the chain resolved (reused or synthesized)
+    # The displayed calc's own plain-measure projection (the Visual Calculation replaces it). Looked
+    # up BEFORE the compile so a dependency can never bind to it as if it were a base measure.
+    entry_proj = next((p for p in values if p.get("nativeQueryRef") == entry_caption), None)
+    # Measures this visual ALREADY projects, keyed by their native reference. A non-table-calc
+    # dependency binds here instead of recursing as a nested Visual Calculation.
+    projected_by_nref = {}
+    for p in values:
+        nref = p.get("nativeQueryRef")
+        if nref and p is not entry_proj:
+            projected_by_nref.setdefault(nref, p)
+
+    def resolve_measure(name, ds):
+        """Bind a dependency to a model measure this visual can reference.
+
+        Two shapes resolve:
+
+        * an UNQUALIFIED non-table-calc calc field -> the measure this visual already projects.
+          Visibility is left ALONE: unlike ``resolve_aggregate`` (which synthesises hidden base
+          measures purely to feed the calc), such a projection is usually the charted value itself
+          -- a reference band's ``WINDOW_MAX([Count of Engagements]) * 1.2`` must not hide
+          ``Count of Engagements``.
+        * ``[Parameters].[X]`` -> the what-if parameter's ``SELECTEDVALUE`` measure, added to the
+          visual as a HIDDEN projection. A Visual Calculation reads the visual's own result matrix,
+          so the scalar has to BE on the visual; binding to the measure (not the picker column)
+          keeps the parameter live, exactly as the colour-rule resolver does. A parameter the model
+          never turned into a what-if table resolves to nothing and the chain fails closed.
+
+        Any other qualified reference (a blend / secondary source) fails closed.
+        """
+        if ds:
+            if _norm_param_key(ds) != "parameters":
+                return None
+            hit = (param_values or {}).get(_norm_param_key(name))
+            if not hit:
+                return None
+            nref = hit["measure"]
+            if nref not in projected_by_nref and nref not in base_projected:
+                qref = "{0}.{1}".format(hit["table"], hit["measure"])
+                while qref in used_refs:
+                    qref += "_p"
+                used_refs.add(qref)
+                base_projected[nref] = {
+                    "field": {"Measure": {
+                        "Expression": {"SourceRef": {"Entity": hit["table"]}},
+                        "Property": hit["measure"]}},
+                    "queryRef": qref, "nativeQueryRef": nref, "hidden": True}
+            base_nrefs.add(nref)
+            return nref
+        proj = projected_by_nref.get((name or "").strip())
+        if proj is None:
+            return None
+        nref = proj.get("nativeQueryRef")
+        base_nrefs.add(nref)
+        return nref
 
     def resolve_aggregate(agg, fieldname, ds):
         if ds:                                   # blend / secondary source -> Feature B, fail closed
@@ -9281,7 +9411,8 @@ def _apply_formula_table_calc_chain(ws, state, chain_index, model_table, field_m
         _, _qref, nref = _field_expression(field, model_table, field_map)
         existing = next((p for p in values if p.get("nativeQueryRef") == nref), None)
         if existing is not None:
-            existing["hidden"] = True
+            if (fieldname or "").strip().lower() not in axis_value_names:
+                existing["hidden"] = True
         elif nref not in base_projected:
             proj = _projection(field, model_table, field_map, used_refs)
             proj["hidden"] = True
@@ -9300,13 +9431,13 @@ def _apply_formula_table_calc_chain(ws, state, chain_index, model_table, field_m
 
     defs, reason = compile_formula_chain(
         entry_caption, calc_formulas, axis="ROWS",
-        resolve_aggregate=resolve_aggregate, resolve_measure=None, summaries=summaries)
+        resolve_aggregate=resolve_aggregate, resolve_measure=resolve_measure, summaries=summaries)
     if not defs:
         return _review(reason or "chain did not compile")
 
     # The displayed calc must already be projected as a plain measure (the VC replaces it). If it is
     # not the shown value pill, fail closed rather than ADD a stray column.
-    base_proj = next((p for p in values if p.get("nativeQueryRef") == entry_caption), None)
+    base_proj = entry_proj
     if base_proj is None:
         return _review("displayed calc is not the shown value")
 
@@ -9316,8 +9447,15 @@ def _apply_formula_table_calc_chain(ws, state, chain_index, model_table, field_m
             new_values.append(proj)
 
     vc_projections = []
+    # queryRefs must be unique ACROSS every usage this visual rebuilds, so allocation skips any ref
+    # already taken by a surviving projection (a second usage would otherwise reuse "select").
+    taken = {p.get("queryRef") for p in new_values if p.get("queryRef")}
+    pool = [q for q in _VC_QUERY_REFS if q not in taken]
     for i, vc in enumerate(defs):
-        qref = _VC_QUERY_REFS[i] if i < len(_VC_QUERY_REFS) else "select{0}".format(i)
+        qref = pool[i] if i < len(pool) else "select{0}".format(len(taken) + i)
+        while qref in taken:
+            qref = qref + "x"
+        taken.add(qref)
         proj = {"field": {"NativeVisualCalculation": {
                     "Language": "dax", "Expression": vc.expression, "Name": vc.name}},
                 "queryRef": qref, "nativeQueryRef": vc.name}
@@ -13513,7 +13651,7 @@ def emit_pbir(ir, *, dataset_name="Model", report_name="Report",
             vname = _sanitize(f"v-{page_name}-{i}-{ws['name']}")
             native_pct = _detect_native_pct_stacked(ws, state, vc_index)
             fchain_handled, fchain_fact = _apply_formula_table_calc_chain(
-                ws, state, chain_index, model_table, field_map, warnings)
+                ws, state, chain_index, model_table, field_map, warnings, _param_values)
             if fchain_handled:
                 # A nested formula table-calc chain rebuilt as nested Visual Calculations owns the
                 # value shelf; the quick-calc / native-percent paths do not also run for this visual.
@@ -13797,7 +13935,7 @@ def emit_pbir(ir, *, dataset_name="Model", report_name="Report",
         vname = _sanitize("v-" + ws["name"])
         native_pct = _detect_native_pct_stacked(ws, state, vc_index)
         fchain_handled, fchain_fact = _apply_formula_table_calc_chain(
-            ws, state, chain_index, model_table, field_map, warnings)
+            ws, state, chain_index, model_table, field_map, warnings, _param_values)
         if fchain_handled:
             # A nested formula table-calc chain rebuilt as nested Visual Calculations owns the
             # value shelf; the quick-calc / native-percent paths do not also run for this visual.
