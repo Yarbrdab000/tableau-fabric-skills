@@ -185,6 +185,14 @@ not mirrored.
   have agreed by construction. Verify a check with something at least as broad as the check, and make
   both print their admitted counts so a divergence like 86-vs-137 surfaces as a question rather than
   as agreement.
+
+  **The corollary, which is a real architectural property rather than luck:** the `[Unreleased]`
+  normaliser recognises only the newer format, so it absorbs the older 51 as body text and sorts them
+  with whatever entry swallowed them. Those survived today only because they all sit *below* the
+  entries it parses — but a relocation would **not** stay silent, because the chain gate parses
+  **both** formats and a moved entry breaks the strictly-descending order. **The normaliser can
+  mangle; the gate is the backstop.** Recorded because "sorting is safe only by luck" reads worse than
+  the system is, and a pessimistic record is as much a wrong record as an optimistic one.
 - **A known-unreliable instrument's most extreme output is the one most likely to be its artifact —
   and it is the one that gets quoted.** A proximity matcher documented as unreliable for large
   movements paired an object that was *never emitted* against an unrelated chart and produced a
