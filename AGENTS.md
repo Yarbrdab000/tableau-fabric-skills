@@ -259,6 +259,25 @@ anchor to revert a bad release). Do all three, every time:
    legitimately discards X and everything after it — that is what rolling back means — so only a
    lower-numbered casualty is a defect. Counting all of them inflates the figure and was wrong twice.
 
+   **The two checks are in DIRECT CONFLICT on at least one anchor, measured.** For `pre-v2.302.0`:
+
+   ```
+   3c3a981  (table-calc lane's 2.301.0)  stamps 2.301.0  gate PASSES  over-discards 12
+   84345a3  (integration-line merge)     stamps 2.300.0  gate FAILS   over-discards  1
+   ```
+
+   The target that makes the rollback nearly correct is the one the anchor-predecessor gate rejects,
+   and the target the gate demands destroys twelve releases. This is not a tie to be broken by
+   preference — it is evidence that **the gate is not a proxy for the property**, and neither should be
+   satisfied on the assumption that it delivers the other. Left unresolved deliberately, and recorded,
+   rather than silently optimised for whichever is currently green.
+
+   The durable statement, which is the day's shape at its purest:
+
+   > **When a check stands in for a property, satisfying the check is not evidence about the property
+   > — and optimising for the check can move the property the wrong way.** Two green anchor gates
+   > currently certify a rollback path that would destroy twelve releases.
+
    **The over-discard count is worth keeping as a METRIC, not just a hazard.** An anchor's extra count
    is exactly *how much other-lane work merged since that lane forked* — a direct read on
    **integration lag**. `pre-v2.299.0` scoring 8 did not mean that anchor was broken; it meant that
