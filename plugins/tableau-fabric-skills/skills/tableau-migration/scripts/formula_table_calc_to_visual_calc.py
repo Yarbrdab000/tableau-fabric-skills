@@ -76,13 +76,20 @@ _TOTAL = "TOTAL"
 # This is the model-layer mapping of :mod:`calc_to_dax` (``resources/calc-to-dax.md`` line "WINDOW_
 # SUM/AVG/MIN/MAX(agg) -> ...(WINDOW(1, ABS, -1, ABS, spec), CALCULATE(agg))") transposed into the
 # visual-calculation dialect: the addressing ``spec`` is replaced by the AXIS, exactly as
-# ``RUNNINGSUM(m, axis)`` / ``COLLAPSEALL(m, axis)`` already do above. That substitution is the whole
-# point of this path -- a formula-authored table calc carries NO addressing/partitioning intent (that
-# lives on the worksheet, which is why the model path correctly refuses it as
-# ``missing_addressing_intent``), while a Visual Calculation gets the partition from the visual for
-# free. The ``CALCULATE(...)`` wrapper the model form needs is absent here because the argument is
-# already a resolved base MEASURE reference, which performs its own context transition -- the same
-# reason the emitter passes a bare ``[m]`` to ``RUNNINGSUM``.
+# ``RUNNINGSUM(m, axis)`` / ``COLLAPSEALL(m, axis)`` already do above. The ``CALCULATE(...)`` wrapper
+# the model form needs is absent here because the argument is already a resolved base MEASURE
+# reference, which performs its own context transition -- the same reason the emitter passes a bare
+# ``[m]`` to ``RUNNINGSUM``.
+#
+# WHY THE AXIS IS A FAITHFUL SUBSTITUTE, stated precisely (an earlier revision of this comment
+# claimed a formula-authored table calc "carries no addressing intent" -- that is FALSE and was
+# measured false: ``ordering_type`` is populated on 46/46 formula usages corpus-wide and the
+# rows/cols shelf layout on 46/46, and ``translation_router`` scopes its ``missing_addressing_intent``
+# category to what the bare ``.tds`` cannot carry, not to what is unknowable). The real reason is
+# narrower: a Visual Calculation runs over the visual's own result matrix in DISPLAY order, so the
+# axis IS that worksheet's addressing, recovered structurally rather than inferred -- and it stays
+# correct when the user re-sorts, which a baked model ``ORDERBY`` does not. That advantage is real
+# and it is also the limit: see :func:`compile_chain` for what this path cannot serve.
 #
 # Order-independence: a whole-partition window aggregate covers every mark in the partition, so its
 # value cannot depend on the visit order -- the same reasoning ``table_calc_to_dax``
@@ -427,6 +434,25 @@ def compile_chain(
     a reference to a key here is a nested Visual Calculation, a reference ``resolve_measure`` can map
     is a base measure, anything else fails closed. ``summaries`` optionally carries each calc's
     original formula text for the provenance annotation. Cycles fail closed.
+
+    WHAT THIS PATH CANNOT SERVE -- read before treating it as the general answer for a stubbed table
+    calc. A Visual Calculation is a **projection on one visual**, so it is right exactly when the
+    calc is consumed as a shown value on that visual, and it cannot help in two measured cases:
+
+      * **a reference line / band.** Corpus 0088 carries 17 ``<reference-line>`` elements whose
+        bounds ARE these calcs (``WINDOW_MAX([Count of Engagements]) * 1.2``). A reference line is
+        not a projection, so the caller correctly declines with "displayed calc is not the shown
+        value" -- those need model-level windowed DAX instead.
+      * **a model measure that references the calc.** Corpus 0074's
+        ``Outliers = SUM([Sales]) < [Upper] AND SUM([Sales]) > [Lower]`` is a model measure over the
+        two band calcs; DAX cannot reference a Visual Calculation, so rebuilding the bands HERE
+        makes them render while leaving ``Outliers`` permanently unresolvable by this route.
+
+    The Tier-1 handoff guidance for ``missing_addressing_intent`` prescribes the complementary route
+    (recover the addressing from the ``.twb`` worksheet context, then emit windowed model DAX --
+    ``RANKX`` over the partition, ``COUNTROWS``/``RANKX`` over ``ALLSELECTED``, ``OFFSET``), and the
+    inputs for it are present: ``ordering_type`` and the rows/cols shelf are extracted on 46/46
+    formula usages corpus-wide. The two routes are complements, not rivals.
     """
     summaries = summaries or {}
     resolve_measure = resolve_measure or (lambda name, ds: None)
