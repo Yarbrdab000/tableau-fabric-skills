@@ -173,6 +173,96 @@ def test_a_quoted_table_name_containing_a_comma_does_not_split_the_value_argumen
     assert len(flags) == 1 and "Wrapped" in flags[0]["detail"], flags
 
 
+def test_the_dispatcher_shape_is_excluded_AND_the_gate_still_sees_stubs():
+    """2.290.0's disclosed partials must not be flagged -- asserted together with a POSITIVE
+    control, from one harness, so the exclusion cannot be satisfied by a dead gate.
+
+    THE CONTRACT BEING PROTECTED. A partially-rebuilt parameter dispatcher keeps its slot pointing
+    at a sibling's stub -- "blank today, correct for free the moment that sibling lands" -- and the
+    engine announces it in ``partial_fidelity`` with the measure, the branch number, the awaited
+    sibling and the reason. That is a DISCLOSED partial. This gate's claim is "this renders blank
+    and nothing told you", so firing on a disclosed one is a different population, and a gate that
+    fires on what the engine already announced trains its reader to skim it.
+
+    WHY THIS IS PINNED RATHER THAN LEFT TO HOLD BY ITSELF. The exclusion is currently an EMERGENT
+    consequence of ``_calculate_value_arg`` returning ``None`` for a computed value: a ``SWITCH``
+    is computed, so the walk stops before it can reach the blank branch. Nothing states it. The
+    obvious future "improvement" -- *follow SWITCH branches, those branches really can be blank* --
+    is a TRUE sentence, is an improvement by its own lights, and silently breaks the contract. A
+    true statement doing the work of a different, false one.
+
+    WHY BOTH DIRECTIONS, FROM ONE HARNESS. A test asserting only that the dispatcher is NOT flagged
+    passes just as happily when the gate has stopped working altogether -- silence from a working
+    check and silence from a dead one are identical. So the same run asserts a shape that MUST be
+    flagged. The negative result is only load-bearing while the positive one holds beside it.
+    """
+    # 2.290.0 dispatcher: three live branches, branch 3 awaiting a sibling that has not translated.
+    dispatcher = _model([
+        ("Avg. Days Participation", "BLANK()"),
+        ("Count of Engagements", "COUNTROWS('E')"),
+        ("Clients per Staff", "DIVIDE([Count of Engagements], [Staff])"),
+        ("Staff", "DISTINCTCOUNT('E'[Owner])"),
+        ("Sort By",
+         "SWITCH(SELECTEDVALUE('P'[Sel]), 1, [Count of Engagements], 2, [Clients per Staff], "
+         "3, [Avg. Days Participation], [Count of Engagements])"),
+        ("Sort By (filtered)",
+         "CALCULATE([Sort By], FILTER('Case', 'Case'[C] >= [Start Date Value]))"),
+        ("Start Date Value", "SELECTEDVALUE('P'[D], DATE(2020,1,1))"),
+    ])
+
+    # The SAME workbook before 2.290.0 landed: the dispatcher had not been rebuilt, so the base is
+    # an outright stub and its wrapper really does render blank for every selection.
+    pre_dispatcher = _model([
+        ("Sort By", "BLANK()"),
+        ("Sort By (filtered)",
+         "CALCULATE([Sort By], FILTER('Case', 'Case'[C] >= [Start Date Value]))"),
+        ("Start Date Value", "SELECTEDVALUE('P'[D], DATE(2020,1,1))"),
+    ])
+
+    excluded = sorted(i["detail"].split("'")[1] for i in _flags(dispatcher))
+    detected = sorted(i["detail"].split("'")[1] for i in _flags(pre_dispatcher))
+
+    assert detected == ["Sort By (filtered)"], (
+        "POSITIVE CONTROL FAILED: a wrapper over an outright BLANK() stub was not flagged, so the "
+        "gate is not working at all -- and the exclusion asserted below would be vacuous. Fix this "
+        "before reading the exclusion result. got=%r" % (detected,))
+
+    assert excluded == [], (
+        "the 2.290.0 dispatcher shape was flagged. Its blank branch is DISCLOSED in "
+        "partial_fidelity (measure, branch, awaited sibling, reason), so flagging it reports a "
+        "defect on something the engine already announced. Usual cause: the value walk was widened "
+        "to follow SWITCH branches -- a true observation, but it changes this check's population "
+        "from 'renders blank and nothing told you' to 'renders blank for some selections, and you "
+        "were told'. got=%r" % (excluded,))
+
+
+def test_the_dispatcher_exclusion_measured_the_delta_between_two_real_builds():
+    """The exclusion is not hypothetical: it is the whole difference between two corpus counts.
+
+    Corpus workbook 0088 flags **11** on a pre-2.290.0 build and **9** on a current one, and the
+    delta is exactly ``Sort By (filtered)`` and ``Select Metric (filtered)`` -- the two the
+    parameter dispatcher rebuilt. Two sessions measured 11 and 9 independently and both filed the
+    difference as "build age"; it was the release. **When two builds disagree, the delta may be the
+    release you shipped.**
+
+    Pinned as a shape rather than a number so it cannot rot against a rebuilt corpus.
+    """
+    both = _model([
+        ("Avg. Days Participation", "BLANK()"),
+        ("Assessments per Client", "BLANK()"),
+        ("Live A", "COUNTROWS('E')"),
+        # rebuilt by 2.290.0 -> excluded
+        ("Sort By", "SWITCH(SELECTEDVALUE('P'[S]), 1, [Live A], 3, [Avg. Days Participation], [Live A])"),
+        ("Sort By (filtered)", "CALCULATE([Sort By], FILTER('C', 'C'[X] > 1))"),
+        # NOT rebuilt -> still caught
+        ("Days Since Participation", "BLANK()"),
+        ("Days Since Participation (filtered)",
+         "CALCULATE([Days Since Participation], FILTER('C', 'C'[X] > 1))"),
+    ])
+    got = sorted(i["detail"].split("'")[1] for i in _flags(both))
+    assert got == ["Days Since Participation (filtered)"], got
+
+
 def test_the_check_appears_in_the_checks_map_and_gates_the_verdict():
     """A check absent from the map reports nothing no matter what it finds."""
     clean = G.check_model_openability(_model([("X", "COUNTROWS('T')")]))

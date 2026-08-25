@@ -14,6 +14,46 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ### Added
 
+- **`tableau-migration` (skill `2.309.0` → `2.310.0`): 2.308.0's exclusion of disclosed parameter
+  dispatchers is now pinned — bidirectionally, so it cannot be satisfied by a dead gate.** The
+  exclusion was real but stated nowhere. It held only as an *emergent* consequence of
+  `_calculate_value_arg` returning `None` for a computed value: a `SWITCH` is computed, so the walk
+  stops before reaching the blank branch.
+
+  **The contract at risk.** A partially-rebuilt parameter dispatcher (2.290.0) keeps its slot
+  pointing at a sibling's stub — *"blank today, correct for free the moment that sibling lands"* —
+  and the engine announces it in `partial_fidelity` with the measure, the branch number, the
+  awaited sibling and the reason. 2.308.0's claim is *"this renders blank and nothing told you"*, so
+  firing on a disclosed partial is a **different population**, and a gate that fires on what the
+  engine already announced trains its reader to skim it.
+
+  **Why it needed pinning rather than trusting.** The obvious future improvement — *follow `SWITCH`
+  branches, those branches really can be blank* — is a **true** sentence, is an improvement by its
+  own lights, and silently breaks the contract. A true statement doing the work of a different,
+  false one. This is the mirror of the anchor incident (2.299.0): there a gate asserted a **proxy**
+  and satisfying it moved the real property the wrong way; here the right property held and
+  **nothing asserted it at all**. Two failure modes of one axis — asserting a proxy, and asserting
+  nothing. The second has the worse signature, because there is no green check to mislead you, only
+  silence, until a reasonable-looking change lands.
+
+  **Pinned as a test, not an explicit code branch.** An early return would duplicate a mechanism the
+  general rule already handles, giving two places that can disagree after the next refactor — and,
+  more decisively, an explicit branch states a *proxy* (*"this path returns early"*) where the test
+  states the *property* (*"the dispatcher shape is not flagged"*). Same distinction the gate itself
+  turns on, applied to where the pin goes.
+
+  **Bidirectional from one harness, which is the part that makes it load-bearing.** A test asserting
+  only that the dispatcher is *not* flagged passes just as happily when the gate has stopped working
+  altogether — silence from a working check and silence from a dead one are identical. So the same
+  run asserts a shape that **must** be flagged. Verified by injection, not by assertion: widening
+  the walk to follow `SWITCH` branches fails the exclusion, and disabling the value walk entirely
+  fails the positive control, **with different messages naming different causes**.
+
+  Also pins the delta as a shape: 0088 flags **11** on a pre-2.290.0 build and **9** on a current
+  one, and the difference is exactly `Sort By (filtered)` and `Select Metric (filtered)` — the two
+  the dispatcher rebuilt. Two sessions measured 11 and 9 independently and both filed it as build
+  age; it was the release. **When two builds disagree, the delta may be the release you shipped.**
+
 - **`tableau-migration` (skill `2.308.0` → `2.309.0`): a forwarding wrapper that drops its base's
   `formatString` renders a CORRECT value as a wrong number — now gated.** The inverse of every
   other check here. Everything else asks whether a value is absent or wrong; this asks whether a
