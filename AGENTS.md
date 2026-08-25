@@ -126,6 +126,15 @@ not mirrored.
   shipped set, or read branches rather than tags — and note that the integrator wrote the anchor
   rule ("an anchor tells you a version is CLAIMED, never that it is unlanded") and then built a
   ledger on exactly the surface it warns about.
+- **A known-unreliable instrument's most extreme output is the one most likely to be its artifact —
+  and it is the one that gets quoted.** A proximity matcher documented as unreliable for large
+  movements paired an object that was *never emitted* against an unrelated chart and produced a
+  "1097px size error", which was then reported as the worst defect on the page. The limitation had
+  been written down by its own author when it was built. The failure mode and the headline finding
+  occupy the same tail of the distribution, so the caveat is never load-bearing until precisely the
+  moment it is ignored. Before quoting an outlier, check it against the limitation you already
+  documented — and make matchers report unpaired items explicitly, because "paired with something
+  implausible" and "not present at all" must never look the same.
 - **A glob is a scope decision, and it stops covering the tip silently.** My blast-radius probe
   filtered anchors with `rollback/pre-v2.2[6789]*` — correct when 2.29x was the top of the range, and
   it does not match `2.30x` **at all**. So the worst anchor in the repo was never examined and the
