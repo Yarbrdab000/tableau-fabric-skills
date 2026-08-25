@@ -12,6 +12,55 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ## [Unreleased]
 
+### Fixed
+
+- **`tableau-migration` (skill `2.311.0` → `2.312.0`): the openability verdict now describes the model
+  that SHIPPED, not an earlier one — 9 real defects on corpus 0088 were reported as a clean pass.**
+  `check_model_openability` runs during the datasource build.
+  `_apply_row_predicate_wrapped_measures` then **ADDS** measures to `_Measures.tmdl`, after that
+  verdict was computed and recorded. So the gate examined a model state in which a
+  wrapper-introduced defect *cannot exist*, and the build shipped a pass that was true about an
+  earlier artifact and false about the one on disk.
+
+  Measured on 0088 at 2.310.0, before this fix:
+
+  ```
+  openability_selfcheck.measure_value_path_not_blank     true    <- 8 wrapper measures render empty
+  openability_selfcheck.bare_column_references_qualified true    <- 1 wrapper emits
+                                                                    CALCULATE([<a COLUMN>], ...)
+  ```
+
+  Both checks are correct — 2.308.0 and 2.306.0 respectively — and both ran too early. **This is not
+  a check that failed to notice a defect; it is a check whose *satisfaction* was never evidence
+  about the shipped model, because the model changed underneath it.** The `(filtered)` wrappers were
+  reported as an *undisclosed* population; they are in fact a population two correct gates were
+  never given the chance to examine.
+
+  After: both checks fail, with 9 named issues. The `bare_column_references_qualified` one is a
+  genuine query-time failure — `Client per Staff Max Goal` is a what-if parameter **column**, not a
+  measure, so `CALCULATE([Client per Staff Max Goal], ...)` is the exact shape 2.306.0 made a hard
+  failure.
+
+  **Blast radius, measured corpus-wide:** 2 of 34 workbooks carry row-predicate wrappers; **1**
+  newly fails. `0134_parameter_filters` has 3 wrapped projections and stays clean, so the re-check
+  discriminates rather than firing on the mechanism. Estate `definition_of_done` moves to `failed`
+  for 0088 — correctly: those 9 defects were always in the shipped artifact.
+
+  **False-positive control, measured on the shipped engine.** 0088 carries 27 forwarding wrappers, all 27 bound by a visual: **19 forward into a LIVE base and 8 into a `BLANK()` stub.** The re-check flags the 8 and none of the 19. That separation is the whole difficulty — a predicate keyed on the `(filtered)` name, or on *“is this a `CALCULATE` forward”*, fires on all 27 and would have looked correct in every artifact until someone counted the false positives. Only resolving the base's own expression distinguishes them.
+
+  **Watched at the render, on the previous generation of this defect** (capture by the colour-measure lane, on a build predating 2.290.0 — the mechanism transfers, the instances are since fixed). One page, cold after refresh, five visuals: the **2** whose Y/Tooltips bound a blind-blank wrapper drew **empty**; the **3** bound to live measures rendered normally. A positive and negative control on the same page, which is stronger evidence than a static gate can produce about its own worth. What a blind-blank looks like is the reason it survives review: **a titled empty box with an axis label** — not an error, not a missing visual, just something that reads as *“no data for this filter”*.
+
+  The merge rule is **derived, not enumerated**: only a `True -> False` transition is folded in, and
+  issues are appended. A named allowlist of "checks the wrap can affect" would freeze a scope
+  decision into a list and silently stop covering the tip the first time the wrap or the gate grew
+  a new interaction. Fail-closed in both directions — the re-run can never *clear* a recorded
+  failure (checks whose inputs are out of scope here are skipped, not falsified), and any malformed
+  input returns the recorded verdict untouched.
+
+  *Scan population, stated because a reduced one is invisible downstream:* the blast radius above was measured over **`C:\tfmig\corpus_312`, all 34 workbooks, `pbip/` roots only** (the shippable projects; the sibling `reports/` tree is the earlier unbound viz-stage write and has no wrappers). An earlier scan of mine reported **291** `visual.json` against a true **316** — not parse failures, but an `if not measures: continue` guard that ran *before* the counter and silently dropped 6 workbooks. That denominator was computed **after a filter**; the defect fixed here is a verdict computed **before a mutation**. Same class, opposite direction, in the instrument used to investigate it.
+
+  *Reported alongside this release and fixed independently by the integrator in `30d5d13`:* three unresolved git conflict markers had been committed into `CHANGELOG.md` and survived a green suite and a clean chain gate, because nothing in the repo reads for them. The inverse of *“no conflict is the absence of one alarm”* — there **was** a conflict, it was hand-resolved, the markers were left behind, and every light stayed green.
+
 ### Added
 
 - **`tableau-migration` (skill `2.310.0` → `2.311.0`): a function name that does not exist in DAX is

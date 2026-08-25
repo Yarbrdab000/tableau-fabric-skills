@@ -62,6 +62,7 @@ try:  # works whether imported as a package or run with scripts/ on sys.path
     from .workbook_table_calcs import extract_table_calc_usages, load_workbook_xml
     from .workbook_calc_usage import workbook_calc_usage
     from .tmdl_generate import tableau_measure_format_to_pbi
+    from .openability_gate import check_model_openability
     from . import fetch_tds as F
 except ImportError:
     from connection_to_m import (parse_tds, locale_dependent_flatfile_relations, extract_bundled_flatfile, extract_calcs,
@@ -76,6 +77,7 @@ except ImportError:
     from workbook_table_calcs import extract_table_calc_usages, load_workbook_xml
     from workbook_calc_usage import workbook_calc_usage
     from tmdl_generate import tableau_measure_format_to_pbi
+    from openability_gate import check_model_openability
     import fetch_tds as F
 
 
@@ -1825,6 +1827,71 @@ def _wrapper_measure_name(projection, row_filters, reserved_lower, tokens=None):
         i += 1
     reserved_lower.add(name.lower())
     return name
+
+
+def _recheck_openability_after_wrap(model_parts, selfcheck):
+    """Re-run the openability gate over the WRAPPED model and fold in anything the wrap broke.
+
+    THE ORDERING GAP THIS CLOSES. ``check_model_openability`` runs during the datasource build,
+    against the model as assembled. ``_apply_row_predicate_wrapped_measures`` then ADDS measures
+    to ``_Measures.tmdl`` -- after that verdict was computed and recorded. So the gate examines a
+    model state in which a wrapper-introduced defect *cannot exist*, and reports a clean pass that
+    is true about an earlier artifact and false about the shipped one.
+
+    Measured on corpus workbook 0088 at 2.310.0: the build reports
+    ``measure_value_path_not_blank: true`` while 8 wrapper measures on that same build render
+    empty, and ``bare_column_references_qualified: true`` while a wrapper emits
+    ``CALCULATE([Client per Staff Max Goal], ...)`` -- an unqualified reference to a COLUMN, which
+    is the exact shape 2.306.0 made a hard failure. Both checks are correct; both ran too early.
+
+    This is not a check that failed to notice a defect -- it is a check whose *satisfaction* was
+    never evidence about the shipped model, because the model changed underneath it.
+
+    MERGE RULE, deliberately DERIVED rather than enumerated: a check may only go ``True -> False``,
+    and issues are only appended. A named allowlist of "checks the wrap can affect" would be a
+    scope decision frozen into a list, and would silently stop covering the tip the first time the
+    wrap or the gate grew a new interaction -- the failure mode this repo has hit repeatedly. So
+    the re-run is compared to the recorded verdict and only *new* failures are folded in:
+
+      * a check that already failed keeps failing (the re-run can never clear it);
+      * a check absent from the re-run -- ``typed_columns_in_header`` and ``endpoints_distinct``
+        are skipped here because their inputs (``flatfile_headers`` / ``expected_endpoints``) are
+        not in scope at the wrap site -- keeps its recorded verdict untouched;
+      * only a ``True -> False`` transition, i.e. a defect the wrap itself introduced, is merged.
+
+    Returns a NEW verdict dict; ``selfcheck`` is never mutated. Fail-closed: any malformed input
+    or unexpected error returns the recorded verdict unchanged, so a build can never lose its
+    openability report because this pass could not run.
+    """
+    if not isinstance(model_parts, dict) or not isinstance(selfcheck, dict):
+        return selfcheck
+    try:
+        after = check_model_openability(model_parts)
+    except Exception:
+        return selfcheck
+    if not isinstance(after, dict):
+        return selfcheck
+    before_checks = selfcheck.get("checks")
+    after_checks = after.get("checks")
+    if not isinstance(before_checks, dict) or not isinstance(after_checks, dict):
+        return selfcheck
+    broke = [name for name, ok in after_checks.items()
+             if ok is False and before_checks.get(name) is True]
+    if not broke:
+        return selfcheck
+    before_issues = selfcheck.get("issues") if isinstance(selfcheck.get("issues"), list) else []
+    after_issues = after.get("issues") if isinstance(after.get("issues"), list) else []
+    broke_set = set(broke)
+    added = [i for i in after_issues
+             if isinstance(i, dict) and i.get("check") in broke_set and i not in before_issues]
+    merged_checks = dict(before_checks)
+    for name in broke:
+        merged_checks[name] = False
+    merged = dict(selfcheck)
+    merged["checks"] = merged_checks
+    merged["issues"] = list(before_issues) + added
+    merged["ok"] = not any(v is False for v in merged_checks.values())
+    return merged
 
 
 def _apply_row_predicate_wrapped_measures(report_parts, model_parts, result, res_report):
@@ -3876,6 +3943,15 @@ def _build_datasource_pbip(entry, wb_detail, twb_text, result, ds, *, label, mod
                     report_parts, res.get("parts"), rebuilt, res_report)
                 if row_wraps:
                     res["parts"] = wrapped_model_parts
+                    # The wrap ADDED measures after the openability verdict was computed, so that
+                    # verdict is about a model state the build no longer ships. Re-run the gate
+                    # over the wrapped parts and fold in anything the wrap itself broke; see
+                    # ``_recheck_openability_after_wrap`` for why the merge is derived rather than
+                    # keyed to a list of check names.
+                    _wrapped_check = _recheck_openability_after_wrap(
+                        wrapped_model_parts, res_report.get("openability_selfcheck"))
+                    if isinstance(_wrapped_check, dict):
+                        res_report["openability_selfcheck"] = _wrapped_check
                     entry["row_predicate_wrap"] = {
                         "visuals": len(row_wraps),
                         "projections": sum(r.get("wrapped", 0) for r in row_wraps),
