@@ -202,7 +202,28 @@ anchor to revert a bad release). Do all three, every time:
    git tag -a rollback/pre-v1.62.0 <pre-change-commit> -m "Pre-v1.62.0 anchor (<feature>)"
    git push origin rollback/pre-v1.62.0
    ```
-   Rollback is then a one-liner: `git reset --hard rollback/pre-v1.62.0`.
+   Rollback on **that lane, before it is integrated**, is then a one-liner:
+   `git reset --hard rollback/pre-v1.62.0`.
+
+   **On an integrated branch, do NOT use `reset --hard` — use `git revert`.** An anchor is a point on
+   **one lane's** history, so once lanes merge, moving the tip there necessarily drops everything
+   merged from every *other* lane since that lane forked. The anchors do not go stale; the operation
+   changes meaning under them. Measured on this repo's integration branch, **all 12 recent anchors
+   over-discard, not one destroys only what it names**:
+
+   ```
+   rollback/pre-v2.299.0   also destroys 2.274.0 2.275.0 2.290.0 2.291.0 2.292.0 2.296.0 2.297.0 2.298.0
+   rollback/pre-v2.298.0   also destroys 2.269.0 2.270.0 2.293.0 2.294.0 2.295.0
+   rollback/pre-v2.293.0   also destroys 2.274.0 2.275.0 2.290.0 2.291.0 2.292.0
+   ```
+
+   So `reset --hard rollback/pre-v2.298.0` discards **six** releases from three lanes while its name
+   promises one. `git revert <that release's commit or merge>` removes what it names and nothing else.
+
+   **No existing gate can see this**, and that is the point: `VERSION`-at-anchor `<` named version
+   passes for all 12, and the anchor-predecessor gate passes too. Both are checks about **numbers**;
+   this is a fact about **topology**. Necessary, insufficient — the same shape as a match-count
+   assertion catching 1 of 7 corrupted captures.
 
 4. **Run the CHANGELOG chain gate on EVERY commit of a rebased stack, not just the tip.**
    `tests/test_changelog_version_chain.py` asserts that each entry's declared predecessor equals the
