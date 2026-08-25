@@ -99,6 +99,21 @@ not mirrored.
   predicate was wrong — it is that a non-match emits nothing to notice, so partial output looks
   complete. Count what you examined, check what you captured, and inject a known-bad case to watch
   the detector go red, before believing any clean result.
+- **"No conflict" is not evidence of correctness; it is the absence of one specific alarm.** The
+  general form of most of the rules below: *the failure is not that something was lost, it is that
+  something plausible was produced.* A clean three-way merge and a regex that fabricates an `S`
+  bucket are the same event — an operation that succeeds, emits confident output, and is wrong in a
+  way the output itself cannot show. `validate` returning zero, a lint passing, a suite going green,
+  a merge without conflicts, a pattern matching: each rules out one failure mode and says nothing
+  about the rest. Three CHANGELOG chain breaks were introduced today by **clean** auto-merges with
+  nothing to notice, and caught only because a gate re-derived the property afterwards.
+- **A ledger built on `refs/tags` shows what has been CLAIMED, never what has been BUILT.** An
+  unpushed commit on another worktree's branch is invisible to you by construction, so a
+  tag-derived view of "what has shipped" is stale the moment anyone commits locally. Centralised
+  allocation fixes version collisions and does nothing for this. Either have sessions report their
+  shipped set, or read branches rather than tags — and note that the integrator wrote the anchor
+  rule ("an anchor tells you a version is CLAIMED, never that it is unlanded") and then built a
+  ledger on exactly the surface it warns about.
 - **Re-derive the SCOPE, not just the arithmetic.** Inheriting someone else's *question* is the same
   defect as inheriting their answer, and far harder to see, because the work you did was genuinely
   correct. Measured: one session correctly refused a reported figure and re-measured it from the
