@@ -100,20 +100,30 @@ not mirrored.
   complete. Count what you examined, check what you captured, and inject a known-bad case to watch
   the detector go red, before believing any clean result.
 - **THE MOVE THAT FINDS THESE: take the confident sentence and ask what would have to be true.** Not
-  "check the work" — check the **claim**. Every finding in one high-volume day came from this, applied
-  by two sessions in turn against each other and against themselves: *"a formula table calc carries no
-  addressing intent"* (false — 46/46 usages carry it), *"those four defects are already fixed"* (the
-  metric moved, the render did not), *"6 → 1 proves it"* (true number, wrong population), *"our
-  convergence was deterministic"* (falsified by its own author before sending), *"the anchor sits two
-  releases short"* (measured on the wrong order — the founding defect was never real), and a probe
-  reporting ~300 releases between two commits (absurd enough to indict the probe, not the repo).
+  "check the work" — check the **claim**. And the question is not *"is this right?"* — every statement
+  below was right. It is:
 
-  The cheapest instance overturned the most: **one `git merge-base --is-ancestor`**, run because the
-  claim *"the anchor sits one release before"* had never been tested against what a reset actually
-  does. It took down a gate, an exception ledger, six anchor repairs and three documentation commits.
+  > **"What would have to be true for this to mean what I am about to use it for?"**
 
-  The rules below are all specialisations of it. Reach for them when you have a specific suspicion;
-  reach for **this** when you have a sentence that sounds right.
+  Because **every silent failure in a high-volume day was a TRUE statement doing the work of a
+  different, false one:**
+
+  | the statement | true of | used as |
+  |---|---|---|
+  | `unsupported character '<'` | the byte the tokenizer hit | "add a comparison parser" |
+  | stub count `6 → 1` | visuals projecting a stub | "those four render defects are fixed" |
+  | interleave debt `4 → 1` | entries in an exception ledger | "the repair is working" |
+  | "every released version has an anchor" | the 89 of 140 it examined | all releases |
+  | "the anchor sits one release before" | the version STAMP | where a `reset --hard` lands |
+  | `= CALCULATE(...)`, not `BLANK()` | the expression | "this measure has a value" |
+
+  **Not one was a bug in the usual sense, and none would have been caught by more care.** The rules
+  below are all specialisations. Reach for them when you have a specific suspicion; reach for **this**
+  when you have a sentence that sounds right.
+
+  The cheapest instance overturned the most: **one `git merge-base --is-ancestor`**, run because *"the
+  anchor sits one release before"* had never been tested against what a reset actually does. It took
+  down a gate, an exception ledger, six anchor repairs and three documentation commits.
 - **"No conflict" is not evidence of correctness; it is the absence of one specific alarm.** The
   general form of most of the rules below: *the failure is not that something was lost, it is that
   something plausible was produced.* A clean three-way merge and a regex that fabricates an `S`
