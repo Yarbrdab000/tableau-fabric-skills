@@ -14,6 +14,53 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ### Added
 
+- **`tableau-migration` (skill `2.310.0` → `2.311.0`): a function name that does not exist in DAX is
+  now an openability failure.** Nothing in this repo validated one. Every other check resolves
+  *references* (`[Measure]`, `'Table'[Column]`), and a bad **function name** is neither — so all
+  nine openability checks passed and the model failed at a customer's Desktop.
+
+  **`TEXT()` is Excel. DAX is `FORMAT()`.** All **five** objects with a direct syntax error in a
+  real customer deliverable called `TEXT(` — three measures and two calculated columns. Two further
+  measures were broken by *cascade* off those five and call nothing invalid themselves, so the file
+  held **7 broken objects and 5 causes**.
+
+  Power BI reports it as `The syntax for '(' is incorrect.` — a message naming neither the function
+  nor the problem. The agent that authored the file spent its entire investigation hunting an
+  unresolved Tableau calculation id that was never involved, and **its own explanation carried the
+  defect**: *"STR() → easily converts to TEXT()"*. It converts to `FORMAT()`. The failure message
+  therefore names the function and the replacement, which turns a misleading engine error into a
+  one-line fix — that is most of this check's value.
+
+  **A denylist, and the reason is error direction rather than maintenance.** A missing entry is a
+  false negative and tolerable; an allowlist of valid DAX functions would fire on every legitimate
+  function nobody remembered to add — fatal for a gate, and it would decay every time DAX gains a
+  function. Entries carry the DAX replacement where one exists (`IIF`→`IF`, `ISNULL`→`ISBLANK`,
+  `IFNULL`→`COALESCE`, `COUNTD`→`DISTINCTCOUNT`, `ATTR`→`SELECTEDVALUE`); the Tableau table-calc
+  family (`WINDOW_*`, `RUNNING_*`) says explicitly that **no rename will fix it**, because a
+  suggestion that cannot work is worse than none.
+
+  **`INDEX`, `WINDOW`, `OFFSET`, `RANK` and `ROWNUMBER` are DAX window functions and are NOT
+  listed** — an earlier draft of the list wrongly included `INDEX`. A denylist entry that is
+  actually valid DAX is the one failure this design cannot tolerate, since every hit is supposed to
+  be unarguable. Pinned by a test that calls all five plus `MID`/`LEFT`/`TRIM`/`SUBSTITUTE`/
+  `SEARCH`/`VALUE`/`MEDIAN`/`CONCATENATE` and asserts silence.
+
+  **Expressions only, never annotations** — measured *before* the check was written rather than
+  after it misfired. `annotation TableauFormula` preserves the Tableau source, which legitimately
+  contains `TEXT(`, `IIF(`, `WINDOW_MAX(`; scanning expression-plus-annotations yields **77 false
+  positives on a clean corpus**, enough to make the check unreadable on its first run and get it
+  switched off.
+
+  Population: **0 across 248 corpus measures and all 34 workbooks** — the deterministic translator
+  cannot emit these — against **5/5** of the customer file's primary breaks. An assisted-path
+  defect, like the bare-reference class of 2.306.0, and both landed in objects annotated
+  `TranslatedBy: assisted translation (human-approved)`.
+
+  One guard is **defensive, not validated**, and is labelled as such in place: a negative lookbehind
+  stops a measure *named* `WINDOW_MAX(Avg. Days Participation)*1.2` being read as a call. Measured
+  with and without it, the corpus returns 0 either way, because nothing currently references those
+  measures from an expression. It should not be cited as evidence the corpus exercised it.
+
 - **`tableau-migration` (skill `2.309.0` → `2.310.0`): 2.308.0's exclusion of disclosed parameter
   dispatchers is now pinned — bidirectionally, so it cannot be satisfied by a dead gate.** The
   exclusion was real but stated nowhere. It held only as an *emergent* consequence of
