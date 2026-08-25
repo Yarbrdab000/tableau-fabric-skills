@@ -126,6 +126,25 @@ not mirrored.
   shipped set, or read branches rather than tags — and note that the integrator wrote the anchor
   rule ("an anchor tells you a version is CLAIMED, never that it is unlanded") and then built a
   ledger on exactly the surface it warns about.
+- **Before a metric can support a claim, verify the metric's POPULATION is the claim's population.
+  Ask what the number counts, not whether it moved.** This supersedes "read the detail more
+  carefully", which is unactionable — the detail was already on screen when the claim was made.
+
+  The mechanism is narrower and more mechanical than confirmation bias:
+  `visuals_projecting_stub_measures` and "visuals that render blank" are **different populations that
+  merely overlap**. `6 → 1` was completely true of the first and was never a statement about the
+  second. Reading the per-visual ids would have caught it *that time*, but only because the two
+  populations happened to be disjoint in that instance — had one stub sat on a blank-rendering
+  visual, the detail would have *looked* like confirmation and the claim would still have been wrong.
+  **A population mismatch survives any amount of careful reading.**
+
+  It is also why going to the render worked and was not luck: **the render IS the population in
+  question.** Same reason `INFO.MEASURES()` settles a "did my model edit land" question — not because
+  it is a second opinion, but because it is the only instrument measuring the thing being claimed.
+
+  And it is the general form of absence-blindness one level up: a static detector enumerates a
+  population (emitted objects) that **structurally excludes** the defect class (never-emitted
+  objects). Same error, one level higher.
 - **Detectors that enumerate what is PRESENT cannot see what was never emitted — and no amount of
   care fixes it, because the class is outside what they can express.** Hit twice in one day by two
   unrelated tools: a proximity matcher gave a never-emitted object a "1097px size error" by pairing it
