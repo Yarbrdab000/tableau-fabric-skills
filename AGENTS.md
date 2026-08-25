@@ -107,6 +107,18 @@ not mirrored.
   a merge without conflicts, a pattern matching: each rules out one failure mode and says nothing
   about the rest. Three CHANGELOG chain breaks were introduced today by **clean** auto-merges with
   nothing to notice, and caught only because a gate re-derived the property afterwards.
+
+  **Why this class needs a MECHANICAL check and cannot be handled by care.** Every instance shares a
+  shape: the operation succeeded and the output was confident. A `= BLANK()` stub is a translation
+  that "worked", producing a measure that binds and says nothing. `[A-Z_]+` matched, producing a
+  category that never existed in the source. A merge completed, producing a chain break. Correct
+  arithmetic on an inherited scope produced a wrong answer. **None of these is detectable by looking
+  harder at the output, because the output is exactly what success looks like** — a human read
+  compares output against expectation, and in every one of these cases the output *met* expectation.
+  They are only detectable by asking a question the output cannot answer about itself, which is what
+  "read at the artifact" means in practice and why it has to be executable. Five findings in one day
+  came from checks; none came from reading, including a line dropped mid-sentence in the very commit
+  that added these rules.
 - **A ledger built on `refs/tags` shows what has been CLAIMED, never what has been BUILT.** An
   unpushed commit on another worktree's branch is invisible to you by construction, so a
   tag-derived view of "what has shipped" is stale the moment anyone commits locally. Centralised
