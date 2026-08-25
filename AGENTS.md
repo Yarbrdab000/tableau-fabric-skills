@@ -619,6 +619,41 @@ The self-update runbook (`skills/tableau-migration/resources/self-update.md`) is
 this contract: it compares installed `VERSION` against the raw `VERSION` on `main` and only reinstalls
 when `main` is newer. If you forget the bump, no client ever updates.
 
+### Recency is not reachability — never decide file ownership by timestamp
+
+Before editing a shared file while other sessions are live, the question is *"does any lane hold work
+in this file that I do not have?"* — a **reachability** question. It is tempting to answer it with
+`git log -1 --date=short -- <file>` per branch and read the older dates as "behind". That orders
+commits by **recency**, which agrees with reachability most of the time and is a different question.
+
+Measured here on `migrate_estate.py`: a lane whose last edit was a day older than the integration tip
+was labelled "BEHIND", and it was **divergent** —
+
+```
+lane vs origin/main:  6 behind, 11 ahead      <- both non-zero
+merge-base blob 7ecdcc2490
+   lane        c96dee7274   changed by lane : True
+   origin/main 92d4a1fc7c   changed by main : True   <- both sides moved it
+```
+
+"Behind" means **contains nothing the target lacks**. That lane's edit was in the *integration branch*
+and not in `origin/main`, so it was content `origin/main` lacked. The conclusion ("safe to edit") was
+right for a reason that had not been stated: safe because **the integration already carried the
+change**, not because the lane was behind. A session branching from `origin/main` rather than from the
+integration tip would have built on a base missing it.
+
+Ask it with reachability, and state which ref the answer is relative to:
+
+```
+git merge-base --is-ancestor <lane-tip> <target>          # strictly behind?
+git rev-list --left-right --count <target>...<lane-tip>   # both non-zero = DIVERGENT
+git rev-parse <ref>:<path>                                # compare blobs against the merge-base
+```
+
+This is the general failure one level down: **an instrument answers the question its predicate
+encodes, and that question is rarely the one you are asking.** A timestamp comparison encodes *which
+is newer*; ownership is about *what is contained where*.
+
 ## Commits
 
 - Make the **user** the commit author, and append the trailer:
