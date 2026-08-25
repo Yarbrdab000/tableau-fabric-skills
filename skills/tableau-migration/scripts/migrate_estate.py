@@ -1827,6 +1827,68 @@ def _wrapper_measure_name(projection, row_filters, reserved_lower, tokens=None):
     return name
 
 
+def _recheck_openability_after_wrap(res_report, wrapped_model_parts):
+    """Re-run the model openability self-check AFTER the row-predicate wrap, and MERGE.
+
+    ``openability_selfcheck`` is produced by the datasource build (``assemble_model``) and describes
+    the model as assembled. ``_apply_row_predicate_wrapped_measures`` then adds measures to that
+    model -- ``CALCULATE(<base>, FILTER(...))`` wrappers -- and rebinds visuals onto them. So the
+    shipped verdict is a **true statement about an earlier artifact**: the check is correct, and it
+    ran before the objects it would have judged existed.
+
+    Measured on 0088 at engine 2.309.0: ``measure_value_path_not_blank`` shipped ``True`` while the
+    same predicate, called directly on the wrapped parts, named **8** measures whose value path
+    bottoms out in ``BLANK()``. Those 8 are bound by visuals and render as titled empty boxes.
+
+    MERGED, never replaced, and that is the whole design of this function. The original call passes
+    ``flatfile_headers`` and ``expected_endpoints``, which are not available here; a bare re-run
+    therefore SKIPS ``typed_columns_in_header`` and ``endpoints_distinct``, and overwriting with it
+    would silently retract two checks that had genuinely run. So the merge can only ever ADD:
+    booleans are ANDed, a check absent from the re-run keeps its original verdict, and issues are
+    unioned. A post-wrap pass can fail a build that passed; it can never pass one that failed.
+
+    Purely diagnostic and never raises -- a build must not break because a self-check could not run.
+    """
+    if not isinstance(res_report, dict) or not wrapped_model_parts:
+        return
+    try:
+        try:
+            from .openability_gate import check_model_openability
+        except ImportError:
+            from openability_gate import check_model_openability
+        post = check_model_openability(wrapped_model_parts)
+    except Exception:  # pragma: no cover - defensive; never block a build on a diagnostic
+        return
+    if not isinstance(post, dict):
+        return
+
+    before = res_report.get("openability_selfcheck")
+    if not isinstance(before, dict):
+        res_report["openability_selfcheck"] = post
+        return
+
+    checks = dict(before.get("checks") or {})
+    for name, ok in (post.get("checks") or {}).items():
+        checks[name] = bool(checks.get(name, True)) and bool(ok)
+
+    issues = list(before.get("issues") or [])
+    seen = {json.dumps(i, sort_keys=True) for i in issues if isinstance(i, dict)}
+    for issue in (post.get("issues") or []):
+        key = json.dumps(issue, sort_keys=True) if isinstance(issue, dict) else str(issue)
+        if key not in seen:
+            seen.add(key)
+            issues.append(issue)
+
+    res_report["openability_selfcheck"] = {
+        "ok": bool(before.get("ok", True)) and bool(post.get("ok", True)),
+        "checks": checks,
+        "issues": issues,
+        # Additive provenance: a reader can see the verdict covers the model that actually shipped,
+        # not the one assembled before the wrap added measures to it.
+        "rechecked_after_row_predicate_wrap": True,
+    }
+
+
 def _apply_row_predicate_wrapped_measures(report_parts, model_parts, result, res_report):
     """Rewrite affected visuals onto wrapped measures and append those measures to ``_Measures``.
 
@@ -3882,6 +3944,7 @@ def _build_datasource_pbip(entry, wb_detail, twb_text, result, ds, *, label, mod
                         "worksheets": sorted({r.get("worksheet") for r in row_wraps
                                               if r.get("worksheet")}),
                     }
+                    _recheck_openability_after_wrap(res_report, wrapped_model_parts)
                 if date_binding:
                     entry["date_rebind"] = {"date_table": date_binding["date_table"],
                                              "active_keys": date_binding["active_keys"]}

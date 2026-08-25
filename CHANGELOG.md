@@ -14,6 +14,47 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ### Added
 
+- **`tableau-migration` (skill `2.311.0` → `2.312.0`): the model openability self-check now
+  describes the model that SHIPPED, not the one assembled before the row-predicate wrap.** The check
+  was correct. It ran too early.
+
+  `openability_selfcheck` is produced by the datasource build. `_apply_row_predicate_wrapped_measures`
+  then ADDS measures to that model — `CALCULATE(<base>, FILTER(...))` wrappers standing in for a
+  Tableau row-level boolean keep — and rebinds visuals onto them. The verdict therefore described an
+  artifact that no longer existed by the time it was reported: a **true pass about an earlier model**.
+
+  ```
+  _value_path_bottoms_out_blank(...) on the WRAPPED parts   -> fires on 8 measures
+  shipped openability_selfcheck                              -> measure_value_path_not_blank: True
+  ```
+
+  Those 8 are bound by visuals and render as **titled empty boxes with an axis label** — which reads
+  as "no data for this filter", the most dismissible failure mode available. Measured on 0088 at
+  engine 2.309.0.
+
+  **The merge direction is the design, not an implementation detail.** The original call supplies
+  `flatfile_headers` and `expected_endpoints`, which are not available at the wrap site, so a bare
+  re-run SKIPS `typed_columns_in_header` and `endpoints_distinct`. Overwriting with it would silently
+  retract two checks that genuinely ran — trading a false pass for a false *absence*, the same class
+  of defect one layer over. So the merge only ever ADDS: booleans are ANDed, a check absent from the
+  re-run keeps its original verdict, issues are unioned. A post-wrap pass can fail a build that
+  passed; it can never pass one that failed.
+
+  **Three fixes were considered and two were wrong, both plausibly.** Adding an `also_projected_as`
+  index to `partial_fidelity` would have disclosed 2 wrappers while 8 identical ones stayed silent.
+  Re-routing the wrapper rebinding through the label-derivation choke point — so binding and label
+  finally agreed — would have rebound all 55 projections across 39 visuals to the **unfiltered**
+  base, silently removing the date-window filter, and would have *looked* like a clean fix. The
+  label/binding divergence is deliberate and documented at the site: `nativeQueryRef` is the
+  user-facing Tableau name, `Measure.Property` the internal implementation measure.
+
+  Found by a parallel session that measured the ordering at the correct engine after first measuring
+  it at a stale one, and that **declined the authorised work** on discovering the approved fix was
+  the wrong one. Tests pin both the merge's conservatism and its effect, the latter from one fixture
+  carrying a wrapper over a `BLANK()` stub and an identical wrapper over a live base — a check that
+  flagged both would be matching the `(filtered)` naming convention rather than resolving the value
+  path, and would fire on the 19 correct wrappers alongside the 9 defective ones.
+
 - **`tableau-migration` (skill `2.310.0` → `2.311.0`): a function name that does not exist in DAX is
   now an openability failure.** Nothing in this repo validated one. Every other check resolves
   *references* (`[Measure]`, `'Table'[Column]`), and a bad **function name** is neither — so all
