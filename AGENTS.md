@@ -126,6 +126,23 @@ not mirrored.
   shipped set, or read branches rather than tags — and note that the integrator wrote the anchor
   rule ("an anchor tells you a version is CLAIMED, never that it is unlanded") and then built a
   ledger on exactly the surface it warns about.
+- **Detectors that enumerate what is PRESENT cannot see what was never emitted — and no amount of
+  care fixes it, because the class is outside what they can express.** Hit twice in one day by two
+  unrelated tools: a proximity matcher gave a never-emitted object a "1097px size error" by pairing it
+  with an unrelated chart, and `visuals_projecting_stub_measures` reported a workbook clean while 17
+  reference lines bound to stubbed calcs went unbuilt. Neither tool was aware of the other's instance.
+
+  This applies to **every static gate in this repo**: the invisible-ink check enumerates emitted
+  colours, the foreign-source-path gate enumerates emitted partitions, the ambiguous-relationship
+  check enumerates emitted relationships. All are absence-blind **by construction**.
+
+  The consequence for prioritisation is not "render verification is cheaper" — it is that **opening
+  the file and looking is the only thing that can see this class at all.** A missing object leaves no
+  artifact to inspect, so there is nothing for a static check to be careful about. Two mitigations
+  where a static check must stand in: make a matcher report **unpaired** items explicitly, so
+  "paired with something implausible" and "not present at all" can never look the same; and derive
+  the expected population from the SOURCE (the `.twb`) rather than from the output, so an absence is
+  a difference rather than an empty set.
 - **A metric moving is not the render changing, and a count says nothing about WHICH object moved.**
   I read `visuals_projecting_stub_measures` dropping **6 → 1** on one workbook and told another
   session that four of its open render defects were therefore fixed. They checked at the artifact:
