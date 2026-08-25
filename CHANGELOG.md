@@ -14,6 +14,35 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ### Added
 
+- **`tableau-migration` (skill `2.312.0` → `2.313.0`): a committed git conflict marker is now a
+  test failure.** Three of them sat in `CHANGELOG.md` at the tip of an integration branch carrying
+  eighteen merged releases, and **every gate stayed green**: the suite passed, the version-chain gate
+  parsed 145 entries and reported 0 breaks, the mirror was byte-identical, both anchors resolved.
+
+  This is the inverse of a rule this repo already carries. *"A clean auto-merge is not evidence of
+  correctness"* is about a merge git believed it resolved. This is the other half: **a merge git
+  REFUSED to resolve, resolved by hand, with the markers left behind** — and every downstream signal
+  still agreed, because each was measuring something the markers do not disturb. The chain parser is
+  line-oriented, so a marker line is simply not an entry header and is skipped.
+
+  The damage was invisible to a reader too. No separator line survived, only the outer two markers, so
+  the file did not look broken: one marker split a bullet's header line in half, and the other pair
+  wrapped a `### Added` heading that read perfectly well. **A conflict that LOOKS resolved is what
+  survives review.**
+
+  Three checks, and the second and third exist because the first can only ever report an absence:
+  the gate itself; **that the scan read anything at all** (a walk matching no files reports the same
+  clean zero as a healthy repo); and that the predicate fires on real markers while staying silent on
+  indented or quoted ones, because this repo documents merge conflicts in prose. Proven by injecting a
+  marker into a real file: fails naming file and line, passes again on removal.
+
+  The marker strings are BUILT by repetition rather than written literally, so the module does not
+  flag itself — the same trap as a format-string check matching inside the annotation that preserves
+  a source formula.
+
+  Found by a parallel session rebuilding at this engine. The markers themselves were removed
+  separately and unversioned, `CHANGELOG.md` being a root file.
+
 - **`tableau-migration` (skill `2.311.0` → `2.312.0`): the model openability self-check now
   describes the model that SHIPPED, not the one assembled before the row-predicate wrap.** The check
   was correct. It ran too early.
