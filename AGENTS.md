@@ -654,6 +654,43 @@ This is the general failure one level down: **an instrument answers the question
 encodes, and that question is rarely the one you are asking.** A timestamp comparison encodes *which
 is newer*; ownership is about *what is contained where*.
 
+### A gate needs a test that it is CALLED, not only that it WORKS
+
+**Correctness and reachability are independent properties, and the entire test-writing reflex points
+at the first.** A gate that never executes passes every test it has, forever, silently.
+
+Measured here: `openability_selfcheck` was computed during model assembly and reported at the end of
+the build, while `_apply_row_predicate_wrapped_measures` *added measures to that model in between*. So
+two correct, well-tested checks — `measure_value_path_not_blank` and `wrapper_keeps_base_format_string`
+— shipped as **true statements about an artifact nobody ships**:
+
+```
+_value_path_bottoms_out_blank on the WRAPPED parts   -> fires on 8 measures
+shipped openability_selfcheck                        -> measure_value_path_not_blank: True
+```
+
+Twelve unit tests, four independent instruments (static parse, `INFO.MEASURES()`, a DAX query, and a
+render) and a corpus reproduction all agreed the gate was correct. **Every one of them measured the
+function; none measured its position in the pipeline**, so their agreement carried no information
+about *when* it runs. Width in technique is not width in scope.
+
+The cheapest possible check was never run: `git grep check_model_openability` returns one call site.
+
+So, for any gate whose verdict is recorded at one stage and read at another:
+
+* **pin the call site**, not just the behaviour — e.g. a test that reads the source at the wrap site
+  and asserts the re-check is invoked there. Brittle, and it should say so in its own failure message;
+* **pin the ARGUMENT, not only the call.** A pin that asserts the call exists is satisfied by passing
+  the *pre*-mutation object, which runs clean and reports healthy;
+* **prefer an artifact pin where it is cheap.** A text pin proves the call is *written*; asserting a
+  provenance flag (here `openability_selfcheck.rechecked_after_row_predicate_wrap`) on a real build
+  proves it *ran*;
+* **cover the early-exit path.** A guard like `if not parts: return` no-ops silently if a refactor
+  starts passing `{}`, and everything downstream still looks fine.
+
+Put beside the absence rule, the pair is: **an absence claim is only as good as the instrument's
+scope, and a positive result is only as good as the instrument having been consulted.**
+
 ## Commits
 
 - Make the **user** the commit author, and append the trailer:
