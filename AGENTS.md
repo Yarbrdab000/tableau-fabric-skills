@@ -126,6 +126,20 @@ not mirrored.
   shipped set, or read branches rather than tags — and note that the integrator wrote the anchor
   rule ("an anchor tells you a version is CLAIMED, never that it is unlanded") and then built a
   ledger on exactly the surface it warns about.
+- **A metric moving is not the render changing, and a count says nothing about WHICH object moved.**
+  I read `visuals_projecting_stub_measures` dropping **6 → 1** on one workbook and told another
+  session that four of its open render defects were therefore fixed. They checked at the artifact:
+  the metric was correct and **not one of the four had changed**. The five cleared stubs were
+  `Select Metric` on a *different page* and four `Sort By` measures driving *slicers that had always
+  rendered correctly*. Had my word been taken, four genuine open defects would have been closed on a
+  page where nothing changed.
+
+  **The disconfirming detail was already in my own output.** The A/B I ran hours earlier printed the
+  visual id beside every measure — `v-page-Assessmen…` next to `Select Metric` — and I read past it
+  because the aggregate matched what I expected. An aggregate that agrees with your hypothesis is the
+  most dangerous kind of confirmation, because the per-item detail that refutes it is right there and
+  costs nothing to check. **Before claiming a metric proves a render outcome, name the specific
+  objects it moved and confirm they are the ones in question.**
 - **A second opinion narrower than the check it verifies is not redundancy.** The shipped CHANGELOG
   chain gate accepts both `->` and `\u2192` and does not require a backticked skill name, so it has always
   examined all **137** entries. My independent probe — written to double-check it — required the
