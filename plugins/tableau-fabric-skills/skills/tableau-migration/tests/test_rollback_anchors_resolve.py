@@ -129,7 +129,11 @@ def test_every_released_version_has_an_anchor(repo):
       * a version with no anchor is a release with no rollback, so assert it rather than remember it.
 
     Reads the CHANGELOG's own ``(skill `A` -> `B`)`` chain as the roster of shipped versions, so the
-    roster cannot drift from what was actually released.
+    roster cannot drift from what was actually released. **Both arrow forms**, because the file
+    carries two entry formats and this docstring already said ``->`` while the pattern below matched
+    only the Unicode arrow -- so it certified "every released version has an anchor" while examining
+    **89 of 140**. The prose specified the grammar the code did not implement, which is the tell to
+    look for: a narrow reader does not merely miss the region it cannot see, it CERTIFIES it.
     """
     import io
     import re
@@ -139,7 +143,8 @@ def test_every_released_version_has_an_anchor(repo):
         pytest.skip("no CHANGELOG.md in this checkout")
     text = io.open(path, encoding="utf-8").read()
     released = []
-    for m in re.finditer(r"\(skill\s+`(\d+\.\d+\.\d+)`\s*\u2192\s*`(\d+\.\d+\.\d+)`\)", text):
+    for m in re.finditer(
+            r"\(skill\s+`(\d+\.\d+\.\d+)`\s*(?:->|\u2192)\s*`(\d+\.\d+\.\d+)`\)", text):
         if m.group(2) not in released:
             released.append(m.group(2))
     if not released:

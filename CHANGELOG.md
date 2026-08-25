@@ -12,6 +12,33 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ## [Unreleased]
 
+### Fixed
+
+- **`tableau-migration` (skill `2.306.0` → `2.307.0`): the last narrow CHANGELOG reader is widened —
+  a gate certified "every released version has an anchor" while examining 89 of 140.**
+  `test_every_released_version_has_an_anchor` matched only the Unicode arrow. The file carries **two**
+  entry formats — 89 newer entries with a backticked skill name and `→`, and 51 older ones with a bare
+  name and ASCII `->` — so the roster it built silently omitted **51 releases**, and reported that
+  every version in it had an anchor.
+
+  **The tell was inside the function.** Its own docstring says it reads the ``(skill `A` -> `B`)``
+  chain — writing the **ASCII** arrow — directly above a pattern that accepts only the Unicode one.
+  *The prose already specified the grammar the code did not implement.*
+
+  This is the sibling of the reader fixed in 2.305.0, in the same module. Fixing one reader in a
+  module with two would have been the same shape as a repair that satisfies a gate without fixing the
+  thing it stands for — so the population was re-derived rather than the named case patched: **239
+  python files swept, exactly one narrow reader remaining, now zero.**
+
+  **Measured safe before the change**: roster 89 → 140, missing anchors **0 either way**. The widening
+  buys 51 newly-judged releases and surfaces no new violation, so this is coverage, not a repair.
+
+  The general rule, which this is the third instance of today: **a verifier narrower than its subject
+  does not merely miss the region it cannot see — it CERTIFIES it**, with the authority of an
+  independent check. Write the predicate from the subject's grammar, never from the sample in front
+  of you.
+
+
 ### Added
 
 - **`tableau-migration` (skill `2.305.0` → `2.306.0`): a measure that names a COLUMN unqualified is
