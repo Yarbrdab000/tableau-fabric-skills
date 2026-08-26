@@ -756,6 +756,29 @@ The tests that actually work on all three are mechanical, and both are one comma
 >
 > **A property is not validated or unvalidated as a whole — each of its jobs is, separately.**
 
+### Which of these rules actually work
+
+Most of the rules above require you to **notice something first** — that a count is unexplained, that a
+claim is unmeasured, that two probes agree suspiciously, that a population might not be the claim's.
+Measured across a day of parallel sessions, that is precisely where they fail: **every error caught
+landed on a claim its author was confident about, and none landed on anything they were already unsure
+of** — because uncertainty triggers the careful behaviour by itself, without a rule.
+
+So the rules that depend on noticing are dead weight in exactly the cases that matter. The ones worth
+relying on are **mechanical** — they cost the same whether or not you think you need them:
+
+- **`import` the engine's tested reader instead of writing a probe.** Every ad-hoc probe written
+  across three sessions invented a worse predicate than one already in the repo.
+- **Print the population and the engine** with any count — the root swept and the build that produced
+  the artifact. Both, always, because they fail differently.
+- **Assert the population is non-empty** before reading a result over it.
+- **Write the expected number into the assertion** (`assert hits, "git grep said 2"`), so a silent zero
+  becomes a failure rather than a tidy answer.
+
+Everything else is a description of how these failures look afterwards. Useful for a post-mortem;
+unreliable as a defence, because **the check is cheapest exactly when you are most sure you do not need
+it.**
+
 ## Commits
 
 - Make the **user** the commit author, and append the trailer:
