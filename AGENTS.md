@@ -725,6 +725,35 @@ What actually settled it, in order of decisiveness:
 Generalised: **a measurement of an artifact cannot tell you the intent of the code that produced it.**
 Before "fixing" a systematic divergence, establish that it is not a contract.
 
+### Carefulness is not a defence — it fails in three directions
+
+The three hardest claims to check are all *careful* ones. Each escapes scrutiny by resembling the
+virtue that should prompt it, and no amount of being more careful helps, because being careful is what
+produces them.
+
+| shape | how it reads | why it escapes |
+|---|---|---|
+| **over-claiming** wrapped in self-criticism | rigour | cataloguing your own error *is* a form of authority, and it displaces the evidence rather than accompanying it |
+| **under-claiming** a property you only partly measured | modesty | you measured one of its jobs, found that one unexercised, and labelled the whole guard unexercised |
+| **a hedge** used instead of an available check | appropriate caution | *"as far as I can tell"* is indistinguishable, to a reader, from having looked |
+
+All three were committed here, by different sessions, on different days' worth of otherwise careful
+work:
+
+- a retraction that was scrupulous about *which key names were missed* and silent about *which files
+  were read* — the scrupulousness is what bought it a pass;
+- `_NON_DAX_CALL_RE`'s leading lookbehind, documented as "defensive, not validated" while its second
+  and load-bearing job was exercised by an existing test;
+- *"not on the issue as far as I can tell"*, written in a worktree where `gh issue view` was available,
+  about an answer that had been posted twenty-seven minutes earlier.
+
+The tests that actually work on all three are mechanical, and both are one command:
+
+> **A hedge is only honest when the check is unavailable.** When it is available, the hedge is a claim
+> wearing modesty — ask *what would have to be true for "as far as I can tell" to mean "I looked"?*
+>
+> **A property is not validated or unvalidated as a whole — each of its jobs is, separately.**
+
 ## Commits
 
 - Make the **user** the commit author, and append the trailer:
