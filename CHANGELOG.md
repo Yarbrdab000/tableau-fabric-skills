@@ -14,6 +14,32 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ### Fixed
 
+- **`tableau-migration` (skill `2.329.0` → `2.330.0`): the storage decision accepts a
+  provenance-tagged volume hint and ADVISES on it, without ever overriding the mode (#163).** The
+  engine picks Import vs DirectQuery from connector class and relation shape and has no concept of how
+  much data a source holds, so *"a 42-million-row table and a 10-thousand-row table get the same
+  treatment and the same guidance."* The reporter's field benchmark, taken against Snowflake directly
+  rather than through Power BI: **1,020,016 rows in 452 s** (~2,255 rows/sec), on an Import table
+  treated identically to the estate's small dimension tables. `select_storage_mode` now takes an
+  optional `row_count={"value", "source": "hyper"|"live"|"unknown", "as_of"}` -- the shape agreed with
+  the reporter, chosen because **it carries its own provenance** -- and stamps a `volume` block with
+  the count, band and specific advice: incremental refresh for a large Import, a first-refresh caveat
+  for a moderate one, and *"Import would almost certainly perform better"* for a small DirectQuery. A
+  `hyper`-sourced count always carries its staleness caveat (an extract's count is as of its last
+  Tableau refresh) and a `live` one never does, so the warning stays informative instead of becoming
+  wallpaper. **It advises and does not decide**, for three reasons: the hint can be silently stale;
+  flipping would make the mode non-reproducible from the descriptor alone, so two runs of one workbook
+  could emit different models for a reason recorded nowhere in either; and the seam for *"the engine
+  should not decide this"* already exists as `--storage-decision`, which an operator can now use
+  having READ the advice. Absent is a normal, representable outcome -- a pure live source has no
+  extract to count -- and `row_count=None` returns the decision byte-identical to today. A bare
+  integer is accepted but stamped `source: "unknown"` rather than laundered. Twelve tests, nine
+  positive controls. **The control caught a real hole in my own test:** the refusal test used a
+  fixture whose mode is DirectQuery, so the `large + Import` branch was unreachable from it and an
+  injected auto-flip passed clean -- a refusal test that cannot reach the branch it refuses is green
+  and about nothing. Both modes are now exercised, plus a guard asserting every advice branch is
+  reachable at all.
+
 - **`tableau-migration` (skill `2.328.0` → `2.329.0`): a DAX reference that resolves but disagrees on
   CASE is now disclosed, and deliberately not failed.** #164 reported a Snowflake estate where ~12
   measures referenced a custom-SQL column by the SQL's literal alias text (`Available_Duration`) while

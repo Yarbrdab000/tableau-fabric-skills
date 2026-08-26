@@ -412,7 +412,7 @@ def _structurally_unsupported_reason(descriptor):
     return _structurally_unsupported_detail(descriptor)[0]
 
 
-def select_storage_mode(descriptor, *, storage_decision=None):
+def select_storage_mode(descriptor, *, storage_decision=None, row_count=None):
     """Choose a storage mode for one Tableau datasource descriptor.
 
     Returns a decision dict: ``mode`` ('Import'|'DirectQuery'|None), ``connector``,
@@ -428,8 +428,14 @@ def select_storage_mode(descriptor, *, storage_decision=None):
     ``needs-storage-decision`` outcome: ``'Import'``, ``'DirectQuery'``, ``'DirectLake'`` or
     ``'recommended'``. Omitting it is the default and returns exactly the decision this function has
     always returned. See :func:`apply_storage_decision` for what it may and may not override.
+
+    ``row_count`` (keyword-only, issue #163) is an optional provenance-tagged volume hint,
+    ``{"value": int, "source": "hyper"|"live"|"unknown", "as_of": str}``. It ADVISES and never
+    overrides -- see :func:`apply_volume_hint`. Omitting it (the common case: a pure live source has
+    no extract to count) returns the decision unchanged.
     """
-    return apply_storage_decision(_select_storage_mode(descriptor), storage_decision)
+    return apply_volume_hint(
+        apply_storage_decision(_select_storage_mode(descriptor), storage_decision), row_count)
 
 
 def normalize_storage_decision(value):
@@ -524,6 +530,124 @@ def apply_storage_decision(decision, storage_decision):
         "%s OPERATOR DECISION: rebuild direct-to-source as %s, supplied explicitly; the shape was "
         "not auto-selectable, so verify the emitted partitions against the source."
         % (decision.get("rationale", ""), want)).strip()
+    return out
+
+
+VOLUME_BAND_MODERATE = 100_000
+VOLUME_BAND_LARGE = 10_000_000
+
+_VOLUME_SOURCES = ("hyper", "live", "unknown")
+
+
+def normalize_row_count(row_count):
+    """Fold a volume hint to ``{value, source, as_of}``, or ``None`` when there is no usable one.
+
+    Accepts the provenance-tagged shape agreed in #163 -- ``{"value": 42104338, "source":
+    "hyper"|"live"|"unknown", "as_of": "..."}``. A BARE INTEGER is accepted but stamped
+    ``source: "unknown"`` rather than trusted: a number with no provenance cannot be told apart from
+    a stale extract count, and the reporter's own framing was that *"a silently stale or silently
+    missing number would drive worse decisions than no number"*.
+
+    Absent, empty, negative and unparseable all return ``None``, because **absent must be a normal,
+    representable outcome** -- a pure live source has no ``.hyper`` at all, so a missing hint is the
+    common case rather than an error.
+    """
+    if row_count is None:
+        return None
+    if isinstance(row_count, bool):          # bool is an int subclass; never a row count
+        return None
+    if isinstance(row_count, (int, float)):
+        row_count = {"value": row_count, "source": "unknown"}
+    if not isinstance(row_count, dict):
+        return None
+    try:
+        value = int(row_count.get("value"))
+    except (TypeError, ValueError):
+        return None
+    if value < 0:
+        return None
+    source = str(row_count.get("source") or "unknown").strip().lower()
+    if source not in _VOLUME_SOURCES:
+        source = "unknown"
+    out = {"value": value, "source": source}
+    as_of = row_count.get("as_of")
+    if as_of:
+        out["as_of"] = str(as_of)
+    return out
+
+
+def volume_band(value):
+    """``'small'`` / ``'moderate'`` / ``'large'`` for a row count.
+
+    Advisory bands, and the thresholds are round numbers rather than derived ones -- said plainly so
+    nobody reads authority into them. What IS measured is the reporter's own benchmark: 1,020,016
+    rows in 452 s against Snowflake (~2,255 rows/sec), on a table that received exactly the same
+    treatment as the estate's small dimension tables. That is the gap this exists to name.
+    """
+    if value < VOLUME_BAND_MODERATE:
+        return "small"
+    if value < VOLUME_BAND_LARGE:
+        return "moderate"
+    return "large"
+
+
+def apply_volume_hint(decision, row_count):
+    """Stamp an optional volume hint onto a storage decision -- ADVISE, never override (#163).
+
+    The engine chooses a storage mode from connector class and relation shape and has no concept of
+    how much data a source holds, so *"a 42-million-row table and a 10-thousand-row table get the
+    same treatment and the same guidance"*. This closes the guidance half and deliberately leaves
+    the decision half alone.
+
+    **Why it does not flip the mode.** Three reasons, in order of weight:
+
+    * the hint can be silently stale -- an extract's count is *as of its last Tableau refresh* and
+      lags badly wherever the source SQL has a rolling window;
+    * flipping would make the storage mode non-reproducible from the descriptor alone, so two runs
+      of the same workbook could emit different models for a reason recorded nowhere in it;
+    * the existing seam already has an answer for "the engine should not decide this" --
+      :func:`apply_storage_decision` -- and an operator can supply ``--storage-decision`` having read
+      the advice. A hint that recommends is composable with that; one that decides fights it.
+
+    Additive and inert without a hint: ``row_count=None`` returns the decision unchanged, which is
+    what every run does today and what a pure live source will always do.
+    """
+    hint = normalize_row_count(row_count)
+    if hint is None:
+        return decision
+    out = dict(decision)
+    band = volume_band(hint["value"])
+    mode = decision.get("mode") or decision.get("recommended_mode")
+    notes = []
+    if band == "large" and mode == "Import":
+        notes.append(
+            "%s rows: a full Import refresh will be long and memory-hungry. Consider incremental "
+            "refresh (needs a date/datetime partition column), or DirectQuery if the source can "
+            "carry the query load." % f"{hint['value']:,}")
+    elif band == "moderate" and mode == "Import":
+        notes.append("%s rows: Import is appropriate; expect a noticeable FIRST refresh."
+                     % f"{hint['value']:,}")
+    elif band == "small" and mode == "DirectQuery":
+        notes.append(
+            "%s rows: this is small enough that Import would almost certainly perform better than "
+            "DirectQuery, which pays a round trip per visual." % f"{hint['value']:,}")
+    if hint["source"] == "hyper":
+        notes.append(
+            "Count is the packaged extract's, as of its last Tableau refresh -- it can lag the live "
+            "source badly where the query has a rolling window.")
+    elif hint["source"] == "unknown":
+        notes.append("Count arrived without provenance, so its age and origin are unknown; treat it "
+                     "as an order of magnitude rather than a figure.")
+    out["volume"] = {
+        "row_count": hint["value"],
+        "source": hint["source"],
+        "band": band,
+        # Named explicitly so nobody has to infer it from the absence of a mode change.
+        "applied_to_mode": False,
+        "advice": notes,
+    }
+    if "as_of" in hint:
+        out["volume"]["as_of"] = hint["as_of"]
     return out
 
 
