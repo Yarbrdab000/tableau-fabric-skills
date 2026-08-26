@@ -6775,7 +6775,27 @@ def _apply_override(field, model_table, field_map):
     # crosscheck could not match, so the whole column was dropped from the table while its correctly
     # translated measure sat unused in the model. Normalised HERE, at the single choke point every
     # reference shape derives ``prop`` from, so ``Property``, ``queryRef`` and ``nativeQueryRef``
-    # can never disagree about the name -- a mismatch between them renders an error tile.
+    # cannot disagree AT THIS POINT.
+    #
+    # SCOPE, because the previous wording overstated and mis-ranked a real investigation twice.
+    # It read "...can never disagree about the name -- a mismatch between them renders an error
+    # tile", and BOTH halves need qualifying:
+    #
+    #   * "never" is true of this function, not of the artifact. A LATER stage rewrites
+    #     ``field.Measure.Property`` without re-deriving the labels -- see
+    #     ``migrate_estate._apply_row_predicate_wrapped_measures``, which points a projection at a
+    #     ``CALCULATE(<base>, FILTER(...))`` wrapper while deliberately leaving ``nativeQueryRef``
+    #     as the user-facing Tableau name. That is intended output, not a bypass: 55 projections
+    #     across 39 visuals in one corpus workbook. Rebinding them "back" to the base would drop
+    #     the filter and silently change every one of those numbers.
+    #   * "renders an error tile" is the consequence of the condition MEASURED ABOVE -- a reference
+    #     naming an object the model does NOT declare. It does not transfer to a name mismatch whose
+    #     ``Property`` resolves: 59 of 59 divergent projections across the 34-workbook corpus resolve
+    #     to a declared object, with a green suite and no error tiles.
+    #
+    # Stated because the fused form was unfalsifiable in place -- checking the consequence required a
+    # population the mechanism clause never described -- and because a comment that makes the next
+    # reader either panic or dismiss it fails in both directions at once.
     if isinstance(prop, str):
         prop = prop.strip() or prop
     if field.get("date_rebound") or field.get("column_rebound") or field.get("measure_rebound"):

@@ -14,6 +14,35 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ### Added
 
+- **`tableau-migration` (skill `2.314.0` → `2.315.0`): the label-agreement invariant comment in
+  `_apply_override` is scoped to what it actually measured.** It claimed *"`Property`, `queryRef` and
+  `nativeQueryRef` can never disagree about the name — a mismatch between them renders an error
+  tile"*, and both halves overstated:
+
+  - **"never"** is true of that function, not of the artifact. A later stage rewrites
+    `field.Measure.Property` without re-deriving the labels —
+    `migrate_estate._apply_row_predicate_wrapped_measures` points a projection at a
+    `CALCULATE(<base>, FILTER(...))` wrapper while **deliberately** leaving `nativeQueryRef` as the
+    user-facing Tableau name. 55 projections across 39 visuals in one corpus workbook. Rebinding them
+    "back" so the labels agree would drop the filter and silently change every one of those numbers.
+  - **"renders an error tile"** is the consequence of the condition measured *in that same comment* —
+    a reference naming an object the model does not declare. It does not transfer to a name mismatch
+    whose `Property` resolves: **59 of 59** divergent projections across the 34-workbook corpus
+    resolve to a declared object, negative control passing, suite green, no error tiles.
+
+  **The claim was written into a codebase that already contained its counterexamples** — the wrappers
+  were minted in 2.56.0 (Aug 4), the sentence added in 2.94.0 (Aug 7). Not invalidated by drift; never
+  true of the artifact, and it survived because it reads as a correct *local* statement about the
+  choke point, which it is.
+
+  Two parallel sessions independently ranked work off it — once toward an emitter change that would
+  have removed those filters, once toward treating 58 projections as a live rendering outage. **A
+  comment whose failure mode is both panic and dismissal fails in both directions at once**, which is
+  the argument for scoping rather than deleting it: the measured claim underneath is real and still
+  load-bearing.
+
+  Comment only; no behaviour change.
+
 - **`tableau-migration` (skill `2.313.0` → `2.314.0`): a broken CHANGELOG entry parser now FAILS
   instead of skipping, and the denylist lookbehind is documented by both of its jobs.**
 
