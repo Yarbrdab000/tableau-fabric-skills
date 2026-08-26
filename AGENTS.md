@@ -539,6 +539,44 @@ superseded rather than partially because both versions still existed to diff. Re
 by resetting onto the surviving branch rather than leaving it — **a lane head that can never merge is a
 trap for whoever picks it up next.**
 
+### A red anchor gate is a question, not a verdict
+
+`test_every_released_version_has_an_anchor` and `test_every_anchor_predates_the_version_it_anchors`
+both read the **shared tag namespace**, so a lane can go red for a reason entirely outside its own
+branch and green again seconds later. Observed twice, on both gates, **both times innocent**: a lane
+fast-forwarded, ran the suite, got `MISSING anchors: ['2.317.0']`, and re-measured 90 seconds later to
+find the tag present — it had been cut *between the test reading the namespace and the re-check*.
+
+**Before filing a defect against another lane for a red anchor gate, run
+`git for-each-ref --sort=-taggerdate refs/tags/rollback` and re-run the test.** A green suite and a red
+suite can both be correct answers about the same commit, and the difference is only *when you looked*.
+
+Do not "fix" the flake by loosening the gate — reading the shared namespace *is* its purpose. Close
+the window at the source instead, which is procedural:
+
+> **Cut the anchor BEFORE the release commit lands, so the window is negative rather than merely short.**
+
+**Measured over 14 consecutive releases: 13 have a negative window** (anchor cut 14–349 s *before* its
+release commit) **and exactly one is positive — 735 s, twelve minutes of a gate that any lane could
+have hit.** The outlier is the informative part:
+
+> **The one release with an open window was the one handled OFF-SCRIPT** — a collision renumber, done
+> by hand because the number was contested. The normal path cuts the anchor first because a script
+> does it; the exceptional path skipped the step, and its anchor was backfilled 7 minutes *after the
+> next release's anchor*, out of order.
+
+**The exceptional path drops the guarantees the normal path automates, and the exceptional path is
+where the stakes are highest** — a contested number is precisely the case an anchor exists for. When a
+release goes off-script for any reason (collision, renumber, reconciliation), walk the steps
+explicitly; do not assume the ones you would have gotten for free.
+
+**A footnote on the probe that measured this, because it is the same class one layer up:** its
+"anchors whose target already stamps ≥ its own version" check reported two defects, both false.
+It compared versions **as strings** — `"2.9.0" >= "2.10.0"` is `True` lexically — so it flagged
+`2.10.0` and `2.100.0`, the only two anchors in 341 where semver and lexical order disagree. Correct
+predicate, wrong comparison; and it produced a *plausible* two rather than an absurd number. Compare
+versions as tuples of ints, never as strings.
+
 **Handing a number back is two-sided, and both halves failed here at once:**
 
 > **A number, once given, needs an explicit hand-back before the giver takes it — and a decline must
