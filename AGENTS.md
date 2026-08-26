@@ -844,6 +844,21 @@ count is plausible, the zero is well-formed, the skip is one line in an already 
 is the whole distinction: a rule you must remember to apply protects nothing at the moment you are
 confident, and a rule that crashes protects you whether or not you were paying attention.
 
+**And the honest qualification: the mechanical rules did not find most of what was found here.** Every
+significant error above was caught by a *different session measuring the same object* — not by a rule
+firing. What made that work has two halves, and neither is mechanical, so neither can be written as a
+check:
+
+- **Say which of your claims you have measured and which you have only reasoned to**, and correct them
+  in public when they break. That makes being wrong cheap enough that declining authorised work, or
+  reopening something you already closed, is the obvious move rather than a risky one.
+- **Treat a late correction as information rather than as relitigation.** Reopening a closed finding
+  is only cheap if the other party never suggests the matter was settled — including when the
+  correction is to a retraction, or to a correction.
+
+The rules are what protect you when nobody else is looking at the same object. **They are not what
+found these.**
+
 One further note on *when* they pay. Almost every catch recorded here was **retrospective** — an
 artifact already existed and someone measured it. Exactly one landed **before the action**: a version
 number about to be taken would have left a hole in the release chain, and the cheaper-looking escape
