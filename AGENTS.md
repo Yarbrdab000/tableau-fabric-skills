@@ -514,6 +514,24 @@ already says is insufficient, because *a tag read is stale the instant it return
 a namespace lookup does not. Recorded as mutual deliberately: **a lane that reads this as "the
 integrator's problem" will skip the check, and it is the check that matters rather than the role.**
 
+**The underlying defect is the ledger's SHAPE, not either party's attention:** `refs/tags/rollback/`
+mixes *claimed*, *shipped* and *abandoned*, so it cannot distinguish a collision from routine churn.
+The obvious repair is to derive the states — *an anchor whose version no reachable commit stamps is
+CLAIMED, i.e. someone is mid-release* — and it turns out **not to be reliable**, which is worth more
+than the repair would have been:
+
+```
+git log --format=%H -- skills/tableau-migration/VERSION                 327 commits
+git log --full-history --format=%H -- skills/tableau-migration/VERSION  464 commits
+                                              omitted by simplification 137   (30%)
+```
+
+**`git log -- <path>` applies history simplification by default and drops commits whose change arrived
+through a merge.** On a history assembled from parallel lanes that is most of them, so the derived
+"claimed" set reported seven demonstrably-shipped releases as in-flight. **Use `--full-history` for any
+question about which versions exist**, and treat a plain `git log -- <path>` as a sample rather than a
+population — the same silent scope decision as a glob, made by a default instead of a flag.
+
 **What made both episodes cheap is that each party archived before overwriting** —
 `archive/pre-v2.314.0-prior`, `archive/duplicate-2.312.0-dispatcher-lane`. Nothing recoverable was
 lost, and more usefully **the decision stayed checkable**: a duplicate could only be confirmed *fully*
