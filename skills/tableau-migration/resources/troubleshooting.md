@@ -20,8 +20,9 @@ What are you running into? Reply with a number and I'll walk you through it:
                                            data/extract/flat-file is missing)
   5) A step errored or the run stalled    (the happy path isn't completing; is WARN a failure?)
   6) Deploy to Fabric failed              (az login, workspace/capacity, refresh / credential wall)
-  7) The output looks wrong               (.pbip won't OPEN at all, .pbip "tiny/broken", calcs = 0,
-                                           a visual missing, a table with no data, numbers off)
+  7) The output looks wrong               (.pbip won't OPEN at all, the RUN says not openable,
+                                           .pbip "tiny/broken", calcs = 0, a visual missing,
+                                           a table with no data, numbers off)
   8) Not sure / none of these             (describe it and I'll route you)
 ```
 
@@ -158,6 +159,8 @@ Deeper: [migration-gotchas.md](migration-gotchas.md) (**Deploy & validate**); th
 | A visual is missing / a placeholder | A disclosed `warned` rebuild (unsupported visual or no usable bindings) | It's reported, not lost — read the worksheet's `viz_fidelity` / warnings row; offer the assisted dashboard-audit tier. |
 | A number doesn't match Tableau | Different **filter context** on the two sides, or cross-engine rounding | Match the filter context first; compare with a **relative epsilon**, not exact equality. A genuine gap is a real mismatch to investigate. |
 | Edited a `.tmdl`/`.m` file but Desktop still runs the old query | Desktop compiles the `.pbip` **once at open** and doesn't watch files | **Close and reopen** the `.pbip` to force a fresh read from disk. |
+| **The run itself says the model is not openable** — `definition_of_done` is `failed`, or `report.json` → `openability_selfcheck.ok` is `false` | The engine's own **pre-emission gate** found a TMDL-level defect that would make Power BI Desktop refuse the model or open it broken. This is **our output**, not the machine (contrast the Newtonsoft row above) | **Read `report.json` → `openability_selfcheck.issues[]` first — it already names the cause.** Each issue carries `check`, `part` and a `detail` that states the mechanism *and* the exact Desktop error, e.g. *"compatibilityLevel 1550 is below the 1606 Power BI Desktop writes … the next COLD open will fail with 'Tabular databases do not support CompatibilityLevel downgrade'"*. Do **not** hand-edit the TMDL to silence it. The usual root cause is **stubbed calcs whose dangling references break the model** → run the **second compiler** (below). |
+| Stubbed calcs left the model non-openable (`needs_review_total > 0` **and** `openability_selfcheck.ok == false`) | A stub is a valid outcome, but a *referenced* stub can leave a dangling DAX reference that the model will not load with | **Offer the assisted pass and run it on the user's `GO`** — this is the documented remedy and it is not optional to *mention*: see [second-compiler.md](second-compiler.md) §*When to start*. Author the DAX into `approved_dax.json`, then re-run with `--approved-dax approved_dax.json`. A real run went 70.9% → 96.4% coverage and `FAILED` → openable this way. Shipping stubs **without telling the user the pass exists** is a process failure. |
 
 Deeper: [migration-gotchas.md](migration-gotchas.md) (**the `.pbip` is a pointer**, **Editing the output**), [second-compiler.md](second-compiler.md), [validation-reconciliation.md](validation-reconciliation.md).
 

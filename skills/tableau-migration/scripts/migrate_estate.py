@@ -5158,6 +5158,36 @@ def migrate_estate(source, output_dir, *, viz_stage=None, pbip=True, rebind_plan
     pbip_dir = os.path.join(output_dir, "pbip") if pbip else None
     os.makedirs(output_dir, exist_ok=True)
 
+    # MACHINE-level blockers, checked BEFORE any work. This is a PREFLIGHT: the findings say
+    # nothing about the workbook, the model or the emitted PBIR -- they say this BOX will fail to
+    # open whatever we hand over. Running it here rather than at report-assembly time is the whole
+    # point: a user reported completing a full migration, being told it succeeded, and only then
+    # double-clicking into `Method not found: 'Void Newtonsoft.Json.JsonSerializerSettings..ctor'`.
+    # The detection existed; it just ran after the work, so it could not save any of it. Detection
+    # only -- the remedy is machine-wide, needs elevation, and is never performed here.
+    # The result is stashed and written into ``report["environment"]`` unchanged below, so the
+    # report schema is untouched.
+    try:
+        import sys as _sys
+        import environment_preflight as _envpre
+        _env_findings = _envpre.environment_findings()
+    except Exception:
+        _sys, _env_findings = None, []
+    for _f in _env_findings:
+        # Loud, immediate, and on stderr so it survives a piped stdout. Printed BEFORE the run so
+        # the user can stop and fix the machine instead of discovering it after the migration.
+        # ``sys`` is imported LOCALLY: this module has no module-level ``import sys`` (verified --
+        # the only other mentions are comments about sys.path), so a bare ``sys.stderr`` here would
+        # raise NameError. It would have raised only when a finding EXISTS, i.e. only on the
+        # machines this code is written to help, and never in a clean-machine test.
+        if _sys is not None:
+            _sys.stderr.write(
+                "[environment] %s\n" % (_f.get("detail") or _f.get("summary") or _f))
+    if _env_findings and _sys is not None:
+        _sys.stderr.write(
+            "[environment] %d machine-level finding(s) above will affect OPENING the output, not "
+            "its correctness. See resources/troubleshooting.md section 7.\n" % len(_env_findings))
+
     viz = _resolve_viz_stage(viz_stage, layout=layout)
     used_folders = set()
 
@@ -5204,11 +5234,11 @@ def migrate_estate(source, output_dir, *, viz_stage=None, pbip=True, rebind_plan
     # Newtonsoft.Json sat in the machine's GAC, and every user's first assumption was that the
     # migration had produced something broken. Detection only -- the remedy is machine-wide, needs
     # elevation and the Windows SDK, and is never performed here. See environment_preflight.
-    try:
-        import environment_preflight as _envpre
-        report["environment"] = {"findings": _envpre.environment_findings()}
-    except Exception:
-        report["environment"] = {"findings": []}
+    #
+    # COMPUTED AT THE TOP OF THIS FUNCTION, not here: the findings were already emitted to stderr
+    # before any work started, so the user can abort a doomed run. This site only records the same
+    # values into the report, unchanged.
+    report["environment"] = {"findings": _env_findings}
     # Absolute, copy-pasteable paths to every openable .pbip (additive; [] under --no-pbip). Resolved
     # here where output_dir is in scope, so the report/summary/stdout can hand the user a REAL path
     # instead of the run-relative pbip/<Name>/<Name>.pbip stored per detail.

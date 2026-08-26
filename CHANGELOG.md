@@ -14,6 +14,53 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ### Fixed
 
+- **`tableau-migration` (skill `2.322.0` → `2.323.0`): the environment PREFLIGHT now actually flies
+  first, and "the run says the model is not openable" is documented where a stuck user looks.**
+
+  Two halves of the same reported failure: a user completed a full migration, was told it succeeded,
+  and only then double-clicked into
+  `Method not found: 'Void Newtonsoft.Json.JsonSerializerSettings..ctor'`.
+
+  **1. A preflight that runs last is a post-mortem.** `environment_preflight` (shipped 2.207.0)
+  detects exactly that machine condition — an outdated `Newtonsoft.Json` in the GAC that makes
+  Power BI Desktop refuse **any** `.pbip`, including a blank one. It was invoked at
+  `migrate_estate.py` L5209, **80% of the way through the run**, at report-assembly time. It found
+  the blocker correctly and could not save a minute of the work it was meant to protect. The check
+  now runs **before the first migration call** and writes each finding to **stderr** immediately, so
+  the user can stop and fix the machine. `report["environment"]` is written from the same values at
+  the same place — **schema untouched**.
+
+  **2. `troubleshooting.md` §7 gained two rows.** The openability gate's own `detail` text is
+  excellent — mechanism, consequence, and the exact Desktop error string, e.g. *"compatibilityLevel
+  1550 is below the 1606 Power BI Desktop writes … the next COLD open will fail with 'Tabular
+  databases do not support CompatibilityLevel downgrade'"* — and it lands in `report.json`, while a
+  user with a broken `.pbip` opens `troubleshooting.md`. That file had **no row keyed on
+  non-openability** (`openability` appeared **nowhere** in 478 KB of docs across 24 files, and 12 of
+  12 gate checks had zero coverage). Now: one row routing to
+  `openability_selfcheck.issues[]`, one for the stub-driven case routing to **second-compiler.md**
+  with `approved_dax.json` — the remedy that took the reported run from 70.9% to 96.4% coverage and
+  `FAILED` to openable. The §7 index line names it too, so it is findable from the top.
+
+  **The bug this nearly shipped with is the point.** `migrate_estate` has **no module-level
+  `import sys`** — the only other mentions are comments about `sys.path`. A bare `sys.stderr.write`
+  in the new block raised `NameError` **only when a finding existed**, i.e. only on the machines the
+  code is written to help, and never in a clean-machine test. `py_compile` passed. It was caught by
+  importing the module and asserting `sys` was bound, then by a control that drives a real run with
+  a **faked finding present**.
+
+  New `tests/test_environment_preflight_order.py` (6 tests) pins call-order against the first
+  migration call, a single call site, and — via a subprocess driver — that a run with a finding
+  present does not raise, warns on stderr, and still records the finding. Positive control: 4
+  injections, **4 caught**, sources restored byte-identical.
+
+  **Three of those injections were rejected as unrepresentative before one counted**, which is the
+  transferable part: the doc tests first asserted a token was present *anywhere in the file*, and
+  both `openability_selfcheck` and the `second-compiler.md` link already appear in neighbouring
+  rows — so gutting the new row still passed. Presence *somewhere* is not presence *where the reader
+  is looking*. The tests now anchor on the §7 **row**, and the injection injures the specific claim.
+
+  Suite 5217 → **5223**.
+
 - **`tableau-migration` (skill `2.321.0` → `2.322.0`): the skill no longer asks an agent to GUESS
   where it is installed, and self-update stops leaving decoys that make the guess wrong.**
 
