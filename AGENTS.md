@@ -1149,7 +1149,31 @@ os.walk on Windows         MAX_PATH truncation
 ```
 
 **The default is invisible in the invocation *and* in the result**, which is precisely why "be more
-careful" never catches these and reading the flag list does.
+careful" never catches these and reading the flag list does. The sharper statement of *why* review
+cannot substitute:
+
+> **The filter you didn't write is the one you won't check.** A tool's default is a scope decision you
+> never made, and it leaves **no trace in your probe** — rereading your own code carefully cannot find
+> it, because it isn't there.
+
+**And two populations can agree under the default and diverge without it**, which is worse than either
+being wrong alone:
+
+```
+                                   simplified   --full-history
+COMMITS touching VERSION                  328              465
+DISTINCT VERSION values                   328              344
+```
+
+Under the default those are **the same number**, so a probe that conflates *how many commits touched
+this file* with *how many versions exist* is **confirmed by its own output**. Drop the default and
+they diverge by 121. **A coincidence that validates a wrong belief is the hardest kind to find**,
+because the check you would run agrees with you.
+
+**A near-miss worth not chasing:** earlier figures here report 327 commits / 464 full-history where a
+later run reports 328 / 465. That is not a discrepancy — a release landed between the two runs.
+**Denominators move while you are quoting them**, the same property as a version number in a message,
+and the defence is to date the measurement rather than to reconcile it.
 
 ### When the rules pay, and the one time it was before the fact
 
