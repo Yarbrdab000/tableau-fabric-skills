@@ -17,6 +17,7 @@ import geometry_audit
 from twb_to_pbir import (
     _row_count_column_target,
     _resolve_measure_values,
+    _visual_json,
     MEASURES_TABLE,    PAGE_HEIGHT,
     PAGE_WIDTH,
     SCHEMA_VISUAL,
@@ -10122,9 +10123,9 @@ def test_a_non_dual_two_measure_bar_chart_is_not_an_overlay():
     assert w["visual_type"] == "column"
 
 
-def test_the_overlay_emits_the_overlap_card_and_a_front_series_transparency():
-    # THE EMITTED ARTIFACT, not just the parse flag: the layout Overlap card, 100% series spacing,
-    # and exactly one scoped transparency naming the FRONT (second) projection.
+def test_the_overlay_emits_the_overlap_card():
+    # THE EMITTED ARTIFACT, not just the parse flag: the layout Overlap card at 100% series spacing,
+    # both measures on ONE shelf, and the source's shelf order preserved as the z-order.
     ir = parse_twb(_workbook(_lipstick_ws("Lipstick")))
     parts = emit_pbir(ir)
     vis = list(_visual_parts(parts).values())
@@ -10138,44 +10139,94 @@ def test_the_overlay_emits_the_overlap_card_and_a_front_series_transparency():
 
     projs = v["query"]["queryState"]["Y"]["projections"]
     assert len(projs) == 2, "both measures must stay on ONE shelf"
-    front = projs[1]["queryRef"]
-
-    scoped = [o for o in v["objects"]["dataPoint"]
-              if "fillTransparency" in o.get("properties", {}) and o.get("selector")]
-    assert len(scoped) == 1, "exactly one series is made translucent, got %d" % len(scoped)
-    assert scoped[0]["selector"]["metadata"] == front, (
-        "the transparency must name the FRONT series -- it is the one that can occlude")
-    assert scoped[0]["properties"]["fillTransparency"]["expr"]["Literal"]["Value"] == "61D"
+    assert [p["queryRef"] for p in projs] == [
+        "Sum(Orders.Sales_Amount)", "Sum(Orders.Profit)"], "shelf order IS the z-order"
 
 
-def test_the_front_series_transparency_follows_shelf_order():
-    # Z-ORDER IS PROJECTION ORDER. Swapping the pills swaps which series is in front, so the
-    # transparency must move with it -- otherwise the reversed variation paints the wrong bar and
-    # the back series can be completely hidden.
+def test_the_overlay_invents_no_transparency():
+    # NO ENGINE-CHOSEN TRANSPARENCY. An earlier version made the FRONT series translucent on the
+    # argument that nothing is ever drawn on top of it, so the back series could never be hidden.
+    # Sound, and it lost at the render: a translucent series over an opaque one does not REVEAL the
+    # one beneath, it BLENDS with it into a third colour that reads as a series which does not
+    # exist. It also contradicted the source -- measured on a 16-sheet workbook, HALF the overlaid
+    # sheets are fully opaque by the author's own choice.
+    ir = parse_twb(_workbook(_lipstick_ws("NoAlpha")))
+    v = list(_visual_parts(emit_pbir(ir)).values())[0]["visual"]
+    bad = [o for o in v["objects"].get("dataPoint", [])
+           if "fillTransparency" in (o.get("properties") or {})]
+    assert not bad, "the source set no mark-transparency, so none may be emitted: %s" % bad
+
+
+def test_the_overlay_carries_the_authors_own_transparency():
+    # Tableau HAS this setting and the author already used it, so there is nothing for the engine to
+    # choose. ``mark-transparency`` is an ALPHA BYTE, so 147/255 opacity is 42% transparency -- and
+    # it lands on whichever series the author set it on, which is NOT always the front one.
+    ws = _lipstick_ws("Authored").replace(
+        "<pane id='1' y-axis-name='[federated.abc].[sum:Sales:qk]'><mark class='Bar' /></pane>",
+        "<pane id='1' y-axis-name='[federated.abc].[sum:Sales:qk]'><mark class='Bar' />"
+        "<style><style-rule element='mark'>"
+        "<format attr='mark-transparency' value='147' /></style-rule></style></pane>")
+    v = list(_visual_parts(emit_pbir(parse_twb(_workbook(ws)))).values())[0]["visual"]
+    scoped = [(o["selector"]["metadata"],
+               o["properties"]["fillTransparency"]["expr"]["Literal"]["Value"])
+              for o in v["objects"]["dataPoint"]
+              if o.get("selector") and "fillTransparency" in (o.get("properties") or {})]
+    assert scoped == [("Sum(Orders.Sales_Amount)", "42D")], (
+        "the author set 147/255 on the BACK series; expected 42%% there, got %s" % scoped)
+
+
+def test_a_fully_opaque_source_pane_emits_no_transparency():
+    # ``mark-transparency`` 255 is the attribute PRESENT and the mark OPAQUE. Treating "carries the
+    # attribute" as "is translucent" would paint a 0% transparency card onto a chart the author drew
+    # solid -- and it is how a sibling probe miscounted this very corpus.
+    ws = _lipstick_ws("Opaque255").replace(
+        "<pane id='1' y-axis-name='[federated.abc].[sum:Sales:qk]'><mark class='Bar' /></pane>",
+        "<pane id='1' y-axis-name='[federated.abc].[sum:Sales:qk]'><mark class='Bar' />"
+        "<style><style-rule element='mark'>"
+        "<format attr='mark-transparency' value='255' /></style-rule></style></pane>")
+    v = list(_visual_parts(emit_pbir(parse_twb(_workbook(ws)))).values())[0]["visual"]
+    bad = [o for o in v["objects"].get("dataPoint", [])
+           if "fillTransparency" in (o.get("properties") or {})]
+    assert not bad, "alpha 255 is opaque, so nothing should be emitted: %s" % bad
+
+
+def test_the_overlay_z_order_follows_shelf_order():
+    # Z-ORDER IS PROJECTION ORDER. The two source variations differ ONLY in that order, so a rebuild
+    # that normalised it would collapse them into one chart and silently reverse one of the two.
     ir = parse_twb(_workbook(_lipstick_ws(
         "Reversed", first="sum:Profit:qk", second="sum:Sales:qk")))
     v = list(_visual_parts(emit_pbir(ir)).values())[0]["visual"]
     projs = v["query"]["queryState"]["Y"]["projections"]
     assert [p["queryRef"] for p in projs] == ["Sum(Orders.Profit)", "Sum(Orders.Sales_Amount)"]
-    scoped = [o for o in v["objects"]["dataPoint"]
-              if "fillTransparency" in o.get("properties", {}) and o.get("selector")]
-    assert [o["selector"]["metadata"] for o in scoped] == ["Sum(Orders.Sales_Amount)"]
 
 
-def test_the_overlay_transparency_survives_a_flat_mark_colour():
-    # The scoped transparency is APPENDED to dataPoint, never assigned over it. The flat mark colour
-    # writes dataPoint by assignment, so emitting the transparency first would have it silently
-    # dropped -- and the report would still validate and still render, just with the back series
-    # hidden, which is the exact defect this rebuild prevents.
-    ws = _lipstick_ws("Coloured").replace(
-        "<pane><mark class='Bar' /></pane>",
-        "<pane><mark class='Bar' /><style><style-rule element='mark'>"
-        "<format attr='mark-color' value='#f28e2b' /></style-rule></style></pane>")
-    v = list(_visual_parts(emit_pbir(parse_twb(_workbook(ws)))).values())[0]["visual"]
-    dp = v["objects"]["dataPoint"]
-    assert any("defaultColor" in o.get("properties", {}) for o in dp), "flat mark colour lost"
-    scoped = [o for o in dp if "fillTransparency" in o.get("properties", {}) and o.get("selector")]
-    assert len(scoped) == 1, "the scoped transparency was clobbered by the mark colour"
+def test_the_overlay_entries_are_appended_to_dataPoint_not_assigned_over_it():
+    # The lipstick entries are APPENDED to dataPoint, never assigned over it -- otherwise any richer
+    # colour source that already populated it (an explicit member palette, a Measure-Names series)
+    # is silently dropped, and the report still validates and still renders.
+    #
+    # Exercised at _visual_json directly rather than through a `.twb` fixture, deliberately: the flat
+    # mark colour is the obvious co-producer and it is SUPPRESSED for a lipstick (per-pane colours
+    # replace it), so no whole-workbook fixture can put two producers on this path any more. A test
+    # that cannot observe its property is worse than no test -- it reports green forever.
+    state = {
+        "Category": {"projections": [{"queryRef": "Orders.Sub", "nativeQueryRef": "Sub"}]},
+        "Y": {"projections": [
+            {"queryRef": "Sum(Orders.A)", "nativeQueryRef": "A"},
+            {"queryRef": "Sum(Orders.B)", "nativeQueryRef": "B"}]},
+    }
+    prior = [{"properties": {"fill": {"solid": {"color": {"expr": {
+        "Literal": {"Value": "'#123456'"}}}}}}, "selector": {"metadata": "Sum(Orders.A)"}}]
+    out = _visual_json(
+        "v", "clusteredColumnChart", {"x": 0, "y": 0, "z": 0, "width": 10, "height": 10},
+        state, data_point_objects=[dict(prior[0])],
+        lipstick_overlap=True, lipstick_series_transparency=[None, 42])
+    dp = out["visual"]["objects"]["dataPoint"]
+    assert any((o.get("properties") or {}).get("fill") for o in dp), (
+        "the pre-existing dataPoint entry was assigned over: %s" % dp)
+    assert any("fillTransparency" in (o.get("properties") or {}) for o in dp), (
+        "the overlay entry never landed: %s" % dp)
+    assert len(dp) == 2, "expected the prior entry PLUS the overlay entry, got %s" % dp
 
 
 def test_an_overlay_is_not_fanned_into_a_measure_trellis():
@@ -10235,8 +10286,31 @@ def test_an_uncoloured_overlay_keeps_the_theme_colours():
     # No pane colour anywhere => nothing is forced, so the theme still supplies BOTH series. Emitting
     # explicit fills here would silently override a report theme nobody asked us to override.
     v = list(_visual_parts(emit_pbir(parse_twb(_workbook(_lipstick_ws("Plain"))))).values())[0]["visual"]
-    fills = [o for o in v["objects"]["dataPoint"] if "fill" in (o.get("properties") or {})]
+    dp = v["objects"].get("dataPoint", [])
+    fills = [o for o in dp if "fill" in (o.get("properties") or {})]
     assert not fills, "no pane colour was set, so no fill should be emitted: %s" % fills
-    scoped = [o for o in v["objects"]["dataPoint"]
-              if "fillTransparency" in (o.get("properties") or {})]
-    assert len(scoped) == 1, "the front-series transparency still applies"
+    layout = v["objects"]["layout"][0]["properties"]
+    assert layout["clusteredGapOverlaps"]["expr"]["Literal"]["Value"] == "true", (
+        "the overlap card must not depend on any colour being present")
+
+def test_a_horizontal_overlay_carries_the_authors_transparency():
+    # The per-pane readers must look at the shelf the measures ACTUALLY sit on. A measures-on-Cols
+    # sheet writes ``x-axis-name`` panes, so a y-only read finds nothing and silently drops both the
+    # author's colour and the author's transparency on every horizontal overlay -- the same blind
+    # spot that made the ws-dict ``dual_axis`` field report False for all 8 horizontal sheets.
+    ws = _lipstick_ws("H Alpha", horizontal=True).replace(
+        "<pane id='1' x-axis-name='[federated.abc].[sum:Sales:qk]'><mark class='Bar' /></pane>",
+        "<pane id='1' x-axis-name='[federated.abc].[sum:Sales:qk]'><mark class='Bar' />"
+        "<style><style-rule element='mark'>"
+        "<format attr='mark-transparency' value='147' />"
+        "<format attr='mark-color' value='#f28e2b' /></style-rule></style></pane>")
+    v = list(_visual_parts(emit_pbir(parse_twb(_workbook(ws)))).values())[0]["visual"]
+    assert v["visualType"] == "clusteredBarChart"
+    got = {}
+    for o in v["objects"].get("dataPoint", []):
+        sel = (o.get("selector") or {}).get("metadata")
+        props = o.get("properties") or {}
+        if sel and "fillTransparency" in props:
+            got[sel] = props["fillTransparency"]["expr"]["Literal"]["Value"]
+    assert got == {"Sum(Orders.Sales_Amount)": "42D"}, (
+        "the author's alpha must survive on a HORIZONTAL overlay: %s" % got)

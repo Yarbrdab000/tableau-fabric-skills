@@ -1904,15 +1904,6 @@ def _is_scale_pair(measures):
 _LOLLIPOP_HEAD_MARKS = frozenset({"circle", "shape", "point"})
 
 
-# Transparency applied to the FRONT series of an overlapping-bar rebuild, as a percentage.
-#
-# Taken from the adjudicated ground-truth `.pbip` for this idiom (``dataPoint.fillTransparency``
-# = ``61D`` on the front measure), not invented -- and render-verified against that file: the back
-# series reads clearly THROUGH the front one at this value, while the front stays solid enough to
-# read as the foreground series.
-_LIPSTICK_FRONT_TRANSPARENCY = 61
-
-
 def _lipstick_measures(meas_rows, meas_cols, mark_by_instance, primary_mark):
     """The overlaid measures of a "lipstick" (overlapping-bar) sheet, in SHELF ORDER, else ``None``.
 
@@ -1980,29 +1971,82 @@ def _pane_mark_colors(table, axis):
     return colors
 
 
-def _lipstick_overlap_objects(query_state, vtype, series_colors=None):
+def _pane_mark_transparency(table, axis):
+    """Per-AXIS mark transparency: ``{measure instance -> percent}``, opaque panes omitted.
+
+    The sibling of :func:`_pane_mark_colors`, and the reason the overlapping-bar rebuild does not
+    have to INVENT a transparency: Tableau's author already made this choice per overlaid series,
+    and it is sitting in the pane as
+    ``<format attr='mark-transparency' value='N'/>``.
+
+    ``N`` is an ALPHA BYTE (0..255), not the 0..100 the Tableau UI shows -- see
+    :func:`_worksheet_mark_transparency`, where that reading is verified against two renders. Power
+    BI's ``fillTransparency`` is the complement as a percentage, so ``255`` -> 0 (omitted, opaque)
+    and ``147`` -> 42.
+
+    Measured on a 16-sheet dual-axis workbook: the author set this on ONE series of 8 sheets and
+    left the other 8 fully opaque. An engine-chosen "always make the front series translucent" rule
+    therefore contradicted the source on half the corpus -- and rendered as mud on the rest, because
+    a translucent series over an opaque one BLENDS with it rather than revealing it.
+    """
+    out = {}
+    panes_el = _first(table, "panes")
+    if panes_el is None:
+        return out
+    name_attr = "{0}-axis-name".format(axis if axis in ("x", "y") else "y")
+    for pane in _children_local(panes_el, "pane"):
+        axis_name = _attr_local(pane, name_attr)
+        if not axis_name:
+            continue
+        toks = _BRACKET_TOKEN_RE.findall(axis_name)
+        if not toks:
+            continue
+        for el in pane.iter():
+            if _local(el.tag) != "format" or (el.get("attr") or "") != "mark-transparency":
+                continue
+            try:
+                n = float(el.get("value"))
+            except (TypeError, ValueError):
+                continue
+            if not (0 <= n <= 255):
+                continue
+            pct = int(round((1.0 - n / 255.0) * 100))
+            if pct > 0:
+                out[toks[-1]] = pct
+    return out
+
+
+def _lipstick_overlap_objects(query_state, vtype, series_colors=None, series_transparency=None):
     """PBIR format objects that rebuild Tableau's overlapping-bar idiom, or ``None``.
 
     Returns ``{"layout": [...], "dataPoint": [...]}`` -- the ``layout`` card turning Overlap on with
-    100% series spacing (so the two series share one slot instead of sitting side by side), plus a
-    ``dataPoint`` entry making the FRONT series translucent.
+    100% series spacing (so the two series share one slot instead of sitting side by side), plus
+    per-series ``dataPoint`` fills where the source coloured its panes.
 
     Z-ORDER IS PROJECTION ORDER, and it needs no translation: Tableau draws the FIRST measure on a
     folded axis behind the second, and so does Power BI, so preserving shelf order preserves which
     series is in front. Confirmed against the ground-truth `.pbip`, whose two pages differ ONLY in
     ``Y`` projection order and whose own page titles name the resulting front/back split.
 
-    WHY THE FRONT SERIES, ALWAYS. Overlap makes total occlusion possible: with both bars in one
-    slot, the back one is hidden wherever the front one is longer. Tableau has three escapes --
-    length, per-series WIDTH, and transparency -- and Power BI's clustered chart has no per-series
-    width at all, so the width escape cannot survive the migration. Of the two that remain, length
-    is a property of the DATA and so is unknowable here (and unstable: it can differ per category
-    and change on refresh). Transparency on the front series is the only one that is decidable at
-    migration time, and it is a guarantee rather than a heuristic -- the front series is never
-    occluded by anything, so making it translucent leaves the back series visible for ANY data.
+    NO TRANSPARENCY IS INVENTED, and the reason is worth keeping because the argument for inventing
+    one is sound and still lost at the render. Overlap makes total occlusion possible: with both bars
+    in one slot the back one is hidden wherever the front is longer. Tableau escapes that three ways
+    -- length, per-series WIDTH, and transparency -- and Power BI's clustered chart has no per-series
+    width at all, so a translucent FRONT series looked like the only escape decidable at migration
+    time (nothing is ever drawn on top of the front series, so it leaves the back visible for ANY
+    data). Shipped, rendered, rejected: a translucent series over an opaque one does not REVEAL the
+    one underneath, it BLENDS with it, producing a third colour that reads as a series which does not
+    exist. Measured on a 16-sheet workbook whose author set one series to Tableau's orange while the
+    other took the palette's blue -- near-complementary hues, so every overlap region came out brown.
+    The ground-truth `.pbip` avoids this only incidentally: it emits no explicit fills at all, so both
+    its series take the default theme's light-blue/dark-blue pair and a blend of them is still a blue.
 
-    Generalises past two series: with N overlaid, series *i* hides 1..*i*-1, so every series except
-    the back-most gets the transparency.
+    What ships instead is the AUTHOR'S OWN transparency, read per pane by
+    :func:`_pane_mark_transparency`. Tableau has this setting and the author already used it, so
+    there is nothing to choose: 8 of those 16 sheets carry it on one series and 8 are fully opaque,
+    which means any engine-chosen rule contradicted the source on half of them. Where the source set
+    none, the overlap ships opaque -- and the occlusion that leaves is disclosed in the worksheet's
+    fidelity note rather than hidden.
     """
     if vtype not in _LIPSTICK_VTYPES:
         return None
@@ -2016,11 +2060,14 @@ def _lipstick_overlap_objects(query_state, vtype, series_colors=None):
     }}]}
     fills = []
     colors = list(series_colors or ())
+    transp = list(series_transparency or ())
     # Positional pairing, refused unless the lengths agree. The projections carry a queryRef but not
     # the measure instance the colour was read against, so a mismatched zip would paint the wrong
     # series -- and a wrong colour on an overlay is indistinguishable from a correct one at a glance.
     if len(colors) != len(projs):
         colors = [None] * len(projs)
+    if len(transp) != len(projs):
+        transp = [None] * len(projs)
     if any(colors):
         # EVERY series gets an explicit colour once ANY of them does, because Power BI colours an
         # unset series by its POSITION in the theme palette -- and the Tableau palette this engine
@@ -2040,22 +2087,20 @@ def _lipstick_overlap_objects(query_state, vtype, series_colors=None):
         if not qref:
             continue
         props = {}
-        # Every series except the back-most is made translucent; see the docstring.
-        if i:
-            props["fillTransparency"] = {"expr": {"Literal": {
-                "Value": "%dD" % _LIPSTICK_FRONT_TRANSPARENCY}}}
         hexv = colors[i]
         if hexv:
             props["fill"] = {"solid": {"color": {"expr": {"Literal": {
                 "Value": _semantic_string_literal(hexv)}}}}}
+        tpct = transp[i]
+        if tpct:
+            props["fillTransparency"] = {"expr": {"Literal": {"Value": "%dD" % tpct}}}
         if not props:
             continue
         # ``selector.metadata`` must name a queryRef this visual actually PROJECTS, which is why it
         # is read back off the emitted query state rather than rebuilt from the parsed shelf.
         fills.append({"properties": props, "selector": {"metadata": qref}})
-    if not fills:
-        return None
-    objects["dataPoint"] = fills
+    if fills:
+        objects["dataPoint"] = fills
     return objects
 
 
@@ -5079,6 +5124,7 @@ def _parse_worksheet(ws, index, ds_caption, warnings, internal_fields=None, date
     combo_split = None
     lipstick_overlap = False
     lipstick_series_colors = {}
+    lipstick_series_transparency = []
     lollipop = False
     lollipop_color = None
     mv_color_scales = []
@@ -5215,15 +5261,25 @@ def _parse_worksheet(ws, index, ds_caption, warnings, internal_fields=None, date
                 # queryRef but not the measure instance, so the pairing is positional -- and the
                 # emitter refuses to apply it unless the lengths agree.
                 _pane_cols = _pane_mark_colors(table, _measure_axis)
+                _pane_transp = _pane_mark_transparency(table, _measure_axis)
                 _lip_meas = _lipstick_measures(
                     meas_rows, meas_cols, mark_by_instance, primary_mark) or []
                 lipstick_series_colors = [_pane_cols.get(f.get("instance")) for f in _lip_meas]
                 if not any(lipstick_series_colors):
                     lipstick_series_colors = []
+                # The AUTHOR'S OWN per-series transparency, not an engine-chosen one. Tableau has
+                # this setting and half this corpus's overlaid sheets use it; inventing a rule
+                # contradicted the source on the other half.
+                lipstick_series_transparency = [
+                    _pane_transp.get(f.get("instance")) for f in _lip_meas]
+                if not any(lipstick_series_transparency):
+                    lipstick_series_transparency = []
                 fidelity_note = (
                     "dual-axis overlapping bars (two different measures folded onto one axis) -> "
-                    "clustered {0} with Overlap on, series spacing 100%, and the front series "
-                    "made translucent so the back series can never be hidden".format(
+                    "clustered {0} with Overlap on and series spacing 100%; the first measure is "
+                    "drawn behind the second, so where the front series is longer it covers the "
+                    "back one -- as Tableau renders the same construct at equal mark widths, and "
+                    "Power BI has no per-series bar width to narrow the front one with".format(
                         "bars" if visual_type == VT_BAR else "columns"))
 
         # Dual-axis lollipop: a Bar (stick) pane + a Circle/Shape/Point (head) pane plotting the SAME
@@ -5709,7 +5765,8 @@ def _parse_worksheet(ws, index, ds_caption, warnings, internal_fields=None, date
         # flat read is correct.
         "mark_color": (None if (lipstick_overlap and lipstick_series_colors)
                        else _constant_mark_color(table)),
-        "lipstick_series_colors": lipstick_series_colors,        "mark_transparency": _mark_transparency_pct(table),
+        "lipstick_series_colors": lipstick_series_colors,
+        "lipstick_series_transparency": lipstick_series_transparency,        "mark_transparency": _mark_transparency_pct(table),
         "sort": sort,
         "kpi_title_card": kpi_title_card,
         "kpi_title_cards": kpi_title_cards,
@@ -11625,7 +11682,8 @@ def _visual_json(name, vtype, position, query_state, sort_definition=None,
                  shape_objects=None, card_label_objects=None, analytics_objects=None,
                  slicer_mode=None, font_objects=None, extra_objects=None,
                  show_title=None, container_fill=None, continuous_axis=False,
-                 lipstick_overlap=False, lipstick_series_colors=None):
+                 lipstick_overlap=False, lipstick_series_colors=None,
+                 lipstick_series_transparency=None):
     # Power BI refuses a Legend alongside several measures and renders an error tile instead of a
     # chart. Enforced HERE so every emit path is covered by construction rather than by each
     # caller remembering.
@@ -11666,11 +11724,14 @@ def _visual_json(name, vtype, position, query_state, sort_definition=None,
     # visual still validates and still renders -- just with the back series hidden, which is the
     # exact defect this rebuild exists to prevent).
     if lipstick_overlap:
-        _lip = _lipstick_overlap_objects(query_state, vtype, lipstick_series_colors)
+        _lip = _lipstick_overlap_objects(query_state, vtype, lipstick_series_colors,
+                                        lipstick_series_transparency)
         if _lip:
             _objs = visual.setdefault("objects", {})
             _objs["layout"] = _lip["layout"]
-            if vtype not in _NO_DATA_POINT_TYPES:
+            # ``dataPoint`` is absent when the source set neither a per-pane colour nor a
+            # per-pane transparency -- the overlap card alone is the whole rebuild then.
+            if _lip.get("dataPoint") and vtype not in _NO_DATA_POINT_TYPES:
                 _objs.setdefault("dataPoint", []).extend(_lip["dataPoint"])
     # Data labels (Tableau "Show Mark Labels"): the data-plane ``visual.objects.labels`` ``show``
     # toggle, applied uniformly (no selector). Per the Power BI formatting reference, ``labels`` is a
@@ -14151,6 +14212,7 @@ def emit_pbir(ir, *, dataset_name="Model", report_name="Report",
                 extra_objects=_merge_extra_objects(lollipop_objects, azure_objects),
                 lipstick_overlap=ws.get("lipstick_overlap"),
                 lipstick_series_colors=ws.get("lipstick_series_colors"),
+                lipstick_series_transparency=ws.get("lipstick_series_transparency"),
                 container_fill=ws.get("canvas_fill")))
             rec = _candidate_record(page_name, vname, ws, vtype, state, pos,
                                     page_display=db["name"] or page_name,
@@ -14409,6 +14471,7 @@ def emit_pbir(ir, *, dataset_name="Model", report_name="Report",
                 extra_objects=_merge_extra_objects(lollipop_objects, azure_objects),
             lipstick_overlap=ws.get("lipstick_overlap"),
             lipstick_series_colors=ws.get("lipstick_series_colors"),
+            lipstick_series_transparency=ws.get("lipstick_series_transparency"),
             container_fill=ws.get("canvas_fill"))
         rec = _candidate_record(page_name, vname, ws, vtype, state, pos,
                                 page_display=ws["name"],
