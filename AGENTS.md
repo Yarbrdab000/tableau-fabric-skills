@@ -601,6 +601,37 @@ that produced it*), committed seven minutes after writing that sentence down.
 
 ### The object you displaced is still there — archive it before gc
 
+**A biased instrument is not a useless one, if you know the direction of the bias.** Before discarding
+the window table, note that the error here is **one-directional**: an ordinary rewrite stamps *now*,
+so it can only move a date **later**.
+
+```
+observed_date   >=  true_creation_date
+observed_window >=  true_window
+```
+
+* A **negative** observed window is therefore **certain** — a rewrite could only have made it look
+  *more* positive, so anything reading negative genuinely was. **All 13 hold.**
+* A **positive** observed window is the only uncertain case, because a later rewrite is exactly what
+  manufactures one. **That is the single row, and it is the one that failed.**
+
+The flaw lands precisely on the row it corrupted and cannot touch the other thirteen. So *"13 of 14
+anchors were cut before their release landed"* survives, and with it the operational conclusion that
+**a red anchor gate is overwhelmingly a timing artifact rather than a defect on your branch.** What
+dies is only the causal story about the exception.
+
+**But state the assumption, because monotonicity is not a law — measured, not reasoned:**
+
+```
+first cut                     18:16:10
+normal rewrite                18:16:11    later
+GIT_COMMITTER_DATE forced     2020-01-01  EARLIER, and nothing in the object marks it
+```
+
+One environment variable defeats the direction of the bias and leaves no trace. Here the assumption is
+checkable (every tag was cut by one of two known scripts, neither of which sets it), so the rescue
+holds — **as a stated premise, not as a property of git.**
+
 **`git tag -d` prints the sha of the object it removes, and that output line is the only record it
 ever existed.** The dangling object stays readable until something runs `git gc`, so the evidence has
 a **hidden expiry that nothing marks** — the same shape as a stale hedge, one layer down in the object
@@ -1046,6 +1077,17 @@ someone else; the file was correct for that reader the entire time.** So:
 
 This is mechanical, unlike most of this file: **list the recipients of the claim, and send to that
 list.** It requires no judgement and no noticing.
+
+**One signal was available on the receiving side and neither party used it.** The lane's endorsement
+read *"it inverts how I'd have read the data"* — an unusually strong reaction to a rule derived from a
+**single row**. That asymmetry is visible without knowing anything about tagger dates:
+
+> **An inference whose weight greatly exceeds its evidence base is detectable from the shape of the
+> claim alone.** One data point carrying a general rule about process is worth challenging before you
+> know anything about the measurement.
+
+Rare in this file, because it needs no domain knowledge and no access to the artifact — it reads the
+*claim*, not the thing claimed.
 
 ### Where an invariant can be expressed as equality, express it as equality
 
