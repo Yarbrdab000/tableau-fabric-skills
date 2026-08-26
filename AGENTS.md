@@ -539,28 +539,54 @@ superseded rather than partially because both versions still existed to diff. Re
 by resetting onto the surviving branch rather than leaving it — **a lane head that can never merge is a
 trap for whoever picks it up next.**
 
-### A red anchor gate is a question, not a verdict
+### A red anchor gate is a question whose answer may be that a rollback path is gone
 
 `test_every_released_version_has_an_anchor` and `test_every_anchor_predates_the_version_it_anchors`
 both read the **shared tag namespace**, so a lane can go red for a reason entirely outside its own
-branch and green again seconds later. Observed twice, on both gates, **both times innocent**: a lane
-fast-forwarded, ran the suite, got `MISSING anchors: ['2.317.0']`, and re-measured 90 seconds later to
-find the tag present — it had been cut *between the test reading the namespace and the re-check*.
+branch and green again seconds later. That much is true. **What was concluded from it was not.**
 
-**Before filing a defect against another lane for a red anchor gate, run
-`git for-each-ref --sort=-taggerdate refs/tags/rollback` and re-run the test.** A green suite and a red
-suite can both be correct answers about the same commit, and the difference is only *when you looked*.
+A lane fast-forwarded, ran the suite, got `MISSING anchors: ['2.317.0']`, re-measured 90 seconds later
+to find the tag present, and reported *"the tag was cut between my test reading the namespace and my
+re-check — nothing was ever wrong."* Reconstructing it from the recovered objects:
 
-Do not "fix" the flake by loosening the gate — reading the shared namespace *is* its purpose.
+```
+17:25:45   original anchor cut                     (recovered object 6209f1d)
+17:26:00   2.317.0 release lands
+   ...     anchor DELETED by another lane          exact time unrecorded
+17:35:30   the suite run begins  -> RED, MISSING ['2.317.0']
+17:38:15   anchor RESTORED                         (current tag object)
+17:38:30   re-run -> GREEN
+```
 
-**Both observed instances were about the namespace and neither was about the branch under test.** One
-was pure timing. The other was a **real deletion**: a lane had created a tag of the same name for its
-own release, mine later overwrote it (shared ref, last writer wins), and when that lane retired its
-duplicate it deleted "its own unused anchor" — by then my object, pointing at my release. **The gate
-caught it; nobody noticed otherwise.** So refine rather than dismiss:
+**The red run falls inside the deletion window.** It was not a not-yet-cut tag; it was a **destroyed
+rollback path for a shipped release**, observed mid-restore. So the honest tally is not "observed
+twice, both innocent":
+
+```
+confirmed innocent red-gate instances : 0
+confirmed TRUE POSITIVE               : 1
+undiagnosed (a morning red on the sibling gate, attributed to timing, never checked) : 1
+```
+
+> **The benign and the malign cause produce an identical observable** — missing, then present. A clean
+> re-measurement does not discriminate between them; it only confirms the current state. **A re-run
+> that goes green tells you the state changed, not that the red was wrong.**
+
+The benign reading was chosen because the second measurement looked clean, then generalised into
+*"overwhelmingly a timing artifact"* and relayed onward — a rule about base rates derived from a
+sample of one, whose one member was the opposite of what it was taken to be.
+
+**The procedural half survives and is still worth doing:** before filing a defect against another lane
+for a red anchor gate, run `git for-each-ref --sort=-taggerdate refs/tags/rollback` and re-run. Do not
+"fix" the flake by loosening the gate — reading the shared namespace *is* its purpose. But re-run to
+**find out which cause it was**, not to make it go away.
+
+**The gate caught real damage that nobody noticed in either direction**: the deleting lane believed
+the tag was its own, and the owning lane did not know it had ever been at risk.
 
 > **A red anchor gate is a reliable verdict about the shared namespace and a poor signal about your
-> own branch.** Re-read the namespace before concluding anything about a lane.
+> own branch.** Re-read the namespace before concluding anything about a lane — including before
+> concluding nothing happened.
 
 **The rule "never delete an anchor you didn't create" does not protect this, and the lane checked.**
 It *had* created a tag by that name, so authorship said "mine" — the name was theirs and the object
@@ -616,9 +642,16 @@ observed_window >=  true_window
   manufactures one. **That is the single row, and it is the one that failed.**
 
 The flaw lands precisely on the row it corrupted and cannot touch the other thirteen. So *"13 of 14
-anchors were cut before their release landed"* survives, and with it the operational conclusion that
-**a red anchor gate is overwhelmingly a timing artifact rather than a defect on your branch.** What
-dies is only the causal story about the exception.
+anchors were cut before their release landed"* survives, and the recovered object promotes it to
+**14 of 14**. What dies is the causal story about the exception.
+
+**What does NOT follow from it, though it was drawn at the time:** that a red anchor gate is
+"overwhelmingly a timing artifact". **The window measures when anchors were CUT; a red gate measures
+whether one is MISSING when the test runs, and a deletion at any later moment is invisible to the
+window.** Two populations, no implication between them — and the one diagnosed red-gate instance was
+a real deletion (see *a red anchor gate is a question whose answer may be that a rollback path is
+gone*). A clean measurement of the wrong population supporting a claim about another is this file's
+most repeated defect, committed here inside the paragraph that rescues a different measurement.
 
 **But state the assumption, because monotonicity is not a law — measured, not reasoned:**
 
