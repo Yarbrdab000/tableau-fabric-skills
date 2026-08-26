@@ -1216,6 +1216,21 @@ check:
   is only cheap if the other party never suggests the matter was settled — including when the
   correction is to a retraction, or to a correction.
 
+**Neither of those is what actually did the work, and the thing that did is structural rather than
+behavioural: the sessions could not write to each other's trees.** Every correction had to survive
+being *explained* to someone who would then go and measure it, and no claim could be quietly fixed in
+place. That is not a property of the participants — it is a property of the arrangement, and it is the
+only part of this reproducible on demand:
+
+> **Put the reviewer where they cannot edit.** A reviewer who can push a fix produces a corrected
+> artifact and no record; a reviewer who can only send a message produces an argument that has to
+> withstand independent measurement — and the measurement is where every finding in this file came
+> from.
+
+It also explains the shape of the failures: **every belief-level error survived a 5199-test suite and
+died the moment a second party recomputed the same number.** Not because that party was more careful,
+but because they had to start from the artifact rather than from the claim.
+
 The rules are what protect you when nobody else is looking at the same object. **They are not what
 found these.**
 
