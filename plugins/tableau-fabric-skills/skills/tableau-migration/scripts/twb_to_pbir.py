@@ -8663,7 +8663,7 @@ def _conditional_format(ws, state, model_table, field_map, warnings):
             value_objects.append({
                 "properties": {
                     "backColor": {"solid": {"color": {"expr": {"FillRule": {
-                        "Input": proj["field"],
+                        "Input": _fill_rule_input(proj),
                         "FillRule": _gradient_color_stops(entry["gradient"])}}}}}},
                 "selector": {
                     "data": [{"dataViewWildcard": {"matchingOption": 1}}],
@@ -9468,10 +9468,30 @@ def _apply_one_formula_table_calc(ws, state, usage, value_key, model_table, fiel
     if base_proj is None:
         return _review("displayed calc is not the shown value")
 
-    new_values = [p for p in values if p is not base_proj]
+    # SPLICE THE VC IN AT THE PILL'S OWN POSITION -- a matrix renders Values in projection order, so
+    # appending rebuilt calcs at the end silently re-columns the table. Measured on the ``Network
+    # Operational`` workbook, whose author interleaves each rank with the measure it ranks:
+    #
+    #   authored / previous build   Weighted Rank | Weighted Rank Score | Rank % ANS FTR | ANS FTR | ...
+    #   appended                    Weighted Rank Score | ANS FTR | % GMC | % MH | <4 ranks at the end>
+    #
+    # Four pills moved to the far right and every rank lost its adjacency to the value it explains.
+    # Nothing flags it: the projections are all present and correct, the visual validates, and only
+    # the reading order is destroyed. The base measure is removed from its slot and the calc(s) that
+    # replace it take that slot, so a per-usage rebuild is position-preserving by construction.
+    base_idx = next((i for i, p in enumerate(values) if p is base_proj), len(values))
+    head = [p for p in values[:base_idx] if p is not base_proj]
+    tail = [p for p in values[base_idx + 1:] if p is not base_proj]
+
+    # Operand measures the visual does not already project are genuine ADDITIONS with no authored
+    # slot of their own. They are projected BEFORE the calc(s) that reference them -- a Visual
+    # Calculation reads its operands from the visual's own matrix, so an operand must already be in
+    # scope -- and they carry ``hidden``, so their position never disturbs the rendered column order.
+    extras = []
     for nref, proj in base_projected.items():
-        if not any(p.get("nativeQueryRef") == nref for p in new_values):
-            new_values.append(proj)
+        if not any(p.get("nativeQueryRef") == nref for p in head + tail):
+            extras.append(proj)
+    new_values = head + extras + tail
 
     vc_projections = []
     # queryRefs must be unique ACROSS every usage this visual rebuilds, so allocation skips any ref
@@ -9489,7 +9509,8 @@ def _apply_one_formula_table_calc(ws, state, usage, value_key, model_table, fiel
         if vc.hidden:
             proj["hidden"] = True
         vc_projections.append((proj, vc))
-    state[value_key]["projections"] = new_values + [p for p, _ in vc_projections]
+    state[value_key]["projections"] = (
+        head + extras + [p for p, _ in vc_projections] + tail)
 
     vc_fact = {
         "kind": "visual_calculation",
@@ -11224,6 +11245,43 @@ def _enforce_legend_measure_limit(query_state, vtype, warnings=None, worksheet=N
             f"member, matching the source) and {len(dropped)} measure(s) dropped: "
             f"{', '.join(str(d) for d in dropped)}"))
     return dropped
+
+
+def _fill_rule_input(projection):
+    """The ``FillRule.Input`` expression that READS a projection's value.
+
+    A ``FillRule`` needs a REFERENCE to the projected column, not a redeclaration of it. For a model
+    measure the projection's own ``field`` already *is* a reference (``Measure`` + ``SourceRef``), so
+    it passes through unchanged. For a **Visual Calculation** it is not: ``field`` carries the whole
+    ``NativeVisualCalculation`` definition (``Language``/``Expression``/``Name``), and inlining that
+    as ``Input`` re-declares the calc inside the colour expression instead of pointing at the column
+    the visual already projects. Power BI then applies no fill at all -- the rule is structurally
+    valid, ``selector.metadata`` resolves to a real ``queryRef``, PBIR validates clean, and the
+    column simply renders with no colour.
+
+    Measured on the ``Network Operational`` corpus workbook: four RANK pills moved from the model
+    -measure route to the Visual-Calculation route, and every one of them lost its gradient --
+    including the two ``red_green_gold`` diverging scales, which are the most visually load-bearing
+    thing on the page. Same palettes, same stops, same selector shape; only ``Input`` differed:
+
+        renders     "Input": {"Measure": {"Expression": {"SourceRef": ...}, "Property": "Rank GMC"}}
+        no colour   "Input": {"NativeVisualCalculation": {"Expression": "RANK(SKIP, ORDERBY(...))"}}
+
+    ``SelectRef``/``ExpressionName`` is the reference form for an in-visual expression, and it is
+    what this file already emits for the chained table-calc path -- the design note above
+    ``_VC_QUERY_REFS`` states the contract outright ("a FillRule ``Input`` references the outer
+    calc's queryRef"). This is the one site that was still inlining the field instead.
+
+    Conditional formatting driven BY a Visual Calculation is a first-class Power BI capability, not
+    a limitation to route around: it is one of the main reasons to reach for one. So the fix binds
+    the reference correctly rather than declining the Visual-Calculation route when a colour rule is
+    present.
+    """
+    if _is_visual_calculation(projection):
+        qref = (projection or {}).get("queryRef")
+        if qref:
+            return {"SelectRef": {"ExpressionName": qref}}
+    return (projection or {}).get("field")
 
 
 def _is_visual_calculation(projection):

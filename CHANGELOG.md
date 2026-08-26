@@ -12,6 +12,69 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ## [Unreleased]
 
+### Fixed
+
+- **`tableau-migration` (skill `2.319.0` → `2.320.0`): a conditional-colour gradient driven by a
+  Visual Calculation no longer renders with no colour, and a rebuilt table calc no longer moves its
+  column to the end.** One root cause, two symptoms, both reported by a user against a **known-good
+  prior build** — so this is a measured regression with a baseline to diff, not a limitation.
+
+  When the formula-table-calc route rebuilds a pill as a Visual Calculation, two things went wrong.
+
+  **1. The `FillRule` re-declared the calc instead of referencing it.** The per-measure background
+  fill wrote `"Input": proj["field"]`. For a model measure that field *is* a reference
+  (`Measure` + `SourceRef`) and renders. For a `NativeVisualCalculation` it is the **whole
+  definition**, so the colour expression re-declared the calculation rather than pointing at the
+  column the visual already projects:
+
+  ```
+  renders     "Input": {"Measure": {..., "Property": "Rank % ANS FTR"}}
+  no colour   "Input": {"NativeVisualCalculation": {"Expression": "RANK(SKIP, ORDERBY(...))"}}
+  ```
+
+  Power BI applies no fill at all. Nothing catches it: identical palettes, identical stops,
+  identical selector shape, `selector.metadata` resolving to a real `queryRef`, PBIR validating
+  clean — and the column simply renders grey. Measured on the reported workbook, **four** rank
+  columns lost their gradients including both `red_green_gold` diverging scales, the most visually
+  load-bearing thing on the page.
+
+  `{"SelectRef": {"ExpressionName": <queryRef>}}` is the reference form, it is **already what this
+  file emits for the chained table-calc path**, and the design note above `_VC_QUERY_REFS` states
+  the contract outright — *"a FillRule `Input` references the outer calc's queryRef."* This was the
+  one site still inlining the field. Now routed through `_fill_rule_input()`: `SelectRef` for a
+  Visual Calculation, unchanged pass-through for a measure.
+
+  **Explicitly NOT fixed by declining the Visual-Calculation route.** Conditional formatting driven
+  by a visual calculation is a first-class Power BI capability and one of the main reasons to reach
+  for one — falling back to the measure route whenever a colour rule is present would have hidden
+  the symptom by discarding the table-calc rebuild. The reference is bound correctly instead.
+
+  **2. The rebuilt calc was appended rather than spliced.** The base pill was removed and the new
+  Visual Calculation(s) added at the **end** of the Values projections. A matrix renders Values in
+  projection order, so on a workbook whose author interleaves each rank with the measure it ranks:
+
+  ```
+  authored    Weighted Rank | Weighted Rank Score | Rank % ANS FTR | ANS FTR | Rank GMC | % GMC | ...
+  appended    Weighted Rank Score | ANS FTR | % GMC | % MH | <all four ranks at the far right>
+  ```
+
+  Four pills moved to the right edge and every rank lost adjacency to the value it explains. No gate
+  sees it — every projection is present and correct, and only the reading order is destroyed. The
+  calc now takes the slot its base pill occupied.
+
+  Operand measures the visual does not already project are inserted **before** the calc that
+  references them (a Visual Calculation reads its operands from the visual's own matrix, so they
+  must be in scope first) and carry `hidden`, so their position never disturbs the rendered order.
+  That ordering constraint was caught by an existing test —
+  `test_nested_formula_chain_rebuilds_as_nested_visual_calculations` asserts the shown calc projects
+  last — on a first attempt that placed them after. **The test was right and the new code was
+  wrong**, verified before touching it.
+
+  Verified at the render, not at the metric: opened cold, refreshed, screenshotted; all gradients
+  present and interleaving restored, matching the user's good build. Column order is an **exact
+  match** on all ten projections. Blast radius measured across all three of the user's workbooks —
+  **1 visual changed out of 250**, and it is the broken one.
+
 ### Added
 
 - **`tableau-migration` (skill `2.318.0` → `2.319.0`): the call-site pin now says which rung it does
