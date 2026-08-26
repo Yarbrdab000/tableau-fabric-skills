@@ -606,19 +606,45 @@ was not. A name you created can silently become someone else's:
 > **Never delete a shared anchor without re-reading its CURRENT target.** Authorship of the name is
 > not ownership of the object.
 
-**The same distinction defeats the obvious way to verify a tag push.** After pushing, a second party
-confirmed sync as *"local 375, remote 375, missing 0"* — **true, and blind to the only divergence
-present**:
+**The same distinction defeats the obvious way to verify a tag push — and then defeats the correction
+of it.** After pushing, a second party confirmed sync as *"local 375, remote 375, missing 0"*. That is
+a **name-set** comparison and it cannot see a divergent object, so I corrected it with an object-level
+one, which found `rollback/pre-v2.274.0` holding `148fec6` locally and `ac97eea` remotely — and I
+filed it as a rollback path needing a human decision. **Wrong, and the lane caught it by peeling:**
 
 ```
-names on both sides          375
-same NAME, DIFFERENT object    1     rollback/pre-v2.274.0  local 9d822fc / remote ac97eea
-missing by name                0     <- what the check reported
+tag OBJECT ids equal   False    148fec6  vs  ac97eea
+PEELED commits equal   TRUE     both -> 9d822fc     <- what `reset --hard` consumes
+difference             tagger date and message only
 ```
 
-> **"Nothing is missing" and "everything matches" are different claims.** A set-membership comparison
-> of a shared namespace cannot see a divergent object, and the tag namespace is exactly where the two
-> come apart, because a tag is a mutable name. **Compare the object ids, not the names.**
+An annotated tag is a **wrapper**. Two wrappers around one commit are different objects — which is why
+`git fetch --tags` refused it with *"would clobber existing tag"* — but the rollback path was never at
+risk. So all three comparisons answer different questions and only one was decision-relevant:
+
+```
+by NAME            "is it present?"            0 differ   -- blind to everything
+by TAG OBJECT      "is it the same tag?"       1 differs  -- true, and not what matters
+by PEELED COMMIT   "where does rollback land?" 0 differ   -- the one that decides
+```
+
+> **Compare the object the ref RESOLVES TO for the use in question.** "Compare ids, not names" is not
+> enough: a ref has several ids, and picking the wrong one produces a confident answer to a question
+> nobody asked.
+
+**Two honest notes, because they are the transferable part.** The lane reached the right comparison
+**by construction rather than by insight** — it used `^{}` and `%(*objectname)` without reasoning them
+through as *"peeled is what rollback consumes"*, so the same check would have been equally silent
+about a metadata divergence that did matter. And my object-level check was **more precise and less
+useful**: it upgraded a blind comparison into a confident false alarm, and a false alarm on a rollback
+path is expensive in attention even when it costs nothing in state.
+
+**Resolved rather than left open:** the local annotation records *why* a re-point was reverted (*"the
+re-point satisfied the anchor-predecessor gate — a claim about version STAMPS — while breaking the
+property the tag exists for: the anchor must be an ANCESTOR of its own release"*), which is the more
+useful artifact, so it was promoted to the remote. **The displaced remote object was archived first**
+as `archive/remote-pre-v2.274.0-preannotation`, and the promotion refused to run unless both sides
+peeled to the same commit.
 
 Two related traps, both cheap to avoid:
 
