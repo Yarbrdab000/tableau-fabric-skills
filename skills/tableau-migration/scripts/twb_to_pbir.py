@@ -2016,6 +2016,86 @@ def _pane_mark_transparency(table, axis):
     return out
 
 
+def _pane_mark_sizes(table, axis):
+    """Per-AXIS mark size: ``{measure instance -> float}``, panes declaring none omitted.
+
+    The third sibling of :func:`_pane_mark_colors` / :func:`_pane_mark_transparency`, and the one
+    that reads a property Power BI cannot express AT ALL. Tableau's overlapping-bar idiom separates
+    its two series three ways -- length, WIDTH, and transparency -- and a clustered Power BI chart
+    has no per-series bar width, so an author who reached only for width has their entire separation
+    mechanism dropped in translation.
+
+    An UNDECLARED size is Tableau's default and says nothing about the author's intent, so it is
+    omitted rather than defaulted to 1.0 -- the same rule :func:`_has_oversized_second_pane` already
+    applies to the lollipop's head-vs-stick signal.
+    """
+    out = {}
+    panes_el = _first(table, "panes")
+    if panes_el is None:
+        return out
+    name_attr = "{0}-axis-name".format(axis if axis in ("x", "y") else "y")
+    for pane in _children_local(panes_el, "pane"):
+        axis_name = _attr_local(pane, name_attr)
+        if not axis_name:
+            continue
+        toks = _BRACKET_TOKEN_RE.findall(axis_name)
+        if not toks:
+            continue
+        size = _pane_mark_size(pane)
+        if size is not None and size > 0:
+            out[toks[-1]] = size
+    return out
+
+
+# Transparency substituted for a WIDTH difference Power BI cannot draw, as a percentage.
+#
+# Not invented: the authors of the reference workbook chose 36%, 42% and 48% by hand on the sheets
+# where they used transparency, and 42 is one of those values -- taken from the sheet that is the
+# closest analogue (same variant family, same series wider). A flat value rather than one scaled to
+# the width ratio, because the ratio is a Tableau mark-size number with no defined mapping onto a
+# Power BI transparency and any curve over it would be invented precision.
+_LIPSTICK_WIDTH_SUBSTITUTE_TRANSPARENCY = 42
+
+
+def _lipstick_series_transparency(measures, pane_transp, pane_sizes):
+    """Per-series transparency for an overlapping-bar rebuild, in SHELF ORDER.
+
+    Two sources, in strict precedence:
+
+    1. **The author's own** ``mark-transparency`` on that series' pane. Always wins -- Tableau has
+       this setting and the author already made the choice, so there is nothing to decide.
+    2. **A substitute for a WIDTH difference**, only for a series the author left opaque. When both
+       overlaid series declare a mark SIZE and one is strictly wider, that width gap is the author's
+       entire separation mechanism and Power BI's clustered chart cannot draw it -- equal-width bars
+       in one slot means the front one simply covers the back one. Lightening the WIDER series is
+       the closest available stand-in for "a broad pale bar with a narrow solid one inside it",
+       which is the look the width difference produces in the source.
+
+    Returns ``[]`` when nothing applies, so an untouched sheet emits no ``dataPoint`` at all.
+
+    Deliberately does NOT substitute when only one side declares a size: an undeclared size is
+    Tableau's default and says nothing about intent, so comparing it against a declared one would
+    manufacture a width gap the author never expressed.
+    """
+    out = []
+    sizes = [pane_sizes.get(f.get("instance")) for f in measures]
+    widest = None
+    if len(sizes) >= 2 and all(s is not None for s in sizes):
+        top = max(sizes)
+        # A tie is not a width difference, and neither is more than one series sharing the maximum.
+        if sizes.count(top) == 1:
+            widest = sizes.index(top)
+    for i, f in enumerate(measures):
+        authored = pane_transp.get(f.get("instance"))
+        if authored:
+            out.append(authored)
+        elif i == widest:
+            out.append(_LIPSTICK_WIDTH_SUBSTITUTE_TRANSPARENCY)
+        else:
+            out.append(None)
+    return out if any(out) else []
+
+
 def _lipstick_overlap_objects(query_state, vtype, series_colors=None, series_transparency=None):
     """PBIR format objects that rebuild Tableau's overlapping-bar idiom, or ``None``.
 
@@ -5262,18 +5342,25 @@ def _parse_worksheet(ws, index, ds_caption, warnings, internal_fields=None, date
                 # emitter refuses to apply it unless the lengths agree.
                 _pane_cols = _pane_mark_colors(table, _measure_axis)
                 _pane_transp = _pane_mark_transparency(table, _measure_axis)
+                _pane_sizes = _pane_mark_sizes(table, _measure_axis)
                 _lip_meas = _lipstick_measures(
                     meas_rows, meas_cols, mark_by_instance, primary_mark) or []
                 lipstick_series_colors = [_pane_cols.get(f.get("instance")) for f in _lip_meas]
                 if not any(lipstick_series_colors):
                     lipstick_series_colors = []
-                # The AUTHOR'S OWN per-series transparency, not an engine-chosen one. Tableau has
-                # this setting and half this corpus's overlaid sheets use it; inventing a rule
-                # contradicted the source on the other half.
-                lipstick_series_transparency = [
-                    _pane_transp.get(f.get("instance")) for f in _lip_meas]
-                if not any(lipstick_series_transparency):
-                    lipstick_series_transparency = []
+                # The AUTHOR'S OWN per-series transparency, with a substitute where they separated
+                # the series by mark WIDTH instead -- a property Power BI cannot draw at all.
+                _authored_transp = [_pane_transp.get(f.get("instance")) for f in _lip_meas]
+                lipstick_series_transparency = _lipstick_series_transparency(
+                    _lip_meas, _pane_transp, _pane_sizes)
+                # Whether any value in there is SUBSTITUTED rather than authored. Worth stating
+                # because the two are indistinguishable in the emitted artifact -- the substitute is
+                # deliberately drawn from the range the author used elsewhere, so on this very
+                # workbook a derived 42 sits beside an authored 42 (alpha 147) on a sibling sheet.
+                _lipstick_width_substituted = bool(
+                    lipstick_series_transparency
+                    and lipstick_series_transparency != [
+                        t or None for t in _authored_transp])
                 fidelity_note = (
                     "dual-axis overlapping bars (two different measures folded onto one axis) -> "
                     "clustered {0} with Overlap on and series spacing 100%; the first measure is "
@@ -5281,6 +5368,12 @@ def _parse_worksheet(ws, index, ds_caption, warnings, internal_fields=None, date
                     "back one -- as Tableau renders the same construct at equal mark widths, and "
                     "Power BI has no per-series bar width to narrow the front one with".format(
                         "bars" if visual_type == VT_BAR else "columns"))
+                if _lipstick_width_substituted:
+                    fidelity_note += (
+                        ". The source separated these series by mark WIDTH, which Power BI cannot "
+                        "draw, so the WIDER one is made {0}% transparent as the closest available "
+                        "stand-in -- this is the engine's substitution, not a transparency the "
+                        "author set".format(_LIPSTICK_WIDTH_SUBSTITUTE_TRANSPARENCY))
 
         # Dual-axis lollipop: a Bar (stick) pane + a Circle/Shape/Point (head) pane plotting the SAME
         # measure against a shared category. Power BI has no native lollipop, so re-route to a combo --

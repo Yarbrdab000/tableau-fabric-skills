@@ -14,6 +14,30 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ### Fixed
 
+- **`tableau-migration` (skill `2.325.0` → `2.326.0`): an overlapping-bar rebuild now
+  substitutes transparency for a mark-WIDTH difference Power BI cannot draw.** Tableau separates
+  two overlaid series three ways -- length, WIDTH, and transparency -- and a clustered Power BI
+  chart has no per-series bar width at all, so an author who reached only for width had their
+  entire separation mechanism dropped in translation: equal-width bars in one slot means the
+  front one simply covers the back one. When both overlaid series declare a mark `size` and one
+  is strictly wider, the WIDER series is now made 42 per cent transparent -- the closest
+  available stand-in for "a broad pale bar with a narrow solid one inside it", which is the look
+  the width difference produces in the source. The value is not invented: the reference
+  workbook's authors chose 36, 42 and 48 per cent by hand on the sheets where they used
+  transparency, and 42 is taken from the sheet that is the closest analogue. A flat value rather
+  than one scaled to the width ratio, because a Tableau mark-size number has no defined mapping
+  onto a Power BI transparency and any curve over it would be invented precision. THE AUTHOR'S
+  OWN transparency always wins; the substitute applies only to a series they left opaque. An
+  UNDECLARED size is Tableau's default and says nothing about intent, so BOTH sides must declare
+  one -- comparing a declared size against an absent one would manufacture a width gap the author
+  never expressed, the same rule `_has_oversized_second_pane` already applies to the lollipop's
+  head-vs-stick signal -- and a tie is not a difference. Because the substitute is deliberately
+  drawn from the range the author used elsewhere, a derived 42 is INDISTINGUISHABLE in the
+  emitted artifact from an authored 42 (alpha 147) on a sibling sheet, and which of the two it is
+  changes what a reader should do about it -- so the worksheet's fidelity note now says
+  explicitly when a transparency is the engine's substitution rather than the author's choice.
+  Verified against the source on a 16-sheet dual-axis workbook: fires on exactly the 4 pages
+  predicted from the mark sizes before implementing, and on no other.
 - **`tableau-migration` (skill `2.323.0` → `2.325.0`): an overlapping-bar rebuild now carries
   the AUTHOR'S OWN per-series transparency instead of an engine-chosen one.** `2.321.0` made the
   FRONT series translucent on an argument that is sound and lost at the render: nothing is ever
