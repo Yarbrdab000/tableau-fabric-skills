@@ -801,6 +801,18 @@ and why every injection script must **assert its injection landed** before readi
 that line, a patch that failed to apply plus a green suite reads as *"the guard survived"* when it
 means *"nothing was tested."* That happened twice in one hour.
 
+**And the inverse: the presence of an alarm is not evidence either, unless you check WHICH alarm.**
+An injection into the canonical tree alone turns the full suite red via **`test_mirror_parity`** — one
+tree edited and not the other — and that red reads as *"the suite catches this regression"* when the
+suite catches nothing of the kind. Measured on the wrap-site argument: patched canonical-only, the
+canonical pin fires and the mirrored copy stays green (correctly, since each resolves its source
+relative to itself); patched in both, both fire. **A harness that edits one tree must patch both, or
+its result describes the mirror check rather than the property under test.**
+
+This repo already carries *"no conflict is not evidence of correctness"*. This is the same statement
+about the other signal: **a green needs to be shown it can go red, and a red needs to be shown it is
+the right red.**
+
 ### Which of these rules actually work
 
 Most of the rules above require you to **notice something first** — that a count is unexplained, that a
