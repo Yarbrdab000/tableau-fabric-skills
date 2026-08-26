@@ -14,6 +14,29 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ### Fixed
 
+- **`tableau-migration` (skill `2.322.0` → `2.323.0`): an overlapping-bar rebuild now carries
+  the AUTHOR'S OWN per-series transparency instead of an engine-chosen one.** ``2.321.0`` made the
+  FRONT series translucent on an argument that is sound and lost at the render: nothing is ever
+  drawn on top of the front series, so making it translucent leaves the back series visible for
+  ANY data -- a guarantee rather than a heuristic. Opened in Desktop, it was wrong twice over. A
+  translucent series over an opaque one does not REVEAL the one beneath, it BLENDS with it into a
+  third colour that reads as a series which does not exist; on a workbook whose author set one
+  series to Tableau's orange while the other took the palette's blue -- near-complementary hues --
+  every overlap region came out brown. And it CONTRADICTED THE SOURCE: Tableau has this setting,
+  the author had already made the choice per pane, and measured across a 16-sheet dual-axis
+  workbook 8 of the overlaid sheets are deliberately fully opaque, so any engine-chosen rule is
+  wrong on half of them by construction. `mark-transparency` is now read per pane alongside the
+  per-pane mark colour and emitted as a scoped `dataPoint.fillTransparency`. It is an ALPHA BYTE,
+  so `147` becomes 42 per cent transparency and `255` -- the attribute PRESENT and the mark
+  OPAQUE -- emits nothing at all. Verified against the source alphas on all 16 sheets: 6 emit a
+  transparency, 0 mismatches. Where the source set none the overlap ships opaque, and the
+  occlusion that leaves (the front series covers the back one wherever it is longer, exactly as
+  Tableau renders the same construct at equal mark widths) is now stated in the worksheet's
+  fidelity note rather than silently accepted. Also fixes a `KeyError` this exposed: an overlay
+  whose source set neither a pane colour nor a pane alpha emits the overlap card alone, and the
+  emit site indexed `dataPoint` unconditionally. Corpus blast radius unchanged from ``2.321.0`` --
+  the same 13 files of 1612 and the same 5 visuals, because no corpus sheet outside the supplied
+  workbook carries a per-pane mark transparency.
 - **`tableau-migration` (skill `2.321.0` → `2.322.0`): the skill no longer asks an agent to GUESS
   where it is installed, and self-update stops leaving decoys that make the guess wrong.**
 
