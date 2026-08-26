@@ -505,6 +505,18 @@ git for-each-ref refs/tags/rollback/                                 # what is a
 number you are about to take means someone is mid-release on it — twice here that tag was archived and
 re-pointed as stale housekeeping, and twice it cost a duplicate implementation.
 
+**Handing a number back is two-sided, and both halves failed here at once:**
+
+> **A number, once given, needs an explicit hand-back before the giver takes it — and a decline must
+> name what it declines.**
+
+Three duplicate implementations came out of that pair. The lane declined three *fixes* and never said
+"the number is free"; the integrator read the declines as a returned number and shipped it. **Each
+party inferred the reasonable thing from what the other actually wrote**, which is what makes it an
+ambiguous protocol rather than a mistake by either. And **silence is the one signal that means nothing
+at all** — it was read as a hand-back twice, at the cost of a full implementation each time. A yes/no
+costs one message.
+
 **Version allocation is centralised. Do not claim a block. At your release step, ask the integrating
 session for a number; it reads `refs/tags` and hands you one.** If the integrator is unavailable,
 fall back to **take the next free number above every anchor, and renumber without ceremony if you
