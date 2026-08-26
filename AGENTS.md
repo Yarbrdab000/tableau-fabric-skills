@@ -606,6 +606,37 @@ was not. A name you created can silently become someone else's:
 > **Never delete a shared anchor without re-reading its CURRENT target.** Authorship of the name is
 > not ownership of the object.
 
+**The same distinction defeats the obvious way to verify a tag push.** After pushing, a second party
+confirmed sync as *"local 375, remote 375, missing 0"* — **true, and blind to the only divergence
+present**:
+
+```
+names on both sides          375
+same NAME, DIFFERENT object    1     rollback/pre-v2.274.0  local 9d822fc / remote ac97eea
+missing by name                0     <- what the check reported
+```
+
+> **"Nothing is missing" and "everything matches" are different claims.** A set-membership comparison
+> of a shared namespace cannot see a divergent object, and the tag namespace is exactly where the two
+> come apart, because a tag is a mutable name. **Compare the object ids, not the names.**
+
+Two related traps, both cheap to avoid:
+
+* **Never `git push --tags` into a shared namespace.** It would have silently overwritten that remote
+  anchor. Push explicit refspecs, classify local-only vs differing first, and re-read the remote
+  afterwards rather than trusting the push output.
+* **A remote-tracking ref is a cache, and in a multi-worktree checkout it is a cache someone else can
+  write.** One lane's `origin/main` advanced from `c55e664` to `e72a473` without that lane fetching,
+  because another worktree's fetch updated the shared ref. `git ls-remote` asks the remote;
+  `origin/main` reports whoever looked last. **The same messages-vs-refs distinction, one layer down.**
+
+**And the shape recurs in the verification of the push itself.** A pre-push secret scan over
+`origin/main..HEAD` reported `0 paths touched, 0 commits` — not a clean result: **the range had become
+empty**, because the push landed between that lane's fetch and its scan. A scan of nothing is
+indistinguishable from a scan that found nothing. It was caught only because *"0 commits in a
+116-commit range"* is absurd on its face; **had the range merely narrowed, it would have read as a
+pass.** Assert the range is non-empty before believing what it reports about the range.
+
 ### A tagger date is not a creation date
 
 **I got the cause of that window wrong and wrote a general rule on top of it.** Measuring anchor-cut
