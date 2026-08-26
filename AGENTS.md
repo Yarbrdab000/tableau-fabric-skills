@@ -1012,6 +1012,39 @@ rendered annotation — but it is never "it's already documented".
 > **Ask where the person who will form the wrong belief is standing, and put the correction there.**
 > A disclosure filed anywhere else is a record that you knew, not a control that anyone learns.
 
+**A fourth instance arrived ninety seconds after this section was committed, and the author was the
+same person who had just written it.** A generalisation of mine was withdrawn (see *a tagger date is
+not a creation date*), and the retraction was sent to the lane that had **supplied the correction** —
+not to the lane that had **received the claim** and was building on it. That lane endorsed the
+withdrawn rule in its next message, from a branch four commits stale that had never contained either
+the claim or its retraction. **The error travelled by message; the retraction travelled by message to
+someone else; the file was correct for that reader the entire time.** So:
+
+> **A retraction is owed to everyone who received the claim, never only to whoever corrected it.**
+> Correcting the record and correcting the recipient are different acts, and the second is the one
+> that changes what anyone does.
+
+This is mechanical, unlike most of this file: **list the recipients of the claim, and send to that
+list.** It requires no judgement and no noticing.
+
+### Where an invariant can be expressed as equality, express it as equality
+
+The string-vs-semver footnote above cost two false positives in a probe. The two shipped gates that
+also compare versions were both immune, **and only one of them for a good reason**:
+
+```
+test_rollback_anchors_resolve.py    [int(x) for x in v.split(".")]     parses to int tuples -- correct
+test_changelog_version_chain.py     if frm != below_to                 makes no ordering comparison
+```
+
+The chain gate asserts each entry's declared predecessor **equals** the version produced beneath it,
+so version *ordering* never enters it. **A comparison you do not make cannot be wrong** — and that is
+a stronger guarantee than making it correctly, because it cannot be reintroduced by a later refactor
+that "improves" the comparator.
+
+> **Ordering needs a correct comparator; equality needs nothing.** Prefer the invariant that has no
+> comparator to get wrong.
+
 ### Which of these rules actually work
 
 Most of the rules above require you to **notice something first** — that a count is unexplained, that a
