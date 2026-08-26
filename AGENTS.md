@@ -1283,6 +1283,47 @@ carries zero bits.
 > **A check that cannot fail is not a check.** A coincidence can break and will occasionally be
 > re-tested; an identity can never disagree with you.
 
+**This rule was not derived today — it was RE-derived, and the earlier statement is better.** It has
+been in `test_rollback_anchors_resolve.py`'s docstring since `efbfbce` (2.205.0, 2026-08-18, 154
+commits ago):
+
+> *"``--branches --remotes``, NOT ``--all``: ``--all`` includes ``refs/tags``, so every anchor makes
+> its own target reachable and the check becomes **tautological**. The first version used ``--all``
+> and passed against a deliberately-orphaned anchor — **a gate that could never fail.** Found by
+> probing it with a real orphan rather than trusting that it worked, which is the only reason it is
+> not still wrong."*
+
+Same rule, same discovery method (*probe it with a case it must reject*), plus the mechanism and the
+counterfactual — and it stayed a note about one gate for a week while the same defect was rediscovered
+from scratch.
+
+**That is a sixth variant of the misplaced-disclosure pattern and the least expected one.** The others
+were transient, or filed where the reader isn't. This one is **durable, permanent, correctly placed,
+and scoped so tightly that the only reader who reaches it is already working on that gate** — the one
+person who does not need it.
+
+> **Correct filing and inaccessibility are not opposites.** A general rule discovered while fixing a
+> specific thing will be written where the specific thing lives, and stay there. **Promote it, or it
+> will be re-derived by someone with the same evidence and less of it.**
+
+**And the identity's premise is not merely unenforced in general — it is unenforced HERE:**
+
+```
+tests that walk git HISTORY (rather than read files at HEAD) : exactly 1
+what that one walks                                          : anchor reachability, not VERSION
+gates asserting VERSION monotonicity across commits          : 0
+```
+
+A test runs *at a commit* and reads files *at that commit*; monotonicity is a property of the
+**sequence**, so it is structurally invisible to every gate here except the one that already shells
+out to git. **The capability exists and was never pointed at this.**
+
+**A last instance, in the command that checked the last claim:** grepping `monotonic` across the tests
+returns dozens of confident hits — `test_monotonic_gate.py` among them — and **not one is about
+`VERSION`.** They are all a *fidelity* gate wearing the same word. Counting the hits would have
+reported "yes, it's gated"; reading the captures reports the opposite. **Assert the captures, not the
+match count** — firing on the author, in the final check of the session.
+
 **State the premise, because it is measured rather than guaranteed** — the identity needs monotone
 versioning, and one reverted bump that restores an older `VERSION` repeats a value and breaks it. Zero
 recurrences and zero non-increasing steps here, so it holds; that is a fact about this repo, of this
