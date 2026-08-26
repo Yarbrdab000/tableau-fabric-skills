@@ -505,6 +505,22 @@ git for-each-ref refs/tags/rollback/                                 # what is a
 number you are about to take means someone is mid-release on it — twice here that tag was archived and
 re-pointed as stale housekeeping, and twice it cost a duplicate implementation.
 
+**And the anchor namespace is SHARED, so the hazard is mutual — it does not care who is allocating.**
+Both directions happened within three minutes: the integrator cut `rollback/pre-v2.314.0` at 16:35, a
+lane cut the same tag at 16:38, and **the second write silently took a slot the first had claimed.**
+The lane had checked `git tag -l "rollback/pre-v2.314.0"` and read "free" — the one check this file
+already says is insufficient, because *a tag read is stale the instant it returns*. Allocate against
+**ancestry** (`git merge-base --is-ancestor` against the other branch), which shows a lane mid-release;
+a namespace lookup does not. Recorded as mutual deliberately: **a lane that reads this as "the
+integrator's problem" will skip the check, and it is the check that matters rather than the role.**
+
+**What made both episodes cheap is that each party archived before overwriting** —
+`archive/pre-v2.314.0-prior`, `archive/duplicate-2.312.0-dispatcher-lane`. Nothing recoverable was
+lost, and more usefully **the decision stayed checkable**: a duplicate could only be confirmed *fully*
+superseded rather than partially because both versions still existed to diff. Retire a superseded tip
+by resetting onto the surviving branch rather than leaving it — **a lane head that can never merge is a
+trap for whoever picks it up next.**
+
 **Handing a number back is two-sided, and both halves failed here at once:**
 
 > **A number, once given, needs an explicit hand-back before the giver takes it — and a decline must
