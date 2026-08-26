@@ -960,7 +960,7 @@ What actually settled it, in order of decisiveness:
 Generalised: **a measurement of an artifact cannot tell you the intent of the code that produced it.**
 Before "fixing" a systematic divergence, establish that it is not a contract.
 
-### Carefulness is not a defence — it fails in three directions
+### Carefulness is not a defence — it fails in four directions
 
 The three hardest claims to check are all *careful* ones. Each escapes scrutiny by resembling the
 virtue that should prompt it, and no amount of being more careful helps, because being careful is what
@@ -978,6 +978,7 @@ produces them.
 over-claim    wrong on arrival
 under-claim   wrong on arrival
 hedge         RIGHT on arrival, wrong later, and reads as having looked
+weak retraction   RIGHT on arrival, leaves the claim ALIVE, and reads as scrupulousness
 ```
 
 **"Be more careful" defends against the first two and is useless against the third** — there was
@@ -986,7 +987,16 @@ check becomes available, which is why the hedge rule carries an expiry rather th
 shape as a count that was true at one engine and stopped being true at the next: **a claim that was
 right when made, with nothing in the artifact marking when it stopped.**
 
-All three were committed here, by different sessions, on different days' worth of otherwise careful
+**The fourth is the hedge aimed at a retraction, and it is worse than the hedge** because a retraction
+is the one artifact a reader trusts to be complete. Written here as *"plausible, probably true, no
+support from its only cited case"* when the truth was that **the only cited case refutes it** — and
+the softer form **invites the reader to keep the rule and go looking for better evidence.** Every word
+of it was accurate. It was produced while deliberately trying to be rigorous, which is the mechanism:
+
+> **Retract at the strongest level the evidence supports, not the safest-sounding one.** *Unsupported*
+> and *contradicted* are different verdicts, and hedging between them keeps a dead claim alive.
+
+All four were committed here, by different sessions, on different days' worth of otherwise careful
 work:
 
 - a retraction that was scrupulous about *which key names were missed* and silent about *which files
@@ -1063,7 +1073,19 @@ rendered annotation — but it is never "it's already documented".
 > **Ask where the person who will form the wrong belief is standing, and put the correction there.**
 > A disclosure filed anywhere else is a record that you knew, not a control that anyone learns.
 
-**A fourth instance arrived ninety seconds after this section was committed, and the author was the
+**A fifth instance is different in kind and sharpens the rule past "put it where the reader looks."**
+The four above were disclosures *someone authored* and misfiled. This one nobody wrote: **`git tag -d`
+prints the sha of the object it removes**, correctly, at exactly the right moment — into stdout, a
+stream nobody treats as evidence. It was the only record that the displaced anchor had ever existed,
+and it survived by accident, in scrollback.
+
+> **A disclosure emitted into a transient stream is not a disclosure, however correct.** The fix is
+> never better wording — it is a **durable sink**.
+
+Which is why the recovery here made the ref *before* reading anything from the object: a value you can
+still print is not the same as a value that will still be there.
+
+**A further instance arrived ninety seconds after this section was committed, and the author was the
 same person who had just written it.** A generalisation of mine was withdrawn (see *a tagger date is
 not a creation date*), and the retraction was sent to the lane that had **supplied the correction** —
 not to the lane that had **received the claim** and was building on it. That lane endorsed the
