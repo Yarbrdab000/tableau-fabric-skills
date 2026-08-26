@@ -761,6 +761,8 @@ def check_model_openability(parts, flatfile_headers=None, expected_endpoints=Non
     measure_case = {}
     measure_format = {}
     columns_by_table = {}
+    columns_case_by_table = {}
+    reference_case_mismatches = []
     for path in sorted(parts):
         text = parts[path]
         if not (isinstance(text, str) and path.endswith(".tmdl")):
@@ -770,6 +772,9 @@ def check_model_openability(parts, flatfile_headers=None, expected_endpoints=Non
             all_columns.add(c.casefold())
             if tname:
                 columns_by_table.setdefault(tname.casefold(), set()).add(c.casefold())
+                # The DECLARED spelling, kept beside the casefolded key so a reference that
+                # resolves but disagrees on case can be named (#164). Costs one dict.
+                columns_case_by_table.setdefault(tname.casefold(), {}).setdefault(c.casefold(), c)
         for m in _MEASURE_DECL_RE.finditer(text):
             nm = _unquote(m.group("name"))
             kf = nm.casefold()
@@ -791,6 +796,24 @@ def check_model_openability(parts, flatfile_headers=None, expected_endpoints=Non
                 if known is None:
                     continue          # unknown table -- not this check's call
                 if col.casefold() in known or col.casefold() in all_measures:
+                    # RESOLVES -- but does it AGREE? Tabular identifiers are case-insensitive, so a
+                    # case-only difference is not a defect in Power BI and must never fail the model.
+                    # It is still worth naming, because the engine has no folding rule anywhere: a
+                    # column's name comes from Tableau's recorded ``remote-name``, i.e. whatever the
+                    # database itself reported. Two emitters can therefore only disagree on case if
+                    # one of them stopped using that name -- a resolver divergence that DAX happens
+                    # to tolerate and the M layer, which is case-SENSITIVE, would not.
+                    #
+                    # Reported as a DISCLOSURE, never an issue: ``ok`` is ``not issues``, and #164's
+                    # described shape opens and queries correctly. Measured across 34 corpus models
+                    # at 2.328.0: 1,284 calc-column and 448 measure references, ZERO mismatches --
+                    # so this is silent on every model we can currently build.
+                    declared = (columns_case_by_table.get(tbl.casefold()) or {}).get(col.casefold())
+                    if declared is not None and declared != col:
+                        reference_case_mismatches.append({
+                            "part": path, "measure": owner, "table": tbl,
+                            "referenced": col, "declared": declared,
+                        })
                     continue
                 refs_ok = False
                 issues.append({
@@ -1213,4 +1236,8 @@ def check_model_openability(parts, flatfile_headers=None, expected_endpoints=Non
         not_evaluated.append({"check": "endpoints_distinct",
                               "reason": endpoints_not_evaluated})
     return {"ok": not issues, "checks": checks, "issues": issues,
-            "not_evaluated": not_evaluated}
+            "not_evaluated": not_evaluated,
+            # Additive disclosure (#164). Deliberately OUTSIDE ``issues``/``checks``: a case-only
+            # difference resolves fine in DAX, so failing on it would reject sound models. Present
+            # and empty on a healthy build, so its absence is never mistaken for "not evaluated".
+            "reference_case_mismatches": reference_case_mismatches}

@@ -14,6 +14,31 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ### Fixed
 
+- **`tableau-migration` (skill `2.328.0` → `2.329.0`): a DAX reference that resolves but disagrees on
+  CASE is now disclosed, and deliberately not failed.** #164 reported a Snowflake estate where ~12
+  measures referenced a custom-SQL column by the SQL's literal alias text (`Available_Duration`) while
+  the same model's calculated columns used the Snowflake-folded name (`AVAILABLE_DURATION`), and
+  inferred that a folding rule *"already exists somewhere in the codebase and is applied by at least
+  one emission path"*. Three measurements say otherwise, and each changes what the right fix is.
+  **There is no folding rule** -- a column's model name is Tableau's recorded `remote-name`, i.e. the
+  name the DATABASE reported when Tableau profiled the query, already folded by Snowflake; nothing
+  derives it, which is why the behaviour is connector-agnostic by construction and why the proposed
+  fix (route every emitter through "the" folding rule) would have introduced the exact bug the
+  reporter warned about for Postgres and Databricks Unity. **It does not reproduce** -- four synthetic
+  shapes at the real TDS parse path plus **1,284 calc-column and 448 measure references across 34
+  corpus models**: zero divergences, zero dangling refs. **And the described defect would not have
+  broken DAX anyway** -- Tabular identifiers are case-insensitive, so `dax_references_resolve`
+  compares casefolded and is right to; injecting the exact reported shape leaves the model `ok` and
+  queryable. What ships is therefore a detector rather than a repair: `openability_selfcheck`
+  gains an additive `reference_case_mismatches[]` naming the measure, the table and **both**
+  spellings. It sits outside `issues`/`checks` on purpose -- `ok` is `not issues`, and failing a model
+  Power BI accepts would reject sound output -- and is present-and-empty on a healthy build so its
+  absence is never mistaken for "not evaluated". Worth having because the engine should never *emit*
+  one: two emitters can only disagree on case if one stopped using the recorded name, a divergence
+  DAX tolerates and the case-SENSITIVE M layer would not. Five tests, five positive controls, all
+  caught -- including *"promotes it to a hard issue"* and *"compares case-sensitively, breaking the
+  real check"*.
+
 - **`tableau-migration` (skill `2.327.0` → `2.328.0`): the stub repair work order is emitted as its
   own artifact, `repair-queue.json`, with its category guidance hoisted.** The payload already
   existed, inside `model_translation_handoff.requests[]`; reaching it meant knowing which of
