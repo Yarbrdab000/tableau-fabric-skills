@@ -14,6 +14,33 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ### Added
 
+- **`tableau-migration` (skill `2.317.0` → `2.318.0`): the post-wrap merge's two unstated contracts
+  are now pinned — it must not mutate the recorded verdict, and a clean wrap must degrade nothing.**
+
+  Both were properties the existing tests **assumed rather than asserted**:
+
+  - **Non-mutation.** The merge builds a new dict and rebinds `res_report["openability_selfcheck"]`,
+    so a caller still holding the assembly-time verdict is safe. Nothing said so, and a refactor to
+    update it in place would satisfy every other test in the file while silently corrupting a value
+    another caller had already read. **Verified by injection to be caught by this test and nothing
+    else** — with the provenance flag preserved, so the injection tests only the mutation and not a
+    second defect alongside it.
+  - **The clean path**, true of 33 of the 34 corpus workbooks. Every other test in that file drives a
+    *defect* through the merge; this one drives a healthy model. A regression that started failing
+    checks on a clean build would be caught by no other assertion there, and would read downstream as
+    a real openability failure on a model that is fine.
+
+  **Written by the parameter-dispatcher session, and their own correction is the part worth keeping.**
+  The second test first asserted the `checks` dict was **identical** after a clean wrap. This merge
+  legitimately **adds nine newly-evaluated checks** — `bare_column_references_qualified`,
+  `dax_references_resolve`, and others the assembly-time verdict never carried — so **equality would
+  have failed correct code.** Ported as **no degradation**: nothing that passed may stop passing, and
+  no issue may appear. They found it by running their test against this implementation rather than by
+  reading either.
+
+  That is the failure mode a test cannot warn you about: **a test that fails correct code is worse
+  than a missing test**, because the natural response is to change the code until it passes.
+
 - **`tableau-migration` (skill `2.316.0` → `2.317.0`): the wrap-site pin now checks the ARGUMENT,
   not just the call — and the first version of it had the exact defect it exists to catch.**
 
