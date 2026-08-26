@@ -56,13 +56,76 @@ echo "==> Installing plugin ${PLUGIN}@${MARKETPLACE} ..."
 "${COPILOT}" plugin install "${PLUGIN}@${MARKETPLACE}" || true
 
 echo "==> Verifying the plugin is installed ..."
-if "${COPILOT}" plugin list 2>&1 | grep -q "${PLUGIN}"; then
-  echo "OK: '${PLUGIN}' is installed."
-  echo "Start a NEW Copilot CLI session -- skills load at session start."
-  echo "Verify inside a session with:  /plugin list   and   /skills list"
-  exit 0
-else
+if ! "${COPILOT}" plugin list 2>&1 | grep -q "${PLUGIN}"; then
   echo "FAILED: '${PLUGIN}' did not appear in 'copilot plugin list'." >&2
   echo "See INSTALL.md for the manual fallback." >&2
   exit 2
 fi
+echo "OK: '${PLUGIN}' is installed."
+
+# ---------------------------------------------------------------------------
+# Resolve and PROVE the installed skill path, then print it.
+#
+# SKILL.md tells the agent to set `$SKILL` to "the folder holding this SKILL.md" and uses it ~22
+# times. Left to inference that is a guess: a machine with install history can hold DOZENS of
+# `tableau-migration` folders (self-update backups, cloned repos under ~/.copilot/chats, personal
+# ~/.claude/skills copies) spanning many versions. The installer knows the answer -- so it proves
+# it, then prints it.
+# ---------------------------------------------------------------------------
+PLUGIN_ROOT="${HOME}/.copilot/installed-plugins/${MARKETPLACE}/${PLUGIN}"
+SKILL_PATH="${PLUGIN_ROOT}/skills/tableau-migration"
+PROBE="${SKILL_PATH}/scripts/new_run.py"
+
+echo ""
+if [ -f "${PROBE}" ]; then
+  VER="unknown"
+  [ -f "${SKILL_PATH}/VERSION" ] && VER="$(tr -d '[:space:]' < "${SKILL_PATH}/VERSION")"
+  echo "==> Installed skill path (verified: scripts/new_run.py present)"
+  echo ""
+  echo "    SKILL=\"${SKILL_PATH}\""
+  echo ""
+  echo "    tableau-migration VERSION: ${VER}"
+
+  SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  if [ -f "${SCRIPT_DIR}/skills/tableau-migration/VERSION" ]; then
+    LV="$(tr -d '[:space:]' < "${SCRIPT_DIR}/skills/tableau-migration/VERSION")"
+    if [ "${LV}" != "${VER}" ]; then
+      echo "    NOTE: this clone is ${LV} but the INSTALLED skill is ${VER}."
+      echo "          The marketplace serves the published plugin, not your working copy."
+    fi
+  fi
+else
+  echo "WARNING: the plugin installed, but the skill folder was not where expected:"
+  echo "         ${SKILL_PATH}"
+  echo "         Find it with:  find \"${HOME}/.copilot/installed-plugins\" -name SKILL.md"
+  echo "         Do NOT guess -- SKILL must point at the folder the loader is using."
+fi
+
+# ---------------------------------------------------------------------------
+# Stale duplicates. `self-update.md` writes its backup as a SIBLING of the live skill
+# (`<skill>.bak-<timestamp>`); old installs and cloned repos leave more copies elsewhere. They are
+# inert to the loader (plugin.json enumerates skills explicitly) but they poison any FILESYSTEM
+# search for the skill folder. Report them; never delete without being asked.
+# ---------------------------------------------------------------------------
+DUPES="$( { find "${PLUGIN_ROOT}/skills" -maxdepth 1 -type d -name 'tableau-migration.bak-*' 2>/dev/null
+            find "${HOME}/.claude/skills" -maxdepth 1 -type d -name 'tableau-migration*' 2>/dev/null
+            find "${HOME}/.copilot/skill-backups" -maxdepth 1 -type d -name 'tableau-migration*' 2>/dev/null
+          } | sort -u )"
+if [ -n "${DUPES}" ]; then
+  N="$(printf '%s\n' "${DUPES}" | wc -l | tr -d '[:space:]')"
+  echo ""
+  echo "==> ${N} other 'tableau-migration' folder(s) exist on this machine."
+  echo "    They are NOT loaded (plugin.json lists skills explicitly), but they make a"
+  echo "    filesystem search for the skill ambiguous. Only the path printed above is live."
+  printf '%s\n' "${DUPES}" | head -n 8 | while IFS= read -r d; do
+    dv="-"; [ -f "${d}/VERSION" ] && dv="$(tr -d '[:space:]' < "${d}/VERSION")"
+    printf '    %-9s %s\n' "${dv}" "${d/#$HOME/\~}"
+  done
+  echo "    Remove them when you're ready (they are backups -- review before deleting)."
+fi
+
+echo ""
+echo "Start a NEW Copilot CLI session -- skills load at session start."
+echo "Verify inside a session with:  /plugin list   and   /skills list"
+exit 0
+

@@ -67,12 +67,7 @@ Write-Host "==> Installing plugin $Plugin@$Marketplace ..."
 
 Write-Host "==> Verifying the plugin is installed ..."
 $list = (& $copilot plugin list 2>&1 | Out-String)
-if ($list -match [regex]::Escape($Plugin)) {
-  Write-Host "OK: '$Plugin' is installed." -ForegroundColor Green
-  Write-Host "Start a NEW Copilot CLI session -- skills load at session start."
-  Write-Host "Verify inside a session with:  /plugin list   and   /skills list"
-  exit 0
-} else {
+if ($list -notmatch [regex]::Escape($Plugin)) {
   Write-Host "FAILED: '$Plugin' did not appear in 'copilot plugin list'." -ForegroundColor Red
   Write-Host "----- copilot plugin list -----"
   Write-Host $list
@@ -80,3 +75,89 @@ if ($list -match [regex]::Escape($Plugin)) {
   Write-Host "See INSTALL.md for the manual fallback."
   exit 2
 }
+Write-Host "OK: '$Plugin' is installed." -ForegroundColor Green
+
+# ---------------------------------------------------------------------------
+# Resolve and PROVE the installed skill path, then print it.
+#
+# SKILL.md tells the agent to set `$SKILL` to "the folder holding this SKILL.md" and then uses it
+# ~22 times. Left to inference that is a guess: on a machine with a history of installs there can be
+# DOZENS of `tableau-migration` folders (self-update backups, cloned repos under ~/.copilot/chats,
+# personal ~/.claude/skills copies), spanning many versions. The installer is the one actor that
+# knows the answer for certain -- so it prints it, and proves it before doing so.
+# ---------------------------------------------------------------------------
+$pluginRoot = Join-Path $env:USERPROFILE ".copilot\installed-plugins\$Marketplace\$Plugin"
+$skillPath  = Join-Path $pluginRoot "skills\tableau-migration"
+$probe      = Join-Path $skillPath "scripts\new_run.py"
+
+Write-Host ""
+if (Test-Path $probe) {
+  $ver = "unknown"
+  $vf = Join-Path $skillPath "VERSION"
+  if (Test-Path $vf) { $ver = (Get-Content $vf -Raw).Trim() }
+
+  Write-Host "==> Installed skill path (verified: scripts\new_run.py present)" -ForegroundColor Green
+  Write-Host ""
+  Write-Host "    `$SKILL = `"$skillPath`"" -ForegroundColor Cyan
+  Write-Host ""
+  Write-Host "    tableau-migration VERSION: $ver"
+
+  # Is the clone we were run from NEWER than what just installed? Marketplace installs can lag.
+  $localVer = Join-Path $PSScriptRoot "skills\tableau-migration\VERSION"
+  if (Test-Path $localVer) {
+    $lv = (Get-Content $localVer -Raw).Trim()
+    if ($lv -ne $ver) {
+      Write-Host "    NOTE: this clone is $lv but the INSTALLED skill is $ver." -ForegroundColor Yellow
+      Write-Host "          The marketplace serves the published plugin, not your working copy."
+    }
+  }
+} else {
+  Write-Host "WARNING: the plugin installed, but the skill folder was not where expected:" -ForegroundColor Yellow
+  Write-Host "         $skillPath"
+  Write-Host "         Find it with:  Get-ChildItem `"$env:USERPROFILE\.copilot\installed-plugins`" -Recurse -Filter SKILL.md"
+  Write-Host "         Do NOT guess -- `$SKILL must point at the folder the loader is using."
+}
+
+# ---------------------------------------------------------------------------
+# Stale duplicates. `self-update.md` writes its backup as a SIBLING of the live skill
+# (`<skill>.bak-<timestamp>`), and old installs / cloned repos leave more copies elsewhere. They are
+# inert to the loader (plugin.json enumerates skills explicitly) but they poison any FILESYSTEM
+# search for "the folder holding this SKILL.md". Report them; never delete without being asked.
+# ---------------------------------------------------------------------------
+$dupes = @()
+if (Test-Path $pluginRoot) {
+  $dupes += Get-ChildItem (Join-Path $pluginRoot "skills") -Directory -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -like "tableau-migration.bak-*" }
+}
+$claudeSkills = Join-Path $env:USERPROFILE ".claude\skills"
+if (Test-Path $claudeSkills) {
+  $dupes += Get-ChildItem $claudeSkills -Directory -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -like "tableau-migration*" }
+}
+$backups = Join-Path $env:USERPROFILE ".copilot\skill-backups"
+if (Test-Path $backups) {
+  $dupes += Get-ChildItem $backups -Directory -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -like "tableau-migration*" }
+}
+
+if ($dupes.Count -gt 0) {
+  Write-Host ""
+  Write-Host "==> $($dupes.Count) other 'tableau-migration' folder(s) exist on this machine." -ForegroundColor Yellow
+  Write-Host "    They are NOT loaded (plugin.json lists skills explicitly), but they make a"
+  Write-Host "    filesystem search for the skill ambiguous. Only the path printed above is live."
+  foreach ($d in ($dupes | Select-Object -First 8)) {
+    $dv = "-"
+    $dvf = Join-Path $d.FullName "VERSION"
+    if (Test-Path $dvf) { $dv = (Get-Content $dvf -Raw).Trim() }
+    Write-Host ("    {0,-9} {1}" -f $dv, $d.FullName.Replace($env:USERPROFILE, "~"))
+  }
+  if ($dupes.Count -gt 8) { Write-Host "    ... and $($dupes.Count - 8) more" }
+  Write-Host "    Remove them when you're ready (they are backups -- review before deleting):"
+  Write-Host "    Get-ChildItem `"$env:USERPROFILE\.copilot`",`"$env:USERPROFILE\.claude`" -Recurse -Directory -Filter 'tableau-migration.bak-*' | Remove-Item -Recurse"
+}
+
+Write-Host ""
+Write-Host "Start a NEW Copilot CLI session -- skills load at session start."
+Write-Host "Verify inside a session with:  /plugin list   and   /skills list"
+exit 0
+

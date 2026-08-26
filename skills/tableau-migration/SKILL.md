@@ -202,7 +202,20 @@ Every script call is `py -3.11 "$SKILL\scripts\<name>.py"`.
 Then set up the local vars file (mirrors the repo's `.env.example` → `.env` convention):
 
 ```powershell
-$SKILL = "<the folder holding this SKILL.md>"
+# --- Resolve $SKILL and PROVE it. Never guess this. -------------------------------------------
+# A machine with install history can hold DOZENS of `tableau-migration` folders (self-update
+# backups `*.bak-<timestamp>`, cloned repos under ~/.copilot/chats, personal ~/.claude/skills
+# copies) spanning many versions. Only ONE is the folder the loader is using. `install.ps1` prints
+# it; if you have it, paste it. Otherwise resolve it deterministically:
+$SKILL = "$env:USERPROFILE\.copilot\installed-plugins\tableau-collection\tableau-fabric-skills\skills\tableau-migration"
+if (-not (Test-Path "$SKILL\scripts\new_run.py")) {
+    # STOP and ask the user for the path -- do NOT search the filesystem and pick a match, and do
+    # NOT fall back to a `.bak-*` sibling. Re-running .\install.ps1 prints the verified path.
+    throw "SKILL path not verified: $SKILL (re-run .\install.ps1 to print the correct one)"
+}
+"$SKILL is tableau-migration $(Get-Content "$SKILL\VERSION" -Raw)".Trim()   # confirm the version you are about to run
+# ----------------------------------------------------------------------------------------------
+
 $RUN   = (py -3.11 "$SKILL\scripts\new_run.py" --root C:\tfmig)   # auto-mints a clean C:\tfmig\runs\NNNN (empty in\+out\) and prints its path
 Set-Location $RUN
 Copy-Item "$SKILL\migration.vars.example.ps1" .\migration.vars.local.ps1   # once
@@ -210,6 +223,13 @@ Copy-Item "$SKILL\migration.vars.example.ps1" .\migration.vars.local.ps1   # onc
 . .\migration.vars.local.ps1
 if ($SUBSCRIPTION_ID) { az account set --subscription $SUBSCRIPTION_ID }   # only if your az default sub isn't the one holding the KV / Fabric capacity
 ```
+
+> **One resolve, then no more asking.** `$SKILL` is established **once**, above, and verified by a
+> `Test-Path`. Every later `py -3.11 "$SKILL\scripts\<name>.py"` in this document then runs without
+> re-confirming the path — a session that re-asks where the skill lives before each script has not
+> done this step. If the `Test-Path` fails, **STOP and ask once** for the path (or tell the user to
+> re-run `.\install.ps1`, which prints the verified one); never probe for candidates and choose.
+
 
 `migration.vars.example.ps1` is committed with **placeholders**; `migration.vars.local.ps1` holds
 the **real** values and is git-ignored — never commit or mirror it.

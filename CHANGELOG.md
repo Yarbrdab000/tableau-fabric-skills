@@ -14,6 +14,51 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ### Fixed
 
+- **`tableau-migration` (skill `2.321.0` → `2.322.0`): the skill no longer asks an agent to GUESS
+  where it is installed, and self-update stops leaving decoys that make the guess wrong.**
+
+  `SKILL.md` established `$SKILL` with a **placeholder** — `"<the folder holding this SKILL.md>"` —
+  then used it ~22 times as `py -3.11 "$SKILL\scripts\<name>.py"`, verified nowhere. That is safe
+  only if the answer is unique. **It is not.** Measured on one machine: **27** `tableau-migration`
+  folders spanning **1.2.1 → 2.141.0** — self-update backups written as `<skill>.bak-<timestamp>`
+  **siblings of the live skill** (4), cloned repos under `~/.copilot/chats` (6), personal
+  `~/.claude/skills` copies (11), `~/.copilot/skill-backups` (3), plus session-state clones.
+
+  **Why this is a whole-session failure, not a papercut.** Every playbook is reached by a path
+  relative to `$SKILL`. Resolve it wrong and `resources/second-compiler.md` never loads — so the
+  *"whenever a calc is stubbed you **must** present the option … quietly shipping stubs is a process
+  failure"* contract is invisible, and the agent declines an assisted pass on 16 stubbed calcs.
+  `troubleshooting.md` never loads, so the Newtonsoft GAC remedy it documents in full is unavailable
+  until after the work is thrown away. And every script call becomes a question instead of a command.
+  One unresolved variable, three unrelated-looking symptoms.
+
+  **Fixed on both sides of the handoff.** `install.ps1` / `install.sh` now **prove** the installed
+  skill path (`Test-Path scripts/new_run.py`) and **print it** as a paste-ready `$SKILL = "..."`,
+  report the installed VERSION, note when the clone you ran from is newer than what the marketplace
+  served, and list any other `tableau-migration` folders so the ambiguity is visible rather than
+  latent. `SKILL.md` resolves `$SKILL` to a concrete path and **guards it with `Test-Path` before
+  the first script call** — on failure, stop and ask **once**; never search and pick a match.
+  `self-update.md` writes its backup to `~/.copilot/skill-backups` in **both** shells instead of
+  beside the live skill.
+
+  **The backups were never a loading hazard — checked, and it matters.** `plugin.json` enumerates
+  skills explicitly, so a `.bak-*` folder is never loaded. The first, more satisfying diagnosis
+  (*"five folders declare the same skill name → ambiguous resolution"*) was **wrong**, and the
+  manifest is what disproved it. The real hazard is narrower and still real: **path discovery**,
+  which is precisely what the placeholder asked an agent to perform.
+
+  New `tests/test_skill_path_resolution.py` (6 tests) pins the placeholder's absence, a concrete
+  assignment, the guard's **position** before the first call, and the backup destination in both
+  shells. Positive control: 4 injections, **4 caught**, sources restored byte-identical.
+
+  **One of those tests was weak and the control found it.** It asserted the *count* of
+  `skill-backups` mentions; reverting the POSIX `cp` destination left the neighbouring `mkdir -p`
+  intact, so the count held and the test passed on a reverted fix. Now it asserts the **command**.
+  *Count the captures, never the matches* — caught by a control, in a test written against that
+  exact class.
+
+  Suite 5211 → **5217**.
+
 - **`tableau-migration` (skill `2.320.0` → `2.321.0`): Tableau's overlapping-bar ("lipstick")
   idiom now rebuilds as a clustered bar/column instead of a combo.** Two same-family measures
   folded onto one axis were promoted to `lineClusteredColumnComboChart`, which turned the second

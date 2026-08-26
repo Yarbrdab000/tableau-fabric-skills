@@ -105,7 +105,15 @@ $Src = Join-Path $Tmp $Sub
 
 # Back up the current install so a failed verify (Step 3) can roll back. This also handles a
 # DIRTY/edited install: local edits are preserved in the backup, then clobbered in place.
-$Backup = "$Install.bak-$((Get-Date).ToString('yyyyMMddHHmmss'))"
+#
+# The backup goes to ~/.copilot/skill-backups, NEVER beside the live skill. A sibling
+# `<skill>.bak-<timestamp>` is inert to the loader (plugin.json enumerates skills explicitly) but it
+# poisons every FILESYSTEM search for "the folder holding this SKILL.md" -- which is exactly how an
+# agent resolves $SKILL. Measured on one machine: 27 tableau-migration folders across 179 versions,
+# 4 of them .bak siblings of the live skill. Keep the search space at one answer.
+$BackupRoot = Join-Path $env:USERPROFILE ".copilot\skill-backups"
+New-Item -ItemType Directory -Force -Path $BackupRoot | Out-Null
+$Backup = Join-Path $BackupRoot ("tableau-migration.bak-" + (Get-Date).ToString('yyyyMMddHHmmss'))
 if (Test-Path $Install) { Copy-Item $Install $Backup -Recurse -Force }
 New-Item -ItemType Directory -Force -Path $Install | Out-Null
 
@@ -209,7 +217,10 @@ local_ver="$(head -n1 "$Install/VERSION" 2>/dev/null | tr -d '[:space:]')"; : "$
 remote_ver="$(curl -fsSL "$RepoRaw" | tr -d '[:space:]')"
 # compare, then:
 tmp="$(mktemp -d)"; git clone --depth 1 https://github.com/Yarbrdab000/tableau-fabric-skills.git "$tmp"
-cp -a "$Install" "$Install.bak-$(date +%Y%m%d%H%M%S)"
+# Backup goes OUTSIDE the skills tree -- a `<skill>.bak-*` sibling poisons any filesystem search
+# for the skill folder, which is how an agent resolves $SKILL. See the PowerShell block above.
+mkdir -p "$HOME/.copilot/skill-backups"
+cp -a "$Install" "$HOME/.copilot/skill-backups/tableau-migration.bak-$(date +%Y%m%d%H%M%S)"
 rsync -a --delete --exclude '.git' --exclude '__pycache__' --exclude '.pytest_cache' \
   "$tmp/skills/tableau-migration/" "$Install/"
 rm -rf "$tmp"   # then run the same file/symbol asserts + python3.11 -m pytest tests -q
