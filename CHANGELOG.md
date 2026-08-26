@@ -14,6 +14,33 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ### Fixed
 
+- **`tableau-migration` (skill `2.330.0` → `2.331.0`): `estate_survey.py` can be scoped below site
+  level, and reports progress by default (#175).** An engineer needed **12 workbooks** from one
+  project on a site holding **273**. The survey ran site-wide -- ~275 REST calls, 6+ minutes -- and
+  printed **nothing** until it finished, because the module's only two `print` calls both run after
+  the survey completes. A slow-but-working run was indistinguishable from a hung one, so it was
+  killed and the operator spent the time investigating URL formats and credentials before concluding
+  *"not a URL issue, not a credential issue -- it's scope."* The per-workbook `/connections` call is
+  deliberate and correct; the scope it was applied over was not. Three parts. **Scope:**
+  `--project` / `--workbook`, repeatable and ANDed, matching LUID or case-insensitive name, giving
+  the `server -> site -> project -> workbook` progression asked for; a token matching nothing is
+  reported as `scope.unmatched` and warned on stderr, so a typo never presents as a quietly smaller
+  survey. **Progress:** default ON to stderr with `--quiet` to invert -- opt-out on the reporter's
+  own reasoning that a diagnostic behind `--verbose` is never enabled by the person who needs it,
+  because they only discover they needed it once the run already looks hung. It names the workbook,
+  not just a counter, and announces the listing calls too. stdout stays byte-identical. **And the
+  design question they raised, answered by keeping the dependency index SITE-WIDE:** a scoped
+  workbook's published predecessor can live outside the scope, and scoping the datasource index too
+  would report *"no dependencies"* for a workbook that has one -- recreating the migrate-in-any-order
+  outcome the STEP 1.5 gate exists to prevent, with exit code 0. Narrower in SUBJECTS, not weaker in
+  ANSWERS, asserted by a test where the only dependency crosses the scope boundary. A numeric
+  `--project` **raises** and names the remedy rather than matching nothing: a browser URL carries
+  only the UI id, which has no public REST mapping to a project LUID, and a flag that surveys zero
+  projects and exits 0 would be worse than no flag. It refuses with exit 2 before signing in.
+  `scope` is recorded even when unscoped, because *"this site has 12 workbooks"* and *"this survey
+  looked at 12 of 273"* read identically in every other field. Thirteen tests, eleven positive
+  controls, all caught.
+
 - **`tableau-migration` (skill `2.329.0` → `2.330.0`): the storage decision accepts a
   provenance-tagged volume hint and ADVISES on it, without ever overriding the mode (#163).** The
   engine picks Import vs DirectQuery from connector class and relation shape and has no concept of how

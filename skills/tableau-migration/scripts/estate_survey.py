@@ -325,8 +325,69 @@ def paged_list(call, path, collection, item, page_size=100, max_pages=1000):
     return out, None
 
 
-def survey_site(call, site_id):
-    """Run the full survey against a site. ``call(path) -> parsed JSON`` is injected.
+_UI_ID_REMEDY = (
+    "A number is the browser UI's id, which has no public REST mapping to the project LUID this "
+    "needs. Use the project NAME exactly as it appears in Tableau, or its LUID (a 36-character "
+    "uuid, e.g. from GET /api/<ver>/sites/<site>/projects)."
+)
+
+
+def validate_scope_token(value, *, flag):
+    """Reject a bare numeric scope token LOUDLY, naming the remedy (#175).
+
+    The most natural way for an operator to identify *"the one project I want"* is to paste the URL
+    out of their browser, and that URL carries only a **numeric UI id** with no public API mapping to
+    the project LUID the REST API needs. Matching it would find nothing.
+
+    A scoping flag that quietly surveys zero projects and exits 0 is worse than no flag at all: it
+    produces an empty, confident, non-degraded survey that reads downstream as *"this estate has no
+    dependencies, migrate in any order"* -- the precise wrong answer this module exists to prevent.
+    So this raises rather than returning an empty match.
+    """
+    token = (value or "").strip()
+    if not token:
+        raise ValueError("%s was given an empty value" % flag)
+    if token.isdigit():
+        raise ValueError("%s=%s looks like a browser UI id. %s" % (flag, token, _UI_ID_REMEDY))
+    return token
+
+
+def _matches(item, tokens):
+    """True when a workbook/project item matches any token, by LUID or case-insensitive name."""
+    luid = _text(item.get("id")).lower()
+    name = _text(item.get("name")).strip().lower()
+    return any(t.lower() == luid or t.strip().lower() == name for t in tokens)
+
+
+def filter_workbooks(workbooks, *, projects=None, workbook_names=None):
+    """Narrow the workbook list to a project and/or workbook scope. Returns ``(kept, unmatched)``.
+
+    ``unmatched`` names every token that matched NOTHING, so a typo surfaces as a reported miss
+    rather than as a quietly smaller survey. Both filters are ANDed when both are supplied, giving
+    the ``server -> site -> project -> workbook`` progression the request asked for.
+    """
+    kept = list(workbooks or [])
+    seen = set()
+    if projects:
+        kept = [w for w in kept if _matches({"id": (w.get("project") or {}).get("id"),
+                                             "name": project_name(w)}, projects)]
+        for w in workbooks or []:
+            p = {"id": (w.get("project") or {}).get("id"), "name": project_name(w)}
+            for t in projects:
+                if _matches(p, [t]):
+                    seen.add(t)
+    if workbook_names:
+        kept = [w for w in kept if _matches(w, workbook_names)]
+        for w in workbooks or []:
+            for t in workbook_names:
+                if _matches(w, [t]):
+                    seen.add(t)
+    unmatched = [t for t in list(projects or []) + list(workbook_names or []) if t not in seen]
+    return kept, unmatched
+
+
+def survey_site(call, site_id, *, projects=None, workbook_names=None, progress=None):
+    """Run the survey against a site, optionally scoped. ``call(path) -> parsed JSON`` is injected.
 
     Read-only: three GET shapes (list workbooks, list datasources, per-workbook connections) and
     nothing else. A per-workbook connections call that fails is recorded rather than raised, so one
@@ -334,17 +395,44 @@ def survey_site(call, site_id):
     dependency". Those are opposite answers: a mid-run session loss made every remaining workbook
     record ``[]``, which reads downstream as "this workbook is independent, migrate it in any
     order" -- the precise wrong answer this module exists to prevent, delivered with exit code 0.
+
+    SCOPING (#175). ``projects`` / ``workbook_names`` narrow only the **per-workbook connections**
+    loop, which is where the cost is: a 273-workbook site cost ~275 REST calls and 6+ minutes, versus
+    13 for the 12 workbooks the operator actually wanted.
+
+    The datasource listing stays SITE-WIDE and that is deliberate, because it answers the request's
+    second design question. A workbook's published-datasource predecessor can sit outside the scope,
+    and resolving dependencies against a scoped datasource index would report *"no dependencies"* for
+    a workbook that has one -- recreating the migrate-in-any-order failure. Keeping the index whole
+    costs one already-paged listing call and makes an out-of-scope predecessor resolve normally, so
+    a scoped survey is narrower in SUBJECTS without being weaker in ANSWERS.
+
+    ``progress`` is an optional ``callable(str)``; ``None`` is silent.
     """
+    def _say(msg):
+        if progress:
+            progress(msg)
+
+    _say("listing workbooks...")
     workbooks, wb_error = paged_list(call, f"/sites/{site_id}/workbooks", "workbooks", "workbook")
+    _say("listing published datasources...")
     datasources, ds_error = paged_list(call, f"/sites/{site_id}/datasources",
                                        "datasources", "datasource")
+    total_site = len(workbooks)
+    unmatched_scope = []
+    if projects or workbook_names:
+        workbooks, unmatched_scope = filter_workbooks(
+            workbooks, projects=projects, workbook_names=workbook_names)
+        _say("scope: %d of %d workbooks selected" % (len(workbooks), total_site))
     conns = {}
     errors = []
     unknown = []
-    for wb in workbooks:
+    total = len(workbooks)
+    for i, wb in enumerate(workbooks, 1):
         luid = _text(wb.get("id"))
         if not luid:
             continue
+        _say("[%d/%d] %s" % (i, total, _text(wb.get("name")) or luid))
         try:
             payload = call(f"/sites/{site_id}/workbooks/{luid}/connections")
             rows = ((payload or {}).get("connections") or {}).get("connection") or []
@@ -364,6 +452,21 @@ def survey_site(call, site_id):
     survey["summary"]["listing_errors"] = len(listing_errors)
     survey["summary"]["dependencies_unknown"] = len(unknown)
     survey["summary"]["degraded"] = survey["degraded"]
+    # SCOPE PROVENANCE, always present. A consumer must be able to tell "this site has 12 workbooks"
+    # from "this survey looked at 12 of 273" -- those read identically in every other field, and the
+    # second is not a statement about the estate. Distinct from ``degraded``: a scoped survey is
+    # complete and trustworthy about its subjects, it just has fewer of them.
+    survey["scope"] = {
+        "scoped": bool(projects or workbook_names),
+        "projects": list(projects or []),
+        "workbooks": list(workbook_names or []),
+        "workbooks_selected": len(workbooks),
+        "workbooks_on_site": total_site,
+        "unmatched": unmatched_scope,
+        # Stated rather than implied: narrowing the subjects did NOT narrow the dependency index.
+        "datasource_index": "site-wide",
+    }
+    survey["summary"]["scoped"] = survey["scope"]["scoped"]
     return survey
 
 
@@ -436,7 +539,32 @@ def main(argv=None):
     ap.add_argument("--keyring-username", metavar="NAME", help="OS keyring username")
     ap.add_argument("--rest-version", default=fetch_tds.DEFAULT_REST_VERSION)
     ap.add_argument("--json", metavar="PATH", help="write the full survey JSON here")
+    # SCOPING (#175). Repeatable and composable: server -> site -> project -> workbook, each
+    # narrowing the last. A site-wide survey of 273 workbooks costs ~275 REST calls and 6+ minutes;
+    # the operator who filed this needed 12 of them.
+    ap.add_argument("--project", action="append", default=[], metavar="NAME|LUID",
+                    help="only workbooks in this project (repeatable; name or 36-char LUID)")
+    ap.add_argument("--workbook", action="append", default=[], metavar="NAME|LUID",
+                    help="only this workbook (repeatable; name or 36-char LUID)")
+    # PROGRESS, default-ON to stderr. Opt-out rather than opt-in on the reporter's own reasoning:
+    # diagnostics behind a --verbose are never enabled by the person who needs them, because they
+    # only discover they needed them after the run already looked hung. stderr keeps stdout (which
+    # a caller may parse) byte-identical to before.
+    ap.add_argument("--quiet", action="store_true",
+                    help="suppress per-workbook progress on stderr (progress is on by default)")
     args = ap.parse_args(argv)
+
+    try:
+        projects = [validate_scope_token(p, flag="--project") for p in args.project]
+        workbook_names = [validate_scope_token(w, flag="--workbook") for w in args.workbook]
+    except ValueError as exc:
+        # Refuse LOUDLY before signing in. A scoping flag that quietly matches nothing would emit a
+        # confident, non-degraded, EMPTY survey -- which reads downstream as "no dependencies,
+        # migrate in any order", the exact outcome the STEP 1.5 gate exists to prevent.
+        print(f"[FAIL] {exc}", file=sys.stderr)
+        return 2
+
+    progress = None if args.quiet else (lambda m: print("[SURVEY] " + m, file=sys.stderr, flush=True))
 
     pat_name, pat_secret, jwt = fetch_tds._resolve_auth(args)
     token, site_id = fetch_tds.sign_in(args.server, args.rest_version, args.site,
@@ -462,11 +590,16 @@ def main(argv=None):
         def call(path):
             return fetch_tds._http_json("GET", base + path, token=state["token"], reauth=_reauth)
 
-        survey = survey_site(call, site_id)
+        survey = survey_site(call, site_id, projects=projects, workbook_names=workbook_names,
+                             progress=progress)
     finally:
         fetch_tds.sign_out(args.server, args.rest_version, state["token"])
 
     print(format_survey(survey))
+    # A scope token that matched nothing is a typo, and a smaller survey is not how a reader should
+    # have to discover it.
+    for miss in survey.get("scope", {}).get("unmatched") or []:
+        print(f"[WARN] scope {miss!r} matched no project or workbook", file=sys.stderr)
     if args.json:
         with open(args.json, "w", encoding="utf-8") as fh:
             json.dump(survey, fh, indent=2)
