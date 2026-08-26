@@ -590,13 +590,33 @@ that produced it*), committed seven minutes after writing that sentence down.
 
 **Consequences, kept separate because they decay differently:**
 
-* The **table stands** as far as it goes — 14 windows, 13 negative — but only under the assumption
-  that no tag was recreated, which is exactly what failed for the fourteenth. Report it as *"when the
-  current tag object was written"*, never as *"when the anchor was cut"*.
-* **The generalisation is withdrawn.** "The exceptional path drops the guarantees the normal path
-  automates" is plausible, is probably true, and **had no support from the one case cited for it.**
-  A rule of that shape is the dangerous kind: it sounds earned, and a reader has no way to tell that
-  its evidence evaporated.
+* The **table is repairable, not merely caveatable.** The displaced tag object survived as a dangling
+  object and was recovered — the original was cut at **17:25:45** against a release that landed at
+  **17:26:00**, a **−15 s** window in line with the other thirteen. **All 14 are negative; there is no
+  outlier.** Report cut times from the object you can still read, not from the current ref.
+* **The generalisation is not merely unsupported — it is CONTRADICTED by its own only case.**
+  2.317.0 followed the normal path precisely. *"Plausible but unevidenced"* and *"the one case cited
+  refutes it"* land very differently on a reader, so state the second. The rule's shape is the
+  dangerous kind either way: it sounds earned, and nobody would have questioned it.
+
+### The object you displaced is still there — archive it before gc
+
+**`git tag -d` prints the sha of the object it removes, and that output line is the only record it
+ever existed.** The dangling object stays readable until something runs `git gc`, so the evidence has
+a **hidden expiry that nothing marks** — the same shape as a stale hedge, one layer down in the object
+database.
+
+```
+git cat-file -p <displaced-sha>              still resolves; tagger epoch is the ORIGINAL cut
+git update-ref refs/tags/archive/<name> <sha>   makes it reachable, hence unprunable
+```
+
+Recovered here as `archive/original-pre-v2.317.0-precollision`, and the value recorded in prose above
+so the finding survives even the archive. **Two rules, and the second is the one that was missed:**
+
+> **When you overwrite or delete a shared ref, the displaced object is still there and still readable
+> — archive it deliberately rather than relying on scrollback.** And **record the VALUE, not the sha**,
+> because the sha's referent has an expiry and the value does not.
 
 **A footnote on the probe that measured this, because it is the same class one layer up:** its
 "anchors whose target already stamps ≥ its own version" check reported two defects, both false.
