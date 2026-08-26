@@ -1111,6 +1111,48 @@ check:
 The rules are what protect you when nobody else is looking at the same object. **They are not what
 found these.**
 
+**One exception, and it is the whole case for keeping the gates.** Of roughly a dozen corrections
+across the day, the suite produced exactly one — and it was the only one that was not a *belief*:
+
+| what went wrong | caught by |
+|---|---|
+| ~12 wrong claims, counts, attributions, generalisations | another session measuring the same object |
+| a shared anchor tag **silently deleted**, destroying a rollback path | `test_every_released_version_has_an_anchor` |
+
+**No human noticed the deletion, in either direction** — the lane that did it believed the tag was its
+own, and I did not know it had ever been at risk. So the division is not "gates are weak":
+
+> **Gates catch corrupted STATE; other readers catch wrong BELIEFS. Neither substitutes for the
+> other, and each is nearly blind to the other's class.**
+
+Every belief-level error today survived a 5199-test suite untouched, and the single state-level error
+was caught by that suite within one run. Do not read *"the rules did not find these"* as a reason to
+invest less in gates — read it as a statement about which of the two failure classes a gate can see.
+
+### Any tool whose scope has a default
+
+The scope class kept recurring, and its most useful form is not *"print your population"* — that
+requires noticing — but a place to look:
+
+> **Any tool whose scope has a default is silently answering a narrower question than you asked, and
+> its output is well-formed either way.**
+
+That turns a discipline into a search. Non-exhaustive, all seen or adjacent to what was seen here:
+
+```
+git log -- <path>          history simplification   dropped 137 of 464 (30%)
+Test-Path .git\MERGE_HEAD  .git is a FILE in a worktree; False unconditionally
+a glob                     its root -- at least visible in the command
+Select-String / grep       single-line matching unless multiline is asked for
+a regex                    no re.S, so "." stops at a newline
+os.walk on Windows         MAX_PATH truncation
+```
+
+**The default is invisible in the invocation *and* in the result**, which is precisely why "be more
+careful" never catches these and reading the flag list does.
+
+### When the rules pay, and the one time it was before the fact
+
 One further note on *when* they pay. Almost every catch recorded here was **retrospective** — an
 artifact already existed and someone measured it. Exactly one landed **before the action**: a version
 number about to be taken would have left a hole in the release chain, and the cheaper-looking escape
