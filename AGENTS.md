@@ -736,9 +736,13 @@ What actually settled it, in order of decisiveness:
 
 1. **Read the code at the site of the change**, not near it. The rationale was in a comment two lines
    above the rewrite, and in `_wrapper_measure_name`'s docstring. Several passes over that file for
-   other reasons never read it.
+   other reasons never read it. **Proximity is not attention** — a comment adjacent to the code you
+   are editing is among the most likely things in the file to be skipped, because it reads as context
+   rather than as evidence.
 2. **Ask what the artifact would lose**, not whether it looks wrong. `35/35 carry a FILTER(` is a
-   one-command question and it ends the argument.
+   one-command question and it ends the argument. **This is the only one of the three that works
+   without suspicion already in hand** — it can be asked of a claim nobody is doubting, which matters
+   because every error recorded here landed on a claim its author was confident about.
 3. **Date the claim.** The comment asserting the labels "can never disagree" was added 38 releases
    *after* the code that makes them disagree — answerable from `git log -S` alone, with no build.
 
