@@ -5249,6 +5249,9 @@ def migrate_estate(source, output_dir, *, viz_stage=None, pbip=True, rebind_plan
     report["input_manifest"] = _build_input_manifest(source, ds_ids, wb_ids)
     with open(os.path.join(output_dir, "input_manifest.json"), "w", encoding="utf-8") as fh:
         json.dump(report["input_manifest"], fh, indent=2, sort_keys=True)
+    # The stub repair work order as its own artifact (#170). BEFORE report.json is written, so the
+    # report records the queue it produced; the summary render then points a reader at the file.
+    _write_repair_queue(report, output_dir)
 
     with open(os.path.join(output_dir, "report.json"), "w", encoding="utf-8") as fh:
         json.dump(report, fh, indent=2, sort_keys=True)
@@ -5266,6 +5269,85 @@ def migrate_estate(source, output_dir, *, viz_stage=None, pbip=True, rebind_plan
             ds_details, bind_stage, load_errors)
         _write_compile_report(output_dir, compile_report)
     return report
+
+
+def _write_repair_queue(report, output_dir):
+    """``repair-queue.json`` -- every stubbed calc's repair work order, as its OWN artifact (#170).
+
+    WHY THIS EXISTS. The repair payload already existed, inside
+    ``model_translation_handoff.requests[]``, and reaching it meant knowing which of ``report.json``'s
+    12 top-level keys held it, which of 34 workbooks owned the stub, and which of *two* same-length
+    sibling lists carried the fields needed to fix it. A reader who found ``needs_review[]`` first got
+    a plausible, complete-looking list of exactly the right calculations with **no formula, no fields
+    and no target table** -- enough to report every stub while repairing none.
+
+    Two things this fixes, both measured on the 34-workbook corpus at 2.327.0:
+
+    * **Position.** ``requests[]`` is reachable only by path. A fixed filename is not.
+    * **Duplication.** ``category_guidance`` is emitted per REQUEST, and there is exactly ONE distinct
+      string per category, estate-wide -- 7 categories, 4,481 chars in total, repeated to **44,407**
+      across 69 requests. On ``0088_salesforce`` that boilerplate is **38% of the whole handoff**,
+      separating each request's unique fields from the next by ~900 characters of text identical to
+      the block above it.
+
+    So the guidance is hoisted to a single ``guidance`` map keyed by category, and each request keeps
+    its ``category`` -- the key. That is a hoist, not a relocation: this file is small, the map
+    precedes the requests, and a reader holding a request has the key in hand. Contrast the wrapper
+    label and dispatcher-blank findings, where a correct disclosure sat in a file the reader was not
+    in; here the alternative to hoisting is 900 chars of *identical* text between every pair of
+    genuinely per-object records, which pushes the reader away from the payload rather than toward it.
+
+    STRICTLY ADDITIVE. ``model_translation_handoff`` is untouched -- ``requests[]`` still carries its
+    inline ``category_guidance`` for every existing consumer -- and this is a new file plus a new
+    ``report["repair_queue"]`` key. Nothing is renamed or removed. Best-effort: a write failure is
+    recorded and never raised, because a repair aid must not fail a migration that otherwise built.
+    """
+    subjects, guidance, by_cat, inline_bytes = [], {}, {}, 0
+    for kind, key, details in (("workbook", "model_translation_handoff", report.get("workbooks")),
+                               ("datasource", "translation_handoff", report.get("datasources"))):
+        for d in details or []:
+            handoff = d.get(key)
+            if not isinstance(handoff, dict):
+                continue
+            reqs = handoff.get("requests") or []
+            if not reqs:
+                continue
+            slim = []
+            for req in reqs:
+                cat, text = req.get("category"), req.get("category_guidance")
+                if cat and text:
+                    guidance.setdefault(cat, text)
+                    inline_bytes += len(text)
+                by_cat[cat] = by_cat.get(cat, 0) + 1
+                slim.append({k: v for k, v in req.items() if k != "category_guidance"})
+            subjects.append({"kind": kind, "name": d.get("name") or d.get("workbook") or "?",
+                             "pbip_folder": d.get("pbip_folder"), "requests": slim})
+    total = sum(len(s["requests"]) for s in subjects)
+    if not total:
+        return
+    queue = {
+        "tool": "migrate_estate",
+        "generated_at": report.get("generated_at"),
+        "summary": {"subjects": len(subjects), "requests": total, "by_category": by_cat},
+        # ONE block per category. ``requests[].category`` is the key into this map.
+        "guidance": guidance,
+        "subjects": subjects,
+    }
+    try:
+        with open(os.path.join(output_dir, "repair-queue.json"), "w", encoding="utf-8") as fh:
+            json.dump(queue, fh, indent=2, sort_keys=True)
+    except OSError as exc:
+        report["repair_queue"] = {"status": "error", "note": str(exc)}
+        return
+    report["repair_queue"] = {
+        "status": "written",
+        "path": "repair-queue.json",
+        "requests": total,
+        "subjects": len(subjects),
+        # What the hoist actually bought, so the claim is checkable rather than asserted.
+        "guidance_bytes_inline": inline_bytes,
+        "guidance_bytes_deduplicated": sum(len(v) for v in guidance.values()),
+    }
 
 
 def _summarize(ds_details, wb_details, viz_available):
@@ -5766,10 +5848,17 @@ def _pending_gates(summary):
             "trigger": "summary.needs_review_total",
             "skill_step": 3,
             "runbook": "resources/second-compiler.md",
+            # The work order's PATH, on the gate that asks someone to do the work. Without it the
+            # queue is reachable only by knowing report.json's shape (#170), and a reader who lands
+            # on needs_review[] instead gets the right names with no formula, fields or target table
+            # -- enough to report every stub while repairing none.
+            "work_order": "repair-queue.json",
             "offer": (f"OFFER the LLM-assisted second compiler for {needs_review} stubbed "
                       "calculation(s) before declaring the migration done -- present them and run "
-                      "only on an explicit GO. If declined, the deterministic result ships as-is "
-                      "(each stub keeps its preserved TableauFormula)."),
+                      "only on an explicit GO. The per-calc work order (formula, resolved fields, "
+                      "target table, category) is repair-queue.json. If declined, the deterministic "
+                      "result ships as-is (each stub keeps its preserved TableauFormula and a "
+                      "TranslationStubReason annotation naming why it stubbed)."),
         })
     warned = summary.get("visuals_warned", 0) or 0
     if warned > 0:

@@ -14,6 +14,30 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ### Fixed
 
+- **`tableau-migration` (skill `2.327.0` → `2.328.0`): the stub repair work order is emitted as its
+  own artifact, `repair-queue.json`, with its category guidance hoisted.** The payload already
+  existed, inside `model_translation_handoff.requests[]`; reaching it meant knowing which of
+  `report.json`'s 12 top-level keys held it, which of 34 workbooks owned the stub, and which of **two
+  same-length sibling lists** carried the fields needed to fix it -- `needs_review[]` and `requests[]`
+  name the same calcs and only the second has `formula`, `fields` and `target_table`. A reader who
+  found the first got a plausible, complete-looking list of exactly the right calculations and could
+  satisfy a *"record every stub"* requirement **while repairing none**. Second, `category_guidance` is
+  emitted per REQUEST, and measured on the 34-workbook corpus at 2.327.0 there is exactly **one
+  distinct string per category** -- 7 categories, 4,481 chars in total, repeated to **44,407** across
+  69 requests, which on `0088_salesforce` is **38% of the whole handoff**. Duplicated inline that does
+  not put guidance where the reader is; it puts ~900 characters of text identical to the block above
+  it *between* every pair of genuinely per-object records. So the guidance is hoisted to one map that
+  each request's own `category` keys into -- a hoist toward the payload, not a relocation away from
+  it, and the inverse of the wrapper-label and dispatcher-blank findings rather than another instance
+  of them. Measured end to end on the corpus: 69 requests across 13 subjects, guidance
+  **44,407 → 4,481** chars, **0** dangling category keys, **0** requests missing a payload field. The
+  second-compiler gate now names the file, because a work order nobody finds is the same outcome as
+  one never written. **Strictly additive:** `report.json` is untouched and still carries all 69 inline
+  guidance copies (asserted, not assumed -- removing it would be a schema removal and would break the
+  reporter's own wrapper); this is a new file plus a new `report["repair_queue"]` key recording
+  `guidance_bytes_inline` vs `guidance_bytes_deduplicated` so the saving is checkable. Nine tests,
+  eight positive controls, all caught, source restored hash-verified byte-identical.
+
 - **`tableau-migration` (skill `2.326.0` → `2.327.0`): a stubbed calculation now carries the
   translator's OWN diagnosis into the TMDL, where the person debugging it is already standing.**
   `translate_tableau_calc_to_dax` returns `(dax, reason, tables_used)` and the emitter discarded the
