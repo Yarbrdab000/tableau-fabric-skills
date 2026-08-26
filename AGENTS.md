@@ -608,6 +608,31 @@ versions as tuples of ints, never as strings.
 **Cut the anchor before the release commit lands** regardless — it is what the scripts already do, and
 it costs nothing. Just do not cite the measurement above as evidence that anyone ever failed to.
 
+### "0 missing" from a document-scoped gate is a statement about the document
+
+`test_every_released_version_has_an_anchor` derives its population from `CHANGELOG.md`, and reports
+**0 missing anchors** — correctly. Reconciling a count pair the anchor probe printed and I had let
+stand (*341 anchors, 344 versions stamped*) shows what that zero covers:
+
+```
+VERSION values stamped on reachable commits   344
+versions with a CHANGELOG entry (the gate's population)  154   oldest 2.87.0
+  of those, missing an anchor                              0
+stamped but never given an entry                         190   all older than 2.87.0
+```
+
+**The CHANGELOG's entry range begins at 2.87.0**, so the 190 are *absent from the document*, not
+unparsed by the gate — checked by scanning for version tokens in **any** shape (166 found, 12 of them
+prose mentions like "regressed in 2.51.0", none of them entries below 2.87.0). No defect: the 38
+stamped versions with no anchor all predate the convention.
+
+> **A gate whose population comes from a document reports on the document's coverage, and a reader
+> will hear it as reporting on the repository.** State the denominator — here, 154 of 344, or 45%.
+
+The transferable habit is smaller than the rule: **reconcile any count pair you print.** `341` and
+`344` sat next to each other in my own output, unexplained, in a script I had already handed to
+another session.
+
 **Handing a number back is two-sided, and both halves failed here at once:**
 
 > **A number, once given, needs an explicit hand-back before the giver takes it — and a decline must
