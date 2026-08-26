@@ -14,6 +14,36 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ### Added
 
+- **`tableau-migration` (skill `2.316.0` → `2.317.0`): the wrap-site pin now checks the ARGUMENT,
+  not just the call — and the first version of it had the exact defect it exists to catch.**
+
+  2.312.0's re-check must receive `wrapped_model_parts`. `test_the_wrap_site_calls_the_recheck`
+  asserted only that the re-check is *invoked*, so
+  `_recheck_openability_after_wrap(res_report, res.get("parts"))` — the **pre-wrap** dict — would
+  satisfy it, run without error, evaluate a model in which the wrapper defect cannot exist, and report
+  a clean verdict. **The original bug, restored behind the fix**, and invisible because the shipped
+  call happens to be correct.
+
+  **The first argument pin passed against that injection.** It used
+  `re.search(r"_recheck_openability_after_wrap\(([^)]*)\)")`, which finds the **definition** line
+  first — `def _recheck_openability_after_wrap(res_report, wrapped_model_parts):` — and therefore read
+  the *parameter* list instead of the *argument* list. It could never fail. **A pin written to catch
+  "one level short of the property" was itself one level short**, for the same reason, in the same
+  operation: the injection script had already made the identical mistake two minutes earlier and
+  rewritten the definition instead of the call site.
+
+  Both were caught by the same thing and it was not care — **the injection script asserts its
+  injection LANDED before reading the result.** Without that, a rewritten definition plus a green
+  suite reads as *"the pin survived"* when it means *"nothing was injected."* Now verified in three
+  states: **green → RED on `res.get("parts")` → green after restore.**
+
+  Adds a second pin that makes the first meaningful: **the pre-wrap and post-wrap dicts must produce
+  DIFFERENT verdicts.** If they agreed there would be nothing for the call site to get wrong and every
+  test here would pass over a distinction that does not exist.
+
+  Found by the measure-value-colouring session, which named it *"a pin one level short of the property
+  it protects"* and rated it above the release it patches.
+
 - **`tableau-migration` (skill `2.315.0` → `2.316.0`): the parse-failure guard is now pinned at the
   MODULE level, not just the helper.** 2.314.0 made a zero-entry CHANGELOG parse raise instead of
   skip. This asserts the failure actually **reaches the module's own checks** — with `_ENTRY_RE`

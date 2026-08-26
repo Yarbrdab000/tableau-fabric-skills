@@ -26,6 +26,7 @@ drop a check it did not evaluate.
 
 import json
 import os
+import re
 import sys
 
 import pytest
@@ -138,6 +139,66 @@ def test_it_flags_a_wrapper_over_a_stub_and_spares_one_over_a_live_base():
         "convention rather than resolving the value path")
     assert sc["checks"].get("typed_columns_in_header") is True, (
         "a check the re-run cannot evaluate was retracted by the merge")
+
+
+def test_the_wrap_site_passes_the_WRAPPED_parts_not_the_pre_wrap_dict():
+    """Pin the ARGUMENT, not just the call. A pin one level short is the next refactor's silent pass.
+
+    ``test_the_wrap_site_calls_the_recheck`` below asserts the re-check is *invoked* at the wrap site.
+    It is satisfied by ``_recheck_openability_after_wrap(res_report, res.get("parts"))`` -- the
+    **pre-wrap** dict -- which runs without error, evaluates a model in which the wrapper defect
+    cannot exist, and reports a clean verdict. That is the original defect restored, wearing the fix.
+
+    Invisible today because the shipped call is correct, which is exactly when a narrow pin costs
+    nothing and exactly why it gets written that way.
+    """
+    path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                        "scripts", "migrate_estate.py")
+    with open(path, encoding="utf-8") as fh:
+        text = fh.read()
+
+    # The DEFINITION line contains the same call shape --
+    # ``def _recheck_openability_after_wrap(res_report, wrapped_model_parts):`` -- and a plain
+    # ``re.search`` finds it FIRST, reading the parameter list instead of the argument list. The
+    # first version of this test did exactly that: it passed while the call site was injected with
+    # ``res.get("parts")``, i.e. it was one level short of the property it exists to protect, which
+    # is the very defect it was written to catch. Exclude the definition explicitly.
+    calls = [m for m in re.finditer(r"(?<!def )_recheck_openability_after_wrap\(([^)]*)\)", text)]
+    assert calls, (
+        "the re-check is never CALLED in migrate_estate.py -- only defined. A correct helper that "
+        "nothing invokes is the defect this release exists to fix, with the dial at zero.")
+    for m in calls:
+        args = [a.strip() for a in m.group(1).split(",")]
+        assert "wrapped_model_parts" in args, (
+            "the openability re-check is called with %r. It must receive the POST-wrap parts "
+            "(wrapped_model_parts); passing the pre-wrap dict runs clean and reports a verdict about "
+            "a model in which the defect cannot exist -- the original bug, restored behind the fix."
+            % args)
+
+
+def test_the_pre_wrap_and_post_wrap_dicts_give_DIFFERENT_verdicts():
+    """Prove the argument matters at all, so the pin above is not decoration.
+
+    If both dicts produced the same verdict there would be nothing for the call site to get wrong, and
+    every test here would pass over a distinction that does not exist. The pre-wrap model has no
+    wrapper; the post-wrap model has one forwarding into a ``BLANK()`` stub. They must disagree.
+    """
+    base = "table Facts\n\n\tmeasure 'Stub Base' = BLANK()\n\n\tcolumn Amount\n\t\tdataType: double\n"
+    wrapped = base + (
+        "\n\tmeasure 'Stub Base (filtered)' = CALCULATE([Stub Base], "
+        "FILTER('Facts', Facts[Amount] > 0))\n")
+
+    pre, post = {}, {}
+    for report, parts in ((pre, base), (post, wrapped)):
+        report["openability_selfcheck"] = _before(checks={"measure_value_path_not_blank": True})
+        me._recheck_openability_after_wrap(report, {"definition/tables/Facts.tmdl": parts})
+
+    pre_ok = pre["openability_selfcheck"]["checks"].get("measure_value_path_not_blank")
+    post_ok = post["openability_selfcheck"]["checks"].get("measure_value_path_not_blank")
+    assert pre_ok is not False, "the PRE-wrap model has no wrapper and must not fail this check"
+    assert post_ok is False, (
+        "the POST-wrap model forwards into a BLANK() stub and must fail -- if it does not, the "
+        "pre/post distinction is empty and the call-site pins above are measuring nothing")
 
 
 def test_the_wrap_site_calls_the_recheck():
