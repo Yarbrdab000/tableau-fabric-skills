@@ -1332,6 +1332,43 @@ only because someone asked for the reasoning each time instead of accepting "no"
 > **Ask a decline for its evidence exactly as you would a claim.** Optimising a process for artifacts
 > systematically deletes its best decisions.
 
+### An elimination is only as strong as the hypotheses its instrument can represent
+
+The undiagnosed red on the sibling gate was later swept: **every archived anchor state was checked
+against the predates-gate and none violates it.** That is a real result and it is *not* a diagnosis:
+
+> **A sweep over preserved states cannot see destruction, because destruction removes the state.** So
+> "0 archived states violate the gate" is **consistent with** a deleted anchor and is no evidence
+> against one — and a deleted anchor is exactly what caused the other red.
+
+The instrument's blind spot is the confirmed cause. Which upgrades the earlier rule — *a gate that can
+only report an absence must also prove it looked* — to its mirror: **an instrument that reads what
+survives can never rule out what was destroyed.** Report such a result as an **elimination with its
+untested hypothesis named**, never as a cause.
+
+**Verifying that sweep took three attempts, and the first two failed the same way the file's central
+class describes** — which is worth recording precisely because it happened inside the check written to
+confirm someone else's care:
+
+```
+attempt 1  swept refs/tags/archive wholesale        -> 4 VIOLATIONS, all false
+           archive/ holds archived ANCHORS *and* archived COMMITS; a commit's name
+           records the version it SHIPPED, so the anchor predicate does not apply
+attempt 2  classified by regex, swept anchors only  -> 16 checked, 0 violations
+           but the classifier required `pre-v` after `/` or `anchor-`, so it silently
+           dropped `archive/original-pre-v2.317.0-precollision`, a genuine anchor
+attempt 3  17 archived anchors, 0 violations        -> the honest figure
+```
+
+**Two contaminated populations and one under-inclusive one, in three consecutive scripts, all written
+to check a finding about populations.** Neither error changed the verdict, which is the danger: a
+population bug that leaves the answer intact leaves nothing to notice. The first was visible only
+because four "violations" were implausible; **the second produced no anomaly at all** and was found
+only by listing what the classifier had excluded.
+
+> **After filtering a population, print what you EXCLUDED, not only what you kept.** The kept set looks
+> correct by construction; the excluded set is where a wrong boundary shows.
+
 ### When the rules pay, and the one time it was before the fact
 
 One further note on *when* they pay. Almost every catch recorded here was **retrospective** — an
