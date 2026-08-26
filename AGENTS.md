@@ -1318,6 +1318,27 @@ because the checking was supposedly over. **A summary is unchecked by constructi
 numbers go once nobody is looking at them any more. Write *"this kept happening"*: it costs nothing
 and cannot be wrong.
 
+**A second instance landed minutes later, from the other direction, and it was a credit rather than a
+count.** A closing message said of a lane *"you found both of your own wrongs"*. The record showed one
+joint and one found entirely by someone else — **zero self-caught**. The lane handed the credit back:
+
+> *accepting it would have been a wrong ledger entry in the message closing a day spent on wrong
+> ledger entries.*
+
+**Attributions are the most fragile summary claim, because they are the only kind with no artifact to
+check against.** A count has a population you can re-measure; a credit exists only in a transcript,
+and a transcript is the transient sink this file already warns about. Four attribution errors were
+made and corrected across one session — a finding credited to the wrong lane, a rule credited in the
+wrong direction, a version number taken as handed back, and this one.
+
+> **Check an attribution against the record before writing it, exactly as you would a number** — and
+> prefer the ungenerous version, because **a flattering summary is the one nobody will contest.**
+
+The correction also *strengthened* the claim it corrected: *"knowing a failure mode in detail provides
+no protection against committing it ninety seconds later"* is better supported by **"neither party
+self-caught anything"** than by "we each caught our own". The generous version was quietly arguing
+against the point it was closing.
+
 ### A decline is unfalsifiable unless the decliner shows their work
 
 The most valuable single act recorded here produced **no code, no test, and no version number**: a lane
