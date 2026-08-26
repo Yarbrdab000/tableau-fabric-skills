@@ -14,6 +14,28 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ### Added
 
+- **`tableau-migration` (skill `2.318.0` → `2.319.0`): the call-site pin now says which rung it does
+  NOT cover, in the file a reader assesses coverage from.**
+
+  Pinning a call site has three rungs and 2.317.0 shipped two: **text** (the call is written — cannot
+  distinguish *written* from *written and then bypassed*) and **argument** (the right thing is passed
+  — cannot see a caller that stops calling). **A call wrapped in a condition that stops being true
+  satisfies both assertions and executes nothing.**
+
+  The third, **artifact** — asserting `openability_selfcheck.rechecked_after_row_predicate_wrap` on a
+  real build — is deliberately absent, **and the reason is not cost**: the suite has no build, so a
+  pytest version would have to SKIP when no artifact is present, which is precisely the
+  absent-vs-unparsed conflation `test_changelog_parse_is_not_vacuous` exists to remove. It would
+  reintroduce that defect in the file that fixes it.
+
+  **The reasoning already existed — in session notes, where no reader of the tests would find it.**
+  Three green tests read as full coverage, and the scoping decision that makes them two-thirds of a
+  ladder was recorded somewhere the repo does not carry. That is this session's own recurring defect
+  aimed at itself: **the disclosure existed, was correct, and was in the wrong place.**
+
+  Docstring only; no behaviour change. Gap named by a parallel session, which noted it was probably a
+  scoping call rather than an oversight and asked for it to be written down either way.
+
 - **`tableau-migration` (skill `2.317.0` → `2.318.0`): the post-wrap merge's two unstated contracts
   are now pinned — it must not mutate the recorded verdict, and a clean wrap must degrade nothing.**
 

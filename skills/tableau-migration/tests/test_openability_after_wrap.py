@@ -22,6 +22,24 @@ trading a false pass for a false *absence*, which is the same class of defect on
 
 So: a post-wrap pass may FAIL a build that passed; it must never PASS one that failed, and must never
 drop a check it did not evaluate.
+
+WHAT THESE TESTS DO NOT COVER, stated here because three green tests read as full coverage and are
+not. Pinning a call site has three rungs, and only two are here:
+
+* **text** -- the call is WRITTEN (``test_the_wrap_site_calls_the_recheck``). Cannot distinguish
+  *written* from *written and then bypassed*.
+* **argument** -- the RIGHT THING is passed
+  (``test_the_wrap_site_passes_the_WRAPPED_parts_not_the_pre_wrap_dict``). Cannot see a caller that
+  stops calling: **a call wrapped in a condition that stops being true satisfies both assertions and
+  executes nothing.**
+* **artifact** -- it RAN. Asserting ``openability_selfcheck.rechecked_after_row_predicate_wrap`` on a
+  real build. **DELIBERATELY ABSENT, and the reason is not cost.** The suite has no build, so a pytest
+  version would have to SKIP when no artifact is present -- which is precisely the absent-vs-unparsed
+  conflation that ``test_changelog_parse_is_not_vacuous`` exists to remove. Adding it here would
+  reintroduce that defect in the file that fixes it.
+
+Assert the artifact rung where builds happen -- the estate/corpus definition-of-done -- and never in
+this suite. Do not add a skipping version and believe it closes the gap.
 """
 
 import json
