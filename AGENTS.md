@@ -1293,6 +1293,45 @@ later run reports 328 / 465. That is not a discrepancy — a release landed betw
 **Denominators move while you are quoting them**, the same property as a version number in a message,
 and the defence is to date the measurement rather than to reconcile it.
 
+### An UNDEFINED population is a different defect from a wrong one
+
+Almost everything above is *correct predicate over the **wrong** population* — the population existed
+and the probe measured a different one. There is a harder sibling:
+
+```
+wrong population      a boundary exists; naming it exposes the error
+undefined population  no boundary exists; nothing can be checked against
+```
+
+A closing summary here claimed **"eleven instances between us"** of the wrong-population class. The
+number was never computable: *is the string-vs-semver probe one instance or two? does an injection
+harness matching a `def` line count separately from the injection script that made the same mistake
+two minutes earlier?* **No answer is wrong, because no population was ever defined.**
+
+> **A count whose population needs an argument should not be published.** A wrong population can be
+> caught by naming it; an undefined one can only be caught by someone asking *"what did you count?"* —
+> and nobody asks that of a summary.
+
+**Which is the half with teeth: the tally was written in the SUMMARY, not in the work.** Every
+verification habit in this file was applied to the analysis and none of it to the closing paragraph,
+because the checking was supposedly over. **A summary is unchecked by construction** — it is where
+numbers go once nobody is looking at them any more. Write *"this kept happening"*: it costs nothing
+and cannot be wrong.
+
+### A decline is unfalsifiable unless the decliner shows their work
+
+The most valuable single act recorded here produced **no code, no test, and no version number**: a lane
+declined an obvious emitter fix four times, having established it would have stripped `FILTER(` from
+55 projections across 39 visuals — **and the report would have looked *more* correct afterwards,
+because the labels would finally have agreed.**
+
+That decision is invisible to every measurement available: green suite, clean validation, a
+better-looking artifact. **A rejected fix leaves no artifact at all**, so it survives in the record
+only because someone asked for the reasoning each time instead of accepting "no".
+
+> **Ask a decline for its evidence exactly as you would a claim.** Optimising a process for artifacts
+> systematically deletes its best decisions.
+
 ### When the rules pay, and the one time it was before the fact
 
 One further note on *when* they pay. Almost every catch recorded here was **retrospective** — an
