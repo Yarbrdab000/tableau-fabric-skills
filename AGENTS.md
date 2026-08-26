@@ -824,6 +824,14 @@ Everything else is a description of how these failures look afterwards. Useful f
 unreliable as a defence, because **the check is cheapest exactly when you are most sure you do not need
 it.**
 
+The four share a property the list does not make obvious, and it is the reason they work: **each one
+fails LOUDLY when the probe is broken.** `assert non-empty` raises; the expected-number assertion
+raises; a printed population is visibly wrong to a reader; and importing the engine's tested reader
+means there is no probe left to be wrong. **Every rule that requires noticing fails silently** — the
+count is plausible, the zero is well-formed, the skip is one line in an already non-zero total. That
+is the whole distinction: a rule you must remember to apply protects nothing at the moment you are
+confident, and a rule that crashes protects you whether or not you were paying attention.
+
 One further note on *when* they pay. Almost every catch recorded here was **retrospective** — an
 artifact already existed and someone measured it. Exactly one landed **before the action**: a version
 number about to be taken would have left a hole in the release chain, and the cheaper-looking escape
