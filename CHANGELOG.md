@@ -14,6 +14,33 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ### Added
 
+- **`tableau-migration` (skill `2.315.0` → `2.316.0`): the parse-failure guard is now pinned at the
+  MODULE level, not just the helper.** 2.314.0 made a zero-entry CHANGELOG parse raise instead of
+  skip. This asserts the failure actually **reaches the module's own checks** — with `_ENTRY_RE`
+  neutered, they must report an *assertion*, not a *skip*.
+
+  **Asserting only that `_entries()` raises proves the helper is loud; it does not prove the gate
+  fails.** The injection that motivated 2.314.0 produced **6 passed** — a green module over a parser
+  that had matched nothing — so the property worth pinning is what the suite would have shown.
+  Verified in both directions: green with the guard present, and **red** when the sentinel is neutered
+  to reproduce the pre-2.314.0 behaviour.
+
+  **Written by the measure-value-colouring session**, which shipped it as its own 2.314.0 twenty-one
+  minutes before this branch shipped a different 2.314.0 with the same guard — the second
+  same-number collision of the day, both caused by the integrator taking a number that had been
+  allocated to a lane. **The signal was there and was misread**: `rollback/pre-v2.314.0` already
+  existed, cut by that lane fifteen minutes earlier, and it was archived and re-pointed as stale
+  bookkeeping rather than read as *"a lane is mid-release on this number."*
+
+  Two of that file's three tests duplicated coverage that had landed independently here and were
+  coupled to the other lane's exact assertion wording; only the third is unique and it is the one that
+  matters. Its function enumeration was widened to filter by signature rather than by name, so tests
+  taking fixtures are not called bare — which also keeps it working as that module grows.
+
+  Recorded from its docstring because it nearly shipped: **the first draft of that test routed through
+  a subprocess and an env-var hook, and would have SKIPPED whenever the hook was absent — a test that
+  cannot fail, added to fix a check that could not fail.**
+
 - **`tableau-migration` (skill `2.314.0` → `2.315.0`): the label-agreement invariant comment in
   `_apply_override` is scoped to what it actually measured.** It claimed *"`Property`, `queryRef` and
   `nativeQueryRef` can never disagree about the name — a mismatch between them renders an error
