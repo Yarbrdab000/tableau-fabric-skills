@@ -551,24 +551,52 @@ find the tag present — it had been cut *between the test reading the namespace
 `git for-each-ref --sort=-taggerdate refs/tags/rollback` and re-run the test.** A green suite and a red
 suite can both be correct answers about the same commit, and the difference is only *when you looked*.
 
-Do not "fix" the flake by loosening the gate — reading the shared namespace *is* its purpose. Close
-the window at the source instead, which is procedural:
+Do not "fix" the flake by loosening the gate — reading the shared namespace *is* its purpose.
 
-> **Cut the anchor BEFORE the release commit lands, so the window is negative rather than merely short.**
+**Both observed instances were about the namespace and neither was about the branch under test.** One
+was pure timing. The other was a **real deletion**: a lane had created a tag of the same name for its
+own release, mine later overwrote it (shared ref, last writer wins), and when that lane retired its
+duplicate it deleted "its own unused anchor" — by then my object, pointing at my release. **The gate
+caught it; nobody noticed otherwise.** So refine rather than dismiss:
 
-**Measured over 14 consecutive releases: 13 have a negative window** (anchor cut 14–349 s *before* its
-release commit) **and exactly one is positive — 735 s, twelve minutes of a gate that any lane could
-have hit.** The outlier is the informative part:
+> **A red anchor gate is a reliable verdict about the shared namespace and a poor signal about your
+> own branch.** Re-read the namespace before concluding anything about a lane.
 
-> **The one release with an open window was the one handled OFF-SCRIPT** — a collision renumber, done
-> by hand because the number was contested. The normal path cuts the anchor first because a script
-> does it; the exceptional path skipped the step, and its anchor was backfilled 7 minutes *after the
-> next release's anchor*, out of order.
+**The rule "never delete an anchor you didn't create" does not protect this, and the lane checked.**
+It *had* created a tag by that name, so authorship said "mine" — the name was theirs and the object
+was not. A name you created can silently become someone else's:
 
-**The exceptional path drops the guarantees the normal path automates, and the exceptional path is
-where the stakes are highest** — a contested number is precisely the case an anchor exists for. When a
-release goes off-script for any reason (collision, renumber, reconciliation), walk the steps
-explicitly; do not assume the ones you would have gotten for free.
+> **Never delete a shared anchor without re-reading its CURRENT target.** Authorship of the name is
+> not ownership of the object.
+
+### A tagger date is not a creation date
+
+**I got the cause of that window wrong and wrote a general rule on top of it.** Measuring anchor-cut
+times against release-commit times gave 13 negative windows and one positive (+735 s), and I concluded
+the outlier was "handled off-script — a collision renumber done by hand, so the step was skipped." It
+reads well and it is **false**. Two artifacts decide it:
+
+```
+ship_2317.py                            EXISTS -- that release used the SAME script as the others
+tag message "Pre-v2.317.0 anchor (...)" my format, my wording, restored verbatim by the other lane
+tagger date 17:38:15                    the RESTORE, not the cut
+```
+
+The anchor was cut on-script like every other one, deleted by another lane, and recreated. **A tag is
+a mutable name: recreating it resets the tagger date, so that field records the last write, not the
+first.** I read it as a creation date and inferred a *procedure* from it — the same error this file
+already names one section up (*a measurement of an artifact cannot tell you the intent of the code
+that produced it*), committed seven minutes after writing that sentence down.
+
+**Consequences, kept separate because they decay differently:**
+
+* The **table stands** as far as it goes — 14 windows, 13 negative — but only under the assumption
+  that no tag was recreated, which is exactly what failed for the fourteenth. Report it as *"when the
+  current tag object was written"*, never as *"when the anchor was cut"*.
+* **The generalisation is withdrawn.** "The exceptional path drops the guarantees the normal path
+  automates" is plausible, is probably true, and **had no support from the one case cited for it.**
+  A rule of that shape is the dangerous kind: it sounds earned, and a reader has no way to tell that
+  its evidence evaporated.
 
 **A footnote on the probe that measured this, because it is the same class one layer up:** its
 "anchors whose target already stamps ≥ its own version" check reported two defects, both false.
@@ -576,6 +604,9 @@ It compared versions **as strings** — `"2.9.0" >= "2.10.0"` is `True` lexicall
 `2.10.0` and `2.100.0`, the only two anchors in 341 where semver and lexical order disagree. Correct
 predicate, wrong comparison; and it produced a *plausible* two rather than an absurd number. Compare
 versions as tuples of ints, never as strings.
+
+**Cut the anchor before the release commit lands** regardless — it is what the scripts already do, and
+it costs nothing. Just do not cite the measurement above as evidence that anyone ever failed to.
 
 **Handing a number back is two-sided, and both halves failed here at once:**
 
