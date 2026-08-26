@@ -165,9 +165,14 @@ _CI_CAT = "<column-instance column='[Category]' derivation='None' name='[none:Ca
 _CI_REGION = "<column-instance column='[Region]' derivation='None' name='[none:Region:nk]' pivot='key' type='nominal' />"
 _CI_SUM_SALES = "<column-instance column='[Sales]' derivation='Sum' name='[sum:Sales:qk]' pivot='key' type='quantitative' />"
 _CI_SUM_PROFIT = "<column-instance column='[Profit]' derivation='Sum' name='[sum:Profit:qk]' pivot='key' type='quantitative' />"
+# AVG of the SAME field as _CI_SUM_SALES. A sum and an average of one column differ by roughly the
+# row count, so the pair is on two magnitude scales BY CONSTRUCTION -- which is the shape that makes
+# a same-family dual axis a genuine two-axis combo rather than an overlapping-bar overlay.
+_CI_AVG_SALES = "<column-instance column='[Sales]' derivation='Avg' name='[avg:Sales:qk]' pivot='key' type='quantitative' />"
 _CI_MONTH_DATE = "<column-instance column='[Order Date]' derivation='Month' name='[mn:Order Date:ok]' pivot='key' type='ordinal' />"
 _CI_STATE = "<column-instance column='[State]' derivation='None' name='[none:State:nk]' pivot='key' type='nominal' />"
 _INST = _CI_CAT + _CI_REGION + _CI_SUM_SALES + _CI_SUM_PROFIT + _CI_MONTH_DATE + _CI_STATE
+_INST_AVG = _INST + _CI_AVG_SALES
 
 
 def _visual_parts(parts):
@@ -408,9 +413,17 @@ def test_two_measures_same_mark_stay_clustered_not_combo():
     # earlier index-only spelling here was therefore a shape Tableau does not emit for this case, and
     # relying on it is what let a trellis whose first column is internally dual collapse into one
     # combo chart.
+    #
+    # THE MEASURE PAIR IS SUM(Sales) + AVG(Sales), matching the real sheet named above. It used to be
+    # SUM(Sales) + SUM(Profit), which is a DIFFERENT shape from the one this test's own comment cites
+    # as its evidence: two aggregations of ONE field are two scales by construction, whereas two
+    # different fields are the overlapping-bar ("lipstick") idiom and must stay a clustered chart
+    # (see test_dual_axis_over_different_fields_is_an_overlay_not_a_combo). Verified at the artifact
+    # rather than the fixture -- 0085 "Small Bar (2)" and 0062 "Solution" (a Pareto) both still parse
+    # to `combo`, so the render-verified behaviour this test protects is unchanged.
     style = (
         "<style><style-rule element='axis'>"
-        "<encoding attr='space' class='0' field='[federated.abc].[sum:Profit:qk]' "
+        "<encoding attr='space' class='0' field='[federated.abc].[avg:Sales:qk]' "
         "field-type='quantitative' fold='true' scope='rows' synchronized='true' type='space' />"
         "</style-rule></style>")
     panes = (
@@ -418,19 +431,20 @@ def test_two_measures_same_mark_stay_clustered_not_combo():
         "<pane><mark class='Bar' /></pane>"
         "<pane id='1' y-axis-name='[federated.abc].[sum:Sales:qk]'>"
         "<mark class='Bar' /></pane>"
-        "<pane id='2' y-axis-name='[federated.abc].[sum:Profit:qk]'>"
+        "<pane id='2' y-axis-name='[federated.abc].[avg:Sales:qk]'>"
         "<mark class='Bar' /></pane>"
         "</panes>")
     ws = _combo_worksheet(
         "Both Bars",
-        rows="([federated.abc].[sum:Sales:qk] + [federated.abc].[sum:Profit:qk])",
+        rows="([federated.abc].[sum:Sales:qk] + [federated.abc].[avg:Sales:qk])",
         cols="[federated.abc].[mn:Order Date:ok]",
-        panes=panes, deps_extra=_INST, style=style)
+        panes=panes, deps_extra=_INST_AVG, style=style)
     w = parse_twb(_workbook(ws))["worksheets"][0]
     assert w["visual_type"] == "combo"
-    # shelf order decides which axis is secondary: Tableau writes the primary first
-    assert [f["caption"] for f in w["combo_split"]["Y"]] == ["Sales"]
-    assert [f["caption"] for f in w["combo_split"]["Y2"]] == ["Profit"]
+    # shelf order decides which axis is secondary: Tableau writes the primary first. Both captions
+    # are "Sales" here (one field, two aggregations), so assert on the INSTANCE token.
+    assert [f["instance"] for f in w["combo_split"]["Y"]] == ["sum:Sales:qk"]
+    assert [f["instance"] for f in w["combo_split"]["Y2"]] == ["avg:Sales:qk"]
 
 
 def test_a_trellis_whose_column_is_internally_dual_still_splits():
@@ -523,9 +537,13 @@ def test_folded_axis_is_the_dual_axis_marker_when_no_index_is_written():
     #   <style-rule element='axis'>
     #     <encoding attr='space' field='[...avg:Sales...]' fold='true' scope='rows'
     #               synchronized='true' type='space' />
+    #
+    # The fixture now uses that sheet's actual measure pair (SUM + AVG of ONE field). It previously
+    # wrote sum:Sales + sum:Profit, contradicting the `avg:Sales` in this very comment -- and two
+    # different fields is the overlapping-bar shape, which is deliberately NOT a combo.
     style = (
         "<style><style-rule element='axis'>"
-        "<encoding attr='space' class='0' field='[federated.abc].[sum:Profit:qk]' "
+        "<encoding attr='space' class='0' field='[federated.abc].[avg:Sales:qk]' "
         "field-type='quantitative' fold='true' scope='rows' synchronized='true' type='space' />"
         "</style-rule></style>")
     panes = (
@@ -533,18 +551,18 @@ def test_folded_axis_is_the_dual_axis_marker_when_no_index_is_written():
         "<pane><mark class='Bar' /></pane>"
         "<pane id='1' y-axis-name='[federated.abc].[sum:Sales:qk]'>"
         "<mark class='Bar' /></pane>"
-        "<pane id='2' y-axis-name='[federated.abc].[sum:Profit:qk]'>"
+        "<pane id='2' y-axis-name='[federated.abc].[avg:Sales:qk]'>"
         "<mark class='Bar' /></pane>"
         "</panes>")
     ws = _combo_worksheet(
         "Folded Dual Axis",
-        rows="([federated.abc].[sum:Sales:qk] + [federated.abc].[sum:Profit:qk])",
+        rows="([federated.abc].[sum:Sales:qk] + [federated.abc].[avg:Sales:qk])",
         cols="[federated.abc].[mn:Order Date:ok]",
-        panes=panes, deps_extra=_INST, style=style)
+        panes=panes, deps_extra=_INST_AVG, style=style)
     w = parse_twb(_workbook(ws))["worksheets"][0]
     assert w["visual_type"] == "combo"
-    assert [f["caption"] for f in w["combo_split"]["Y"]] == ["Sales"]
-    assert [f["caption"] for f in w["combo_split"]["Y2"]] == ["Profit"]
+    assert [f["instance"] for f in w["combo_split"]["Y"]] == ["sum:Sales:qk"]
+    assert [f["instance"] for f in w["combo_split"]["Y2"]] == ["avg:Sales:qk"]
 
 
 def test_two_measures_same_mark_WITHOUT_a_dual_axis_stay_clustered():
@@ -10009,3 +10027,216 @@ def test_a_single_mark_map_does_not_claim_a_layer_collapse():
     ir = parse_twb(_workbook(_geo_ws("Profit by State", "Automatic", enc)))
     emit_pbir(ir)
     assert not any("mark layer" in w["reason"] for w in ir["warnings"])
+
+
+# ---------------------------------------------------------------------------------------------
+# Tableau's overlapping-bar ("lipstick") idiom -> a clustered chart with the layout Overlap card
+# and a front-series transparency. See _lipstick_overlap_objects / _is_scale_pair.
+# ---------------------------------------------------------------------------------------------
+
+_LIP_STYLE = (
+    "<style><style-rule element='axis'>"
+    "<encoding attr='space' class='0' field='[federated.abc].[{fold}]' "
+    "field-type='quantitative' fold='true' scope='{scope}' synchronized='true' type='space' />"
+    "</style-rule></style>")
+
+
+def _lipstick_ws(name, horizontal=False, first="sum:Sales:qk", second="sum:Profit:qk",
+                 deps=None):
+    """A dual-axis Bar+Bar sheet. ``horizontal`` puts the measures on Cols (a bar chart).
+
+    The fold NAMES THE SECOND measure -- that is what makes it the secondary axis. An earlier
+    version of this helper hardcoded ``sum:Profit`` there, so any fixture overriding ``second``
+    folded a field that was not on the shelf and silently stopped being a dual axis at all.
+    """
+    pair = "([federated.abc].[{0}] + [federated.abc].[{1}])".format(first, second)
+    cat = "[federated.abc].[none:Category:nk]"
+    axis = "x" if horizontal else "y"
+    panes = (
+        "<panes>"
+        "<pane><mark class='Bar' /></pane>"
+        "<pane id='1' {a}-axis-name='[federated.abc].[{f}]'><mark class='Bar' /></pane>"
+        "<pane id='2' {a}-axis-name='[federated.abc].[{s}]'><mark class='Bar' /></pane>"
+        "</panes>").format(a=axis, f=first, s=second)
+    return _combo_worksheet(
+        name,
+        rows=(cat if horizontal else pair),
+        cols=(pair if horizontal else cat),
+        panes=panes,
+        deps_extra=(deps if deps is not None else _INST),
+        style=_LIP_STYLE.format(fold=second, scope=("cols" if horizontal else "rows")))
+
+
+def test_dual_axis_over_different_fields_is_an_overlay_not_a_combo():
+    # THE HEADLINE BEHAVIOUR. Two different measures on one folded axis, both drawn as Bars, is
+    # Tableau's overlapping-bar idiom -- not a two-scale combo. Before this it was promoted to
+    # lineClusteredColumnComboChart, which cost the second measure its mark type entirely.
+    w = parse_twb(_workbook(_lipstick_ws("Lipstick")))["worksheets"][0]
+    assert w["visual_type"] == "column"
+    assert w["lipstick_overlap"] is True
+    assert w["combo_split"] is None
+    assert "overlapping bars" in (w["fidelity_note"] or "")
+
+
+def test_a_horizontal_overlay_keeps_its_orientation():
+    # Measures on COLS is a horizontal bar chart. The combo route would have rotated it, because
+    # Power BI's only combo draws its columns vertically -- so this lost the orientation as well as
+    # the mark type. Also the regression guard for the ws-dict ``dual_axis`` field, which used to be
+    # read on the y axis only and so reported False for every horizontal dual axis.
+    w = parse_twb(_workbook(_lipstick_ws("Lipstick H", horizontal=True)))["worksheets"][0]
+    assert w["visual_type"] == "bar"
+    assert w["dual_axis"] is True, "the ws-dict dual_axis field must be read on the measure shelf"
+    assert w["lipstick_overlap"] is True
+
+
+def test_two_aggregations_of_one_field_stay_a_two_scale_combo():
+    # The other side of the discriminator, and the case the overlay must never swallow: SUM and AVG
+    # of the SAME field are on different magnitude scales by construction, so they keep the combo.
+    w = parse_twb(_workbook(_lipstick_ws(
+        "Sum vs Avg", second="avg:Sales:qk", deps=_INST_AVG)))["worksheets"][0]
+    assert w["visual_type"] == "combo"
+    assert w["lipstick_overlap"] is False
+
+
+def test_a_single_measure_dual_axis_is_not_an_overlay():
+    # Nothing to overlap: one measure drawn on two axes is the lollipop / filled-line family, which
+    # has its own routes. A guard that fires here would hijack them.
+    w = parse_twb(_workbook(_lipstick_ws(
+        "Same Measure", second="sum:Sales:qk")))["worksheets"][0]
+    assert w["lipstick_overlap"] is False
+
+
+def test_a_non_dual_two_measure_bar_chart_is_not_an_overlay():
+    # No fold => no second axis => an ordinary clustered chart. Overlapping THAT would silently hide
+    # one series behind the other.
+    pair = "([federated.abc].[sum:Sales:qk] + [federated.abc].[sum:Profit:qk])"
+    panes = ("<panes>"
+             "<pane><mark class='Bar' /></pane>"
+             "<pane id='1' y-axis-name='[federated.abc].[sum:Sales:qk]'><mark class='Bar' /></pane>"
+             "<pane id='2' y-axis-name='[federated.abc].[sum:Profit:qk]'><mark class='Bar' /></pane>"
+             "</panes>")
+    ws = _combo_worksheet("No Fold", rows=pair, cols="[federated.abc].[none:Category:nk]",
+                          panes=panes, deps_extra=_INST, style="")
+    w = parse_twb(_workbook(ws))["worksheets"][0]
+    assert w["lipstick_overlap"] is False
+    assert w["visual_type"] == "column"
+
+
+def test_the_overlay_emits_the_overlap_card_and_a_front_series_transparency():
+    # THE EMITTED ARTIFACT, not just the parse flag: the layout Overlap card, 100% series spacing,
+    # and exactly one scoped transparency naming the FRONT (second) projection.
+    ir = parse_twb(_workbook(_lipstick_ws("Lipstick")))
+    parts = emit_pbir(ir)
+    vis = list(_visual_parts(parts).values())
+    assert len(vis) == 1, "expected ONE overlaid visual, got %d" % len(vis)
+    v = vis[0]["visual"]
+    assert v["visualType"] == "clusteredColumnChart"
+
+    layout = v["objects"]["layout"][0]["properties"]
+    assert layout["clusteredGapOverlaps"]["expr"]["Literal"]["Value"] == "true"
+    assert layout["clusteredGapSize"]["expr"]["Literal"]["Value"] == "100D"
+
+    projs = v["query"]["queryState"]["Y"]["projections"]
+    assert len(projs) == 2, "both measures must stay on ONE shelf"
+    front = projs[1]["queryRef"]
+
+    scoped = [o for o in v["objects"]["dataPoint"]
+              if "fillTransparency" in o.get("properties", {}) and o.get("selector")]
+    assert len(scoped) == 1, "exactly one series is made translucent, got %d" % len(scoped)
+    assert scoped[0]["selector"]["metadata"] == front, (
+        "the transparency must name the FRONT series -- it is the one that can occlude")
+    assert scoped[0]["properties"]["fillTransparency"]["expr"]["Literal"]["Value"] == "61D"
+
+
+def test_the_front_series_transparency_follows_shelf_order():
+    # Z-ORDER IS PROJECTION ORDER. Swapping the pills swaps which series is in front, so the
+    # transparency must move with it -- otherwise the reversed variation paints the wrong bar and
+    # the back series can be completely hidden.
+    ir = parse_twb(_workbook(_lipstick_ws(
+        "Reversed", first="sum:Profit:qk", second="sum:Sales:qk")))
+    v = list(_visual_parts(emit_pbir(ir)).values())[0]["visual"]
+    projs = v["query"]["queryState"]["Y"]["projections"]
+    assert [p["queryRef"] for p in projs] == ["Sum(Orders.Profit)", "Sum(Orders.Sales_Amount)"]
+    scoped = [o for o in v["objects"]["dataPoint"]
+              if "fillTransparency" in o.get("properties", {}) and o.get("selector")]
+    assert [o["selector"]["metadata"] for o in scoped] == ["Sum(Orders.Sales_Amount)"]
+
+
+def test_the_overlay_transparency_survives_a_flat_mark_colour():
+    # The scoped transparency is APPENDED to dataPoint, never assigned over it. The flat mark colour
+    # writes dataPoint by assignment, so emitting the transparency first would have it silently
+    # dropped -- and the report would still validate and still render, just with the back series
+    # hidden, which is the exact defect this rebuild prevents.
+    ws = _lipstick_ws("Coloured").replace(
+        "<pane><mark class='Bar' /></pane>",
+        "<pane><mark class='Bar' /><style><style-rule element='mark'>"
+        "<format attr='mark-color' value='#f28e2b' /></style-rule></style></pane>")
+    v = list(_visual_parts(emit_pbir(parse_twb(_workbook(ws)))).values())[0]["visual"]
+    dp = v["objects"]["dataPoint"]
+    assert any("defaultColor" in o.get("properties", {}) for o in dp), "flat mark colour lost"
+    scoped = [o for o in dp if "fillTransparency" in o.get("properties", {}) and o.get("selector")]
+    assert len(scoped) == 1, "the scoped transparency was clobbered by the mark colour"
+
+
+def test_an_overlay_is_not_fanned_into_a_measure_trellis():
+    # A dual axis is ONE overlaid pane. The trellis guard reads the ws-dict ``dual_axis`` field, so a
+    # horizontal overlay whose field was mis-read came back as N side-by-side charts: measured, 8
+    # horizontal sheets became 16 visuals.
+    ir = parse_twb(_workbook(_lipstick_ws("H Overlay", horizontal=True)))
+    vis = _visual_parts(emit_pbir(ir))
+    assert len(vis) == 1, "a dual axis must stay ONE visual, got %d" % len(vis)
+    assert list(vis.values())[0]["visual"]["visualType"] == "clusteredBarChart"
+
+def test_an_overlay_colours_each_series_from_its_own_pane():
+    # Tableau colours each overlaid series on ITS OWN PANE. Collapsing that to one worksheet-wide
+    # colour painted both bars the same orange, leaving transparency as the only separator -- caught
+    # at the render, invisible to every structural check.
+    ws = _lipstick_ws("Two Colours")
+    ws = ws.replace(
+        "<pane id='2' y-axis-name='[federated.abc].[sum:Profit:qk]'><mark class='Bar' /></pane>",
+        "<pane id='2' y-axis-name='[federated.abc].[sum:Profit:qk]'><mark class='Bar' />"
+        "<style><style-rule element='mark'>"
+        "<format attr='mark-color' value='#f28e2b' /></style-rule></style></pane>")
+    v = list(_visual_parts(emit_pbir(parse_twb(_workbook(ws)))).values())[0]["visual"]
+    fills = {}
+    for o in v["objects"]["dataPoint"]:
+        sel = (o.get("selector") or {}).get("metadata")
+        f = (o.get("properties") or {}).get("fill")
+        if sel and f:
+            fills[sel] = f["solid"]["color"]["expr"]["Literal"]["Value"]
+    assert fills.get("Sum(Orders.Profit)") == "'#f28e2b'", (
+        "the pane's own mark colour must reach that series: %s" % fills)
+    assert len(set(fills.values())) == len(fills), (
+        "two overlaid series must not share a colour: %s" % fills)
+
+
+def test_an_overlay_never_leaves_two_series_the_same_colour():
+    # THE PALETTE COLLISION. Power BI colours an unset series by its POSITION in the theme palette,
+    # and the emitted Tableau palette is the same list the author picked from -- so setting series 0
+    # to #F28E2B (the palette's SECOND entry) made series 1 default to that exact colour and both
+    # overlapping bars rendered orange. Every series is therefore coloured explicitly once any of
+    # them is, filling gaps from the palette skipping colours already taken.
+    ws = _lipstick_ws("Collision").replace(
+        "<pane id='1' y-axis-name='[federated.abc].[sum:Sales:qk]'><mark class='Bar' /></pane>",
+        "<pane id='1' y-axis-name='[federated.abc].[sum:Sales:qk]'><mark class='Bar' />"
+        "<style><style-rule element='mark'>"
+        "<format attr='mark-color' value='#f28e2b' /></style-rule></style></pane>")
+    v = list(_visual_parts(emit_pbir(parse_twb(_workbook(ws)))).values())[0]["visual"]
+    fills = [(o["selector"]["metadata"],
+              o["properties"]["fill"]["solid"]["color"]["expr"]["Literal"]["Value"])
+             for o in v["objects"]["dataPoint"]
+             if o.get("selector") and "fill" in (o.get("properties") or {})]
+    assert len(fills) == 2, "both series must carry an explicit fill, got %s" % fills
+    assert fills[0][1] == "'#f28e2b'"
+    assert fills[1][1] != fills[0][1], "series 1 collided with the explicit colour: %s" % fills
+
+
+def test_an_uncoloured_overlay_keeps_the_theme_colours():
+    # No pane colour anywhere => nothing is forced, so the theme still supplies BOTH series. Emitting
+    # explicit fills here would silently override a report theme nobody asked us to override.
+    v = list(_visual_parts(emit_pbir(parse_twb(_workbook(_lipstick_ws("Plain"))))).values())[0]["visual"]
+    fills = [o for o in v["objects"]["dataPoint"] if "fill" in (o.get("properties") or {})]
+    assert not fills, "no pane colour was set, so no fill should be emitted: %s" % fills
+    scoped = [o for o in v["objects"]["dataPoint"]
+              if "fillTransparency" in (o.get("properties") or {})]
+    assert len(scoped) == 1, "the front-series transparency still applies"

@@ -14,6 +14,36 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ### Fixed
 
+- **`tableau-migration` (skill `2.320.0` → `2.321.0`): Tableau's overlapping-bar ("lipstick")
+  idiom now rebuilds as a clustered bar/column instead of a combo.** Two same-family measures
+  folded onto one axis were promoted to `lineClusteredColumnComboChart`, which turned the second
+  series into a LINE and -- for a measures-on-Cols sheet -- rotated the chart, because Power BI's
+  only combo draws its columns vertically. Measured on a 16-sheet dual-axis workbook: 16/16
+  promoted, 8 of them also rotated. Such a sheet now keeps both measures on `Y` and carries the
+  layout Overlap card (`clusteredGapOverlaps` + `clusteredGapSize` at 100 per cent) plus a scoped
+  `dataPoint.fillTransparency` on the FRONT series. Z-order needs no translation -- Tableau draws
+  the first pill behind and so does Power BI -- so preserving shelf order preserves front/back.
+  The transparency goes on the FRONT series always: overlap makes total occlusion possible, and of
+  Tableau's three escapes (length, per-series width, transparency) Power BI has no per-series bar
+  width at all while length is a property of the data, so the front series is the only one
+  decidable at migration time -- and it is a guarantee rather than a heuristic, since nothing is
+  ever drawn on top of it. NOT gated on `synchronized='true'`, which looks like the discriminator
+  and is not one: swept across 35 corpus workbooks it holds on **33 of 37 folded axes**, including
+  the `SUM`/`AVG` sheet whose two scales are the whole reason the combo route exists, so it
+  restates `fold` rather than qualifying it. The discriminator is structural instead -- two
+  aggregations of ONE field are two magnitude scales by construction (`SUM`+`AVG`, a Pareto's
+  cumulative percent-of-count), whereas two DIFFERENT fields are the comparison overlay. Three
+  coupled fixes ride along, each found by opening the build and looking rather than by any gate:
+  the worksheet's `dual_axis` flag was read on the y axis only, so every HORIZONTAL dual axis
+  reported `False` and the trellis guard fanned one overlaid pane into N side-by-side charts; a
+  lipstick's series are coloured per PANE, not per worksheet, so collapsing them to one flat
+  colour painted both overlapping bars the same orange; and once any series is coloured explicitly
+  every series must be, because Power BI colours an unset series by its POSITION in the theme
+  palette and the author's own mark colour is drawn from that same list -- setting series 0 to the
+  palette's second entry made series 1 default to that exact colour. Corpus blast radius: 13 files
+  of 1612 swept, 5 unique visuals across 2 workbooks, every one of them a combo that should never
+  have been one (4 previous-vs-current-year comparison bars, 1 control chart whose `Automatic`
+  marks Tableau draws as two lines on one plot).
 - **`tableau-migration` (skill `2.319.0` → `2.320.0`): a conditional-colour gradient driven by a
   Visual Calculation no longer renders with no colour, and a rebuilt table calc no longer moves its
   column to the end.** One root cause, two symptoms, both reported by a user against a **known-good

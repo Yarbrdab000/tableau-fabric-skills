@@ -1665,6 +1665,12 @@ def _folded_axis_instances(table, axis):
     are otherwise serialised identically: a leading blank pane plus one ``*-axis-name`` pane per
     measure, no index on any of them. ``scope`` names the shelf (``rows`` for a y axis, ``cols``
     for an x one) and is treated as a filter only when present.
+
+    The neighbouring ``synchronized='true'`` is deliberately NOT read. It looks like the signal for
+    "both measures share one scale" and is not: swept across 35 corpus workbooks plus a dedicated
+    dual-axis workbook it holds on 33 of 37 folded axes -- including the ``SUM``/``AVG`` sheet whose
+    two scales are the reason the combo route exists -- so it restates ``fold`` rather than
+    qualifying it. See :func:`_is_scale_pair` for the discriminator that does work.
     """
     folded = set()
     style = _first(table, "style")
@@ -1801,7 +1807,7 @@ def _mark_family(mark):
 
 
 def _detect_combo(meas_rows, meas_cols, has_category, mark_by_instance, primary_mark,
-                  dual_axis=False):
+                  dual_axis=False, overlay=False):
     """Classify a dual-axis combo: measures on one shelf that split into a column-family group
     and a line-family group, against a shared category dimension.
 
@@ -1818,6 +1824,17 @@ def _detect_combo(meas_rows, meas_cols, has_category, mark_by_instance, primary_
     the plot height. An invisible series is the same failure as an error tile, so the secondary-axis
     measure goes to Y2 and keeps its scale. Power BI draws a Y2 series as a LINE, so this trades one
     mark type for both series actually being visible -- disclosed by the caller's fidelity note.
+
+    ...UNLESS THE TWO MEASURES ARE AN OVERLAY rather than two scales -- see :func:`_is_scale_pair`,
+    which is what ``overlay`` carries. Tableau's overlapping-bar ("lipstick") idiom is serialised
+    IDENTICALLY to the sliver case above, so the two cannot be told apart by the dual-axis markers;
+    routing every same-family dual axis to a combo turned all 16 sheets of a lipstick workbook into
+    line-on-Y2 combos, 8 of them ALSO rotated (Power BI's only combo draws its columns vertically,
+    so a measures-on-Cols sheet loses its orientation as well as its mark type).
+
+    NOT gated on ``synchronized='true'``, which looks like the obvious discriminator and is not one:
+    swept across the corpus it holds on 33 of 37 folded axes -- including the ``SUM``/``AVG`` sheet
+    that motivates the paragraph above -- so it is a restatement of ``fold`` rather than a signal.
 
     Which measure is secondary comes from SHELF ORDER: Tableau writes the primary axis first.
 
@@ -1837,14 +1854,209 @@ def _detect_combo(meas_rows, meas_cols, has_category, mark_by_instance, primary_
             line_meas.append(f)
     if column_meas and line_meas:
         return column_meas, line_meas
-    if dual_axis and len(measures) > 1 and not line_meas:
+    if dual_axis and len(measures) > 1 and not line_meas and not overlay:
         distinct = {str(f.get("instance") or f.get("caption")) for f in measures}
         if len(distinct) > 1:
             return measures[:1], measures[1:]
     return None, None
 
 
+def _is_scale_pair(measures):
+    """True when a dual axis's measures are TWO SCALES of one field rather than an OVERLAY.
+
+    Tableau serialises both idioms identically -- same shelf, same fold, same marks -- so this is
+    the only structural signal that separates them, and it is read off the measure INSTANCE tokens
+    (``sum:Sales:qk``, ``avg:Sales:qk``) rather than from any data:
+
+    * ``SUM(Sales)`` + ``AVG(Sales)``  -- one field, two aggregations. A sum and an average of the
+      same column differ by roughly the row count, so they are on different magnitude scales BY
+      CONSTRUCTION. That is why the author reached for a second axis, and collapsing them onto one
+      renders the smaller as an invisible sliver (measured: ~1/40th on 0085 ``Small Bar (2)``).
+    * ``pcto:cum:cnt:Profit`` + ``cnt:Profit`` -- one field, a percent-of-total running total
+      against its own count. The Pareto idiom; also two scales by construction.
+    * ``SUM(Sales)`` + ``SUM(Profit)`` -- DIFFERENT fields, same aggregation. Nothing about the pair
+      forces different magnitudes, and overlaying two comparable measures is precisely what the
+      overlapping-bar idiom is for.
+
+    Conservative in the direction that preserves today's behaviour: anything that cannot be parsed
+    into ``agg:field:tag`` counts as a scale pair, so an unrecognised shape keeps the combo route it
+    has today rather than being re-routed into an overlay on a guess.
+
+    Corpus check (35 workbooks + the lipstick workbook, 37 folded axes): every same-field pair is a
+    genuine two-scale idiom (``SUM``/``AVG``, Pareto) and every different-field pair is a comparison
+    overlay (a lipstick, or Salesforce current-vs-previous-year bars).
+    """
+    fields, aggs = set(), set()
+    for f in measures or ():
+        inst = str(f.get("instance") or "")
+        parts = inst.split(":")
+        if len(parts) < 3:
+            return True
+        # ``pcto:cum:cnt:Profit:qk`` -- the FIELD is the second-to-last token; everything before it
+        # is the aggregation chain.
+        fields.add(parts[-2])
+        aggs.add(":".join(parts[:-2]))
+    if len(fields) != 1:
+        return False
+    return len(aggs) > 1
+
+
 _LOLLIPOP_HEAD_MARKS = frozenset({"circle", "shape", "point"})
+
+
+# Transparency applied to the FRONT series of an overlapping-bar rebuild, as a percentage.
+#
+# Taken from the adjudicated ground-truth `.pbip` for this idiom (``dataPoint.fillTransparency``
+# = ``61D`` on the front measure), not invented -- and render-verified against that file: the back
+# series reads clearly THROUGH the front one at this value, while the front stays solid enough to
+# read as the foreground series.
+_LIPSTICK_FRONT_TRANSPARENCY = 61
+
+
+def _lipstick_measures(meas_rows, meas_cols, mark_by_instance, primary_mark):
+    """The overlaid measures of a "lipstick" (overlapping-bar) sheet, in SHELF ORDER, else ``None``.
+
+    Requires 2+ DISTINCT measures on one shelf, every one of them drawn by a COLUMN-family mark.
+    A mixed-family shelf is a real combo and was already claimed by :func:`_detect_combo`; a
+    single-measure shelf has nothing to overlap. Shelf order is preserved because it IS the
+    z-order -- see :func:`_lipstick_overlap`.
+    """
+    measures = list(meas_rows) + list(meas_cols)
+    if len(measures) < 2:
+        return None
+    distinct = {str(f.get("instance") or f.get("caption")) for f in measures}
+    if len(distinct) < 2:
+        return None
+    for f in measures:
+        if _mark_family(mark_by_instance.get(f.get("instance"), primary_mark)) != "column":
+            return None
+    return measures
+
+
+# The clustered families whose layout card exposes the overlap controls. The unqualified
+# ``columnChart`` / ``barChart`` are Power BI's STACKED variants (see _pbir_visual_type) -- their
+# segments are stacked, not overlaid, so an overlap card there is meaningless at best.
+_LIPSTICK_VTYPES = frozenset({"clusteredColumnChart", "clusteredBarChart"})
+
+
+def _pane_mark_colors(table, axis):
+    """Per-AXIS constant mark colours: ``{measure instance -> '#hex'}``.
+
+    A dual-axis worksheet colours each overlaid series on its OWN pane
+    (``<pane x-axis-name='...'><style><style-rule element='mark'><format attr='mark-color'>``).
+    :func:`_constant_mark_color` deliberately collapses the worksheet to ONE colour, which is right
+    for a single-series chart and wrong for an overlay: rendered, it painted both overlapping bars
+    the same orange, so the only thing separating them was the transparency. Tableau draws them in
+    two colours, and two same-coloured bars sharing one slot is precisely the readability failure
+    the overlap rebuild exists to avoid.
+
+    Only panes that name an axis are read, so the leading unnamed pane (which carries no series of
+    its own) cannot supply a colour for everything.
+    """
+    colors = {}
+    panes_el = _first(table, "panes")
+    if panes_el is None:
+        return colors
+    name_attr = "{0}-axis-name".format(axis if axis in ("x", "y") else "y")
+    for pane in _children_local(panes_el, "pane"):
+        axis_name = _attr_local(pane, name_attr)
+        if not axis_name:
+            continue
+        toks = _BRACKET_TOKEN_RE.findall(axis_name)
+        if not toks:
+            continue
+        style = _first(pane, "style")
+        if style is None:
+            continue
+        for rule in _children_local(style, "style-rule"):
+            if _attr_local(rule, "element") != "mark":
+                continue
+            for fmt in _children_local(rule, "format"):
+                if _attr_local(fmt, "attr") != "mark-color":
+                    continue
+                val = (_attr_local(fmt, "value") or "").strip().lower()
+                if val.startswith("#"):
+                    colors[toks[-1]] = val
+    return colors
+
+
+def _lipstick_overlap_objects(query_state, vtype, series_colors=None):
+    """PBIR format objects that rebuild Tableau's overlapping-bar idiom, or ``None``.
+
+    Returns ``{"layout": [...], "dataPoint": [...]}`` -- the ``layout`` card turning Overlap on with
+    100% series spacing (so the two series share one slot instead of sitting side by side), plus a
+    ``dataPoint`` entry making the FRONT series translucent.
+
+    Z-ORDER IS PROJECTION ORDER, and it needs no translation: Tableau draws the FIRST measure on a
+    folded axis behind the second, and so does Power BI, so preserving shelf order preserves which
+    series is in front. Confirmed against the ground-truth `.pbip`, whose two pages differ ONLY in
+    ``Y`` projection order and whose own page titles name the resulting front/back split.
+
+    WHY THE FRONT SERIES, ALWAYS. Overlap makes total occlusion possible: with both bars in one
+    slot, the back one is hidden wherever the front one is longer. Tableau has three escapes --
+    length, per-series WIDTH, and transparency -- and Power BI's clustered chart has no per-series
+    width at all, so the width escape cannot survive the migration. Of the two that remain, length
+    is a property of the DATA and so is unknowable here (and unstable: it can differ per category
+    and change on refresh). Transparency on the front series is the only one that is decidable at
+    migration time, and it is a guarantee rather than a heuristic -- the front series is never
+    occluded by anything, so making it translucent leaves the back series visible for ANY data.
+
+    Generalises past two series: with N overlaid, series *i* hides 1..*i*-1, so every series except
+    the back-most gets the transparency.
+    """
+    if vtype not in _LIPSTICK_VTYPES:
+        return None
+    projs = [p for p in ((query_state or {}).get("Y") or {}).get("projections", [])
+             if not p.get("hidden")]
+    if len(projs) < 2:
+        return None
+    objects = {"layout": [{"properties": {
+        "clusteredGapOverlaps": {"expr": {"Literal": {"Value": "true"}}},
+        "clusteredGapSize": {"expr": {"Literal": {"Value": "100D"}}},
+    }}]}
+    fills = []
+    colors = list(series_colors or ())
+    # Positional pairing, refused unless the lengths agree. The projections carry a queryRef but not
+    # the measure instance the colour was read against, so a mismatched zip would paint the wrong
+    # series -- and a wrong colour on an overlay is indistinguishable from a correct one at a glance.
+    if len(colors) != len(projs):
+        colors = [None] * len(projs)
+    if any(colors):
+        # EVERY series gets an explicit colour once ANY of them does, because Power BI colours an
+        # unset series by its POSITION in the theme palette -- and the Tableau palette this engine
+        # emits is the same list the author picked their mark colour from. Rendered: Tableau set
+        # Sales to #F28E2B, which is the theme's SECOND entry, so the second series defaulted to
+        # that very colour and both overlapping bars came out orange, distinguished only by the
+        # transparency. Fill the gaps from the palette skipping colours already taken, which also
+        # matches Tableau: a pane with no explicit mark colour draws in the palette's first colour.
+        taken = {c.lower() for c in colors if c}
+        spare = [c for c in _TABLEAU_10 if c.lower() not in taken]
+        for i, c in enumerate(colors):
+            if c:
+                continue
+            colors[i] = spare.pop(0) if spare else None
+    for i, p in enumerate(projs):
+        qref = p.get("queryRef")
+        if not qref:
+            continue
+        props = {}
+        # Every series except the back-most is made translucent; see the docstring.
+        if i:
+            props["fillTransparency"] = {"expr": {"Literal": {
+                "Value": "%dD" % _LIPSTICK_FRONT_TRANSPARENCY}}}
+        hexv = colors[i]
+        if hexv:
+            props["fill"] = {"solid": {"color": {"expr": {"Literal": {
+                "Value": _semantic_string_literal(hexv)}}}}}
+        if not props:
+            continue
+        # ``selector.metadata`` must name a queryRef this visual actually PROJECTS, which is why it
+        # is read back off the emitted query state rather than rebuilt from the parsed shelf.
+        fills.append({"properties": props, "selector": {"metadata": qref}})
+    if not fills:
+        return None
+    objects["dataPoint"] = fills
+    return objects
 
 
 def _all_pane_marks(table):
@@ -4865,6 +5077,8 @@ def _parse_worksheet(ws, index, ds_caption, warnings, internal_fields=None, date
 
     fidelity_note = None
     combo_split = None
+    lipstick_overlap = False
+    lipstick_series_colors = {}
     lollipop = False
     lollipop_color = None
     mv_color_scales = []
@@ -4959,11 +5173,17 @@ def _parse_worksheet(ws, index, ds_caption, warnings, internal_fields=None, date
         # combo chart so the column measure(s) land on Y and the line measure(s) on Y2. Same-mark
         # multi-measure shelves keep their ordinary single-mark visual (no false combos).
         if visual_type in (VT_COLUMN, VT_BAR, VT_LINE, VT_AREA):
-            mark_by_instance, primary_mark, dual_axis = _pane_mark_map(
-                table, _measure_shelf_axis(meas_rows, meas_cols))
+            _measure_axis = _measure_shelf_axis(meas_rows, meas_cols)
+            mark_by_instance, primary_mark, dual_axis = _pane_mark_map(table, _measure_axis)
+            # OVERLAY vs TWO SCALES. Tableau serialises the overlapping-bar ("lipstick") idiom and
+            # a genuine two-scale dual axis identically, so this is the discriminator -- see
+            # _is_scale_pair. Deliberately NOT ``synchronized='true'``, which holds on 33 of the
+            # corpus's 37 folded axes and so separates nothing.
+            _overlay = not _is_scale_pair(list(meas_rows) + list(meas_cols))
             column_meas, line_meas = _detect_combo(
                 meas_rows, meas_cols, bool(dims_rows or dims_cols),
-                mark_by_instance, primary_mark, dual_axis=dual_axis)
+                mark_by_instance, primary_mark, dual_axis=dual_axis,
+                overlay=_overlay)
             if column_meas and line_meas:
                 visual_type = VT_COMBO
                 combo_split = {"Y": column_meas, "Y2": line_meas}
@@ -4981,6 +5201,30 @@ def _parse_worksheet(ws, index, ds_caption, warnings, internal_fields=None, date
                 fidelity_note = (
                     "dual-axis line + area over the same measure (Tableau's filled-line idiom) -> "
                     "areaChart, whose fill is the second pane")
+            elif (_overlay and dual_axis and visual_type in (VT_COLUMN, VT_BAR)
+                    and _lipstick_measures(meas_rows, meas_cols, mark_by_instance, primary_mark)):
+                # Tableau's overlapping-bar / "lipstick" idiom: two same-family measures folded onto
+                # one axis and drawn overlaid in a single plot rectangle. Kept as a clustered
+                # bar/column with both measures on Y -- the combo route above would cost the second
+                # measure's mark type and, on a Cols sheet, the orientation.
+                lipstick_overlap = True
+                # Per-series colours in SHELF ORDER (hex or None per measure). Tableau colours each
+                # overlaid series on its own pane; rendered, collapsing them to one worksheet-wide
+                # colour painted both bars the same orange and left transparency as the only
+                # separator. A list rather than a dict because the emitted projections carry a
+                # queryRef but not the measure instance, so the pairing is positional -- and the
+                # emitter refuses to apply it unless the lengths agree.
+                _pane_cols = _pane_mark_colors(table, _measure_axis)
+                _lip_meas = _lipstick_measures(
+                    meas_rows, meas_cols, mark_by_instance, primary_mark) or []
+                lipstick_series_colors = [_pane_cols.get(f.get("instance")) for f in _lip_meas]
+                if not any(lipstick_series_colors):
+                    lipstick_series_colors = []
+                fidelity_note = (
+                    "dual-axis overlapping bars (two different measures folded onto one axis) -> "
+                    "clustered {0} with Overlap on, series spacing 100%, and the front series "
+                    "made translucent so the back series can never be hidden".format(
+                        "bars" if visual_type == VT_BAR else "columns"))
 
         # Dual-axis lollipop: a Bar (stick) pane + a Circle/Shape/Point (head) pane plotting the SAME
         # measure against a shared category. Power BI has no native lollipop, so re-route to a combo --
@@ -5410,7 +5654,17 @@ def _parse_worksheet(ws, index, ds_caption, warnings, internal_fields=None, date
         "map_style_raw": _worksheet_map_style_raw(ws),
         "axis_titles": axis_titles,
         "continuous_axis": continuous_axis,
-        "dual_axis": _pane_mark_map(table)[2],
+        # Read on the shelf the measures ACTUALLY sit on. ``_pane_mark_map`` defaults to the y axis,
+        # which is right for a vertical chart and blind on a HORIZONTAL one -- a measures-on-Cols
+        # dual axis writes ``x-axis-name`` panes, so the y-only read finds no axis panes and reports
+        # False. Measured on the 16-sheet dual-axis corpus: all 8 horizontal sheets reported False
+        # where the axis-aware read (the one ``_detect_combo`` already uses at the visual-type
+        # decision) says True. The disagreement was latent only because those sheets were promoted
+        # to a combo before the single consumer of this field could act on it; the moment a
+        # same-family horizontal dual axis stays a bar chart, the sole consumer
+        # (``_measure_trellis_measures``, whose guard means "a dual axis is ONE overlaid pane, not a
+        # trellis") reads the wrong answer and fans it into N side-by-side charts.
+        "dual_axis": _pane_mark_map(table, _measure_shelf_axis(meas_rows, meas_cols))[2],
         "axis_hidden": sorted(axis_hidden),
         "row_labels_hidden": row_labels_hidden,
         # Grand-total visibility, from the shelf's own ``total``/``onTop`` attributes. Power BI's
@@ -5436,6 +5690,9 @@ def _parse_worksheet(ws, index, ds_caption, warnings, internal_fields=None, date
         "swap_controls": swap_controls,
         "fidelity_note": fidelity_note,
         "combo_split": combo_split,
+        # Tableau's overlapping-bar ("lipstick") idiom: two same-family measures on ONE synchronized
+        # axis. Recorded here because the emitter only ever sees this dict.
+        "lipstick_overlap": lipstick_overlap,
         "lollipop": lollipop,
         "lollipop_color": lollipop_color,
         # The worksheet's single constant mark colour, for EVERY visual type -- the flat
@@ -5447,8 +5704,12 @@ def _parse_worksheet(ws, index, ds_caption, warnings, internal_fields=None, date
         # default blue for every chart -- measured on the corpus's time-series workbook, where three
         # orange (#f28e2b), three green (#59a14f) and three cyan (#00bceb) charts ALL came out blue.
         # It is the single most visible whole-dashboard defect after the page background.
-        "mark_color": _constant_mark_color(table),
-        "mark_transparency": _mark_transparency_pct(table),
+        # A lipstick's series are coloured PER PANE, so the worksheet-wide flat colour is suppressed
+        # for it -- see _pane_mark_colors. Left in place for every other shape, which is where the
+        # flat read is correct.
+        "mark_color": (None if (lipstick_overlap and lipstick_series_colors)
+                       else _constant_mark_color(table)),
+        "lipstick_series_colors": lipstick_series_colors,        "mark_transparency": _mark_transparency_pct(table),
         "sort": sort,
         "kpi_title_card": kpi_title_card,
         "kpi_title_cards": kpi_title_cards,
@@ -11363,7 +11624,8 @@ def _visual_json(name, vtype, position, query_state, sort_definition=None,
                  data_point_objects=None, label_objects=None, legend_objects=None,
                  shape_objects=None, card_label_objects=None, analytics_objects=None,
                  slicer_mode=None, font_objects=None, extra_objects=None,
-                 show_title=None, container_fill=None, continuous_axis=False):
+                 show_title=None, container_fill=None, continuous_axis=False,
+                 lipstick_overlap=False, lipstick_series_colors=None):
     # Power BI refuses a Legend alongside several measures and renders an error tile instead of a
     # chart. Enforced HERE so every emit path is covered by construction rather than by each
     # caller remembering.
@@ -11397,6 +11659,19 @@ def _visual_json(name, vtype, position, query_state, sort_definition=None,
     # diverging ``linearGradient3`` block from ``_shape_map_datapoint_objects``) so it renders on open.
     if data_point_objects and vtype not in _NO_DATA_POINT_TYPES:
         visual.setdefault("objects", {})["dataPoint"] = data_point_objects
+    # Tableau's overlapping-bar ("lipstick") idiom -> the ``layout`` overlap card + a front-series
+    # ``dataPoint.fillTransparency``. Applied AFTER the dataPoint assignment above and APPENDING to
+    # it, because that line assigns rather than merges: emitting the transparency first would have
+    # it silently overwritten by any mark/measure palette, and the loss would be invisible (the
+    # visual still validates and still renders -- just with the back series hidden, which is the
+    # exact defect this rebuild exists to prevent).
+    if lipstick_overlap:
+        _lip = _lipstick_overlap_objects(query_state, vtype, lipstick_series_colors)
+        if _lip:
+            _objs = visual.setdefault("objects", {})
+            _objs["layout"] = _lip["layout"]
+            if vtype not in _NO_DATA_POINT_TYPES:
+                _objs.setdefault("dataPoint", []).extend(_lip["dataPoint"])
     # Data labels (Tableau "Show Mark Labels"): the data-plane ``visual.objects.labels`` ``show``
     # toggle, applied uniformly (no selector). Per the Power BI formatting reference, ``labels`` is a
     # visual-wide object; only show/hide is set here (label detail styling is Tier-2).
@@ -13874,6 +14149,8 @@ def emit_pbir(ir, *, dataset_name="Model", report_name="Report",
                 analytics_objects=analytics_objects,
                 font_objects=_grid_font_objects(ws),
                 extra_objects=_merge_extra_objects(lollipop_objects, azure_objects),
+                lipstick_overlap=ws.get("lipstick_overlap"),
+                lipstick_series_colors=ws.get("lipstick_series_colors"),
                 container_fill=ws.get("canvas_fill")))
             rec = _candidate_record(page_name, vname, ws, vtype, state, pos,
                                     page_display=db["name"] or page_name,
@@ -14130,6 +14407,8 @@ def emit_pbir(ir, *, dataset_name="Model", report_name="Report",
             analytics_objects=analytics_objects,
             font_objects=_grid_font_objects(ws),
                 extra_objects=_merge_extra_objects(lollipop_objects, azure_objects),
+            lipstick_overlap=ws.get("lipstick_overlap"),
+            lipstick_series_colors=ws.get("lipstick_series_colors"),
             container_fill=ws.get("canvas_fill"))
         rec = _candidate_record(page_name, vname, ws, vtype, state, pos,
                                 page_display=ws["name"],
