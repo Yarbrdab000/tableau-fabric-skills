@@ -793,6 +793,20 @@ produces them.
 | **under-claiming** a property you only partly measured | modesty | you measured one of its jobs, found that one unexercised, and labelled the whole guard unexercised |
 | **a hedge** used instead of an available check | appropriate caution | *"as far as I can tell"* is indistinguishable, to a reader, from having looked |
 
+**They are not symmetric in time, and the third is the dangerous one because it was CORRECT:**
+
+```
+over-claim    wrong on arrival
+under-claim   wrong on arrival
+hedge         RIGHT on arrival, wrong later, and reads as having looked
+```
+
+**"Be more careful" defends against the first two and is useless against the third** — there was
+nothing to be careful about at the moment of writing. The only defence is re-deriving it once the
+check becomes available, which is why the hedge rule carries an expiry rather than a caution. Same
+shape as a count that was true at one engine and stopped being true at the next: **a claim that was
+right when made, with nothing in the artifact marking when it stopped.**
+
 All three were committed here, by different sessions, on different days' worth of otherwise careful
 work:
 
