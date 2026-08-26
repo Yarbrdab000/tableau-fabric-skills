@@ -588,6 +588,16 @@ the tag was its own, and the owning lane did not know it had ever been at risk.
 > own branch.** Re-read the namespace before concluding anything about a lane — including before
 > concluding nothing happened.
 
+**This file already carried the rule that would have prevented the misreading**, in the verification
+section: *"A red result is a question, not a verdict. A verifier that fails has told you nothing until
+you know **which side** is wrong."* It was not ignored — it was **inverted**. Read as *"a red is
+unreliable, so discount it"* rather than *"a red is undiagnosed, so diagnose it"*, and the second
+measurement was then taken as the diagnosis when it was only a fresh reading of a changed state.
+
+> **A rule can fail by being applied backwards, which looks exactly like having applied it.** Where a
+> rule says a signal needs interpretation, the failure mode is to treat "needs interpretation" as
+> "means nothing" — and that reads as rigour, since the rule was consulted.
+
 **The rule "never delete an anchor you didn't create" does not protect this, and the lane checked.**
 It *had* created a tag by that name, so authorship said "mine" — the name was theirs and the object
 was not. A name you created can silently become someone else's:
