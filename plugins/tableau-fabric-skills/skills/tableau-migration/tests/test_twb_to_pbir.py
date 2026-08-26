@@ -10314,3 +10314,78 @@ def test_a_horizontal_overlay_carries_the_authors_transparency():
             got[sel] = props["fillTransparency"]["expr"]["Literal"]["Value"]
     assert got == {"Sum(Orders.Sales_Amount)": "42D"}, (
         "the author's alpha must survive on a HORIZONTAL overlay: %s" % got)
+
+# --- width substitution: Power BI has no per-series bar width, so a source that separated its
+# --- overlaid series by mark SIZE loses its entire separation mechanism in translation.
+
+def _sized_lipstick(name, back_size=None, front_size=None, back_alpha=None, front_alpha=None):
+    """A dual-axis Bar+Bar sheet with per-pane size/alpha on either overlaid series."""
+    def style(size, alpha):
+        parts = []
+        if size is not None:
+            parts.append("<format attr='size' value='%s' />" % size)
+        if alpha is not None:
+            parts.append("<format attr='mark-transparency' value='%s' />" % alpha)
+        if not parts:
+            return ""
+        return ("<style><style-rule element='mark'>" + "".join(parts) + "</style-rule></style>")
+    ws = _lipstick_ws(name)
+    ws = ws.replace(
+        "<pane id='1' y-axis-name='[federated.abc].[sum:Sales:qk]'><mark class='Bar' /></pane>",
+        "<pane id='1' y-axis-name='[federated.abc].[sum:Sales:qk]'><mark class='Bar' />"
+        + style(back_size, back_alpha) + "</pane>")
+    ws = ws.replace(
+        "<pane id='2' y-axis-name='[federated.abc].[sum:Profit:qk]'><mark class='Bar' /></pane>",
+        "<pane id='2' y-axis-name='[federated.abc].[sum:Profit:qk]'><mark class='Bar' />"
+        + style(front_size, front_alpha) + "</pane>")
+    return parse_twb(_workbook(ws))["worksheets"][0]
+
+
+def test_a_width_difference_lightens_the_WIDER_series():
+    # The classic lipstick: a broad bar with a narrow one inside it, both opaque. Power BI draws
+    # both at the same width, so the front simply covers the back and the author's whole separation
+    # mechanism is gone. Lightening the wider one is the closest available stand-in.
+    w = _sized_lipstick("Wide back", back_size=1.74, front_size=0.83)
+    assert w["lipstick_series_transparency"] == [42, None], w["lipstick_series_transparency"]
+
+
+def test_the_width_substitute_follows_the_WIDTH_not_the_position():
+    # It is the WIDER series that gets lightened, wherever it sits. Keying on front/back instead
+    # would lighten the narrow bar and leave the broad one solid -- the inverse of the source.
+    w = _sized_lipstick("Wide front", back_size=0.81, front_size=1.38)
+    assert w["lipstick_series_transparency"] == [None, 42], w["lipstick_series_transparency"]
+
+
+def test_the_authors_own_transparency_beats_the_width_substitute():
+    # Precedence. The author set BOTH a width difference and a transparency; the transparency is an
+    # explicit choice and the substitute exists only to stand in for what cannot be drawn.
+    w = _sized_lipstick("Both", back_size=1.67, front_size=1.32, back_alpha=162)
+    assert w["lipstick_series_transparency"] == [36, None], w["lipstick_series_transparency"]
+
+
+def test_equal_widths_are_not_a_width_difference():
+    # Nothing to substitute for -- the source drew both series the same width on purpose.
+    w = _sized_lipstick("Equal", back_size=1.38, front_size=1.38)
+    assert w["lipstick_series_transparency"] == [], w["lipstick_series_transparency"]
+
+
+def test_one_declared_size_is_not_a_width_difference():
+    # An UNDECLARED size is Tableau's default and says nothing about intent, so comparing it
+    # against a declared one would manufacture a width gap the author never expressed. Same rule
+    # _has_oversized_second_pane already applies to the lollipop's head-vs-stick signal.
+    w = _sized_lipstick("Half", back_size=0.93)
+    assert w["lipstick_series_transparency"] == [], w["lipstick_series_transparency"]
+
+
+def test_the_width_substitution_is_disclosed_as_the_engines_own():
+    # The substitute is drawn from the range the author used elsewhere, so a derived 42 is
+    # INDISTINGUISHABLE in the artifact from an authored 42 (alpha 147). Which of the two it is
+    # changes what a reader should do about it, so the note has to say.
+    sub = _sized_lipstick("Derived", back_size=1.74, front_size=0.83)
+    assert "engine's substitution" in (sub["fidelity_note"] or ""), sub["fidelity_note"]
+
+    authored = _sized_lipstick("Authored", back_alpha=147)
+    assert authored["lipstick_series_transparency"] == [42, None]
+    assert "engine's substitution" not in (authored["fidelity_note"] or ""), (
+        "an authored transparency must NOT be reported as the engine's: %s"
+        % authored["fidelity_note"])
