@@ -987,6 +987,31 @@ This repo already carries *"no conflict is not evidence of correctness"*. This i
 about the other signal: **a green needs to be shown it can go red, and a red needs to be shown it is
 the right red.**
 
+### Correct, recorded, and in a place the reader never visits
+
+Distinct from every rule above, because **nothing about it is wrong**, which is why it is hard to see.
+Three instances in this repo, found only because a parallel session noticed they were one shape:
+
+| the disclosure | where it lives | where the reader is |
+|---|---|---|
+| `_wrapper_measure_name` keeps the Tableau name deliberately — *"this name is NOT internal"* | a docstring in `migrate_estate.py` | reading a report where label and binding disagree |
+| a dispatcher branch is blank on purpose, with measure, branch number, awaited sibling and reason | the `partial_fidelity` report section | looking at a blank visual in Desktop |
+| the artifact rung of the call-site pin is deliberately out of scope, and why | session notes | reading three green tests in the test file |
+
+**All three are correct reasoning, correctly recorded, filed where the person who needs it does not
+look.** The reader's next act is identical to the reader's next act if the reasoning had never
+existed: conclude the label is a bug, conclude the blank is a defect, conclude the pin is complete.
+
+**Two of the three placements were deliberate and defensible, and that changes nothing about the
+outcome** — deliberateness is a fact about the author, not about what the reader ends up believing.
+Nor is the remedy always "move it": surfacing the dispatcher disclosure as a *gate* would fire on
+what the engine already announced and regress 2.290.0. The remedy is to move it **toward the
+reader's surface**, which is sometimes a docstring, sometimes a report line, and sometimes a
+rendered annotation — but it is never "it's already documented".
+
+> **Ask where the person who will form the wrong belief is standing, and put the correction there.**
+> A disclosure filed anywhere else is a record that you knew, not a control that anyone learns.
+
 ### Which of these rules actually work
 
 Most of the rules above require you to **notice something first** — that a count is unexplained, that a
