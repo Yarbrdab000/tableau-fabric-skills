@@ -1430,6 +1430,38 @@ two minutes earlier?* **No answer is wrong, because no population was ever defin
 > caught by naming it; an undefined one can only be caught by someone asking *"what did you count?"* —
 > and nobody asks that of a summary.
 
+**There is a third member of the family, and it is the one with a mechanical tell: a ratio published
+without its sampling frame.** `pbir_lint` was reported as firing on **"1 of 7"** injected defects and
+called blind by construction. Arithmetically true; a coverage verdict on a whole module drawn from
+seven hand-picked cases with **no scope stated**. The module's docstring names its four rules and says
+outright that *"a clean result means 'free of these two known PBIR validity defects', not 'provably
+valid'"*. **Six of the seven were out of scope by design.** Re-measured against what it claims:
+
+```
+R4 visualType nonsense              IN-SCOPE      FIRED
+R6 duplicate nativeQueryRef         IN-SCOPE      FIRED
+$schema bogus / negative width      out-of-scope  silent  (correct, documented)
+
+IN-SCOPE caught 2 of 2  -- the module works exactly as written
+```
+
+> **A ratio is meaningless until the frame it was drawn from is stated.** *"1 of 7"* and *"2 of 2"*
+> describe the same run. **Publish the frame with the ratio, and when receiving one, ask what the
+> denominator was drawn from before acting on it.**
+
+**The receiving half is the part neither party did.** The lane that got "1 of 7" re-ranked a gate on it
+and drafted a defect report against the module **within five minutes** — after a week spent on exactly
+this class — because it arrived as a measurement with a number attached. That is the earlier
+*"an inference whose weight greatly exceeds its evidence base is detectable from the claim alone"*
+rule, failing at the point of receipt rather than authorship, and it is **cheaper to catch there**:
+the receiver need not know anything about the module, only that a whole-module verdict rests on seven
+unexplained cases.
+
+**And the disclosure that would have prevented it was in the file, correct, permanent, and had been on
+screen that morning** — the scope note sits three sentences from the end of a docstring opened to find
+an entry point. **Filing a disclosure correctly is not the same as it being read, and there is no
+wording fix for that.**
+
 **Which is the half with teeth: the tally was written in the SUMMARY, not in the work.** Every
 verification habit in this file was applied to the analysis and none of it to the closing paragraph,
 because the checking was supposedly over. **A summary is unchecked by construction** — it is where
