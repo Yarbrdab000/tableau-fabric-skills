@@ -1446,6 +1446,41 @@ only by listing what the classifier had excluded.
 > **After filtering a population, print what you EXCLUDED, not only what you kept.** The kept set looks
 > correct by construction; the excluded set is where a wrong boundary shows.
 
+**Three filters were written for that one population and all three were wrong**, by three different
+routes, in scripts whose authors had each just read the previous one's:
+
+```
+literal "archive/anchor-pre-v"          12    reported as "all archived anchor states"
+regex requiring / or anchor- infix      16    silently dropped the recovered original
+any "pre-v<semver>" in the name         17    kept 17 + excluded 6 == 23 total
+```
+
+**Every one returned 0 violations, so no wrong answer was ever produced** — which is exactly why none
+was noticed. The 12-filter dropped `archive/original-pre-v2.317.0-precollision`, *the single most
+relevant object in the sweep*, and still reported the right verdict with the word "all".
+
+The cheap guard is arithmetic, not attention: **assert that kept + excluded == the whole**, and print
+the reason for each exclusion. None of the three wrong filters made that check; it is one line and it
+fails loudly.
+
+### What this file does NOT support
+
+A reader meeting a long list of errors will conclude **"be more careful"**, and that is the one
+conclusion the record rules out. Every layer below was written by someone who had just read the layer
+above and was *actively hunting this exact defect*:
+
+```
+the finding        a sweep over preserved states cannot see destruction
+the check          3 attempts, 2 contaminated populations
+the check of that  12 of 17, silently, reported as "all"
+the catch          only by running print-what-you-excluded against that script
+```
+
+**Nobody was careless at any point.** The errors were produced *by* care, at every level, including
+inside the corrections. That is why the mechanical rules here are worth more than the insightful ones,
+why *"be more careful"* appears nowhere as a remedy, and why none of it removes the need for a second
+party who has to begin from the artifact rather than from the claim.
+
 ### When the rules pay, and the one time it was before the fact
 
 One further note on *when* they pay. Almost every catch recorded here was **retrospective** — an
