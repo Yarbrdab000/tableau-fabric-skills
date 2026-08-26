@@ -445,10 +445,11 @@ anchor to revert a bad release). Do all three, every time:
    * **Anchor targets PASS it — but only under the right formulation.** "A commit stamped with the
      declared predecessor" is **under-determined**: merges and doc commits inherit a `VERSION` without
      changing it, so measured over 710 commits, **112 of 329 versions are carried by more than one
-     commit**. Two integrators can both satisfy the gate and write anchors that reset to materially
-     different trees. "The commit where `VERSION` **became** X" (stamped X, no parent stamped X) is
-     near-unique: **327 of 329**, with two historic exceptions (`1.23.0`, `1.25.0`) that each have two
-     introducers.
+     commit** *(measured at an earlier vintage; the same quantity at `e88386b` is **121 of 344**, and
+     both are the same fact — every figure in this file is of its own date and none carry one)*. Two
+     integrators can both satisfy the gate and write anchors that reset to materially different trees.
+     "The commit where `VERSION` **became** X" (stamped X, no parent stamped X) is near-unique:
+     **327 of 329**, with two historic exceptions (`1.23.0`, `1.25.0`) that each have two introducers.
 
    So the hazard is not *"more than one candidate integrator"* — it is **an under-specified target
    with more than one candidate integrator.** Fix the specification and the number of writers stops
@@ -1264,18 +1265,28 @@ cannot substitute:
 > it, because it isn't there.
 
 **And two populations can agree under the default and diverge without it**, which is worse than either
-being wrong alone:
+being wrong alone — and worse still, the agreement here is **not a coincidence but an identity**:
 
 ```
-                                   simplified   --full-history
+measured at e88386b                simplified   --full-history
 COMMITS touching VERSION                  328              465
 DISTINCT VERSION values                   328              344
+recurring values: 0     non-increasing steps: 0
 ```
 
-Under the default those are **the same number**, so a probe that conflates *how many commits touched
-this file* with *how many versions exist* is **confirmed by its own output**. Drop the default and
-they diverge by 121. **A coincidence that validates a wrong belief is the hardest kind to find**,
-because the check you would run agrees with you.
+Under simplification every commit returned is one that *changed* `VERSION`; `VERSION` only ever
+increases, so no value recurs, so **commit → value is injective and the counts must agree.** A probe
+that conflates *how many commits touched this file* with *how many versions exist* is therefore not
+merely unlucky at that setting — it is **unfalsifiable** there, and the corroboration it returns
+carries zero bits.
+
+> **A check that cannot fail is not a check.** A coincidence can break and will occasionally be
+> re-tested; an identity can never disagree with you.
+
+**State the premise, because it is measured rather than guaranteed** — the identity needs monotone
+versioning, and one reverted bump that restores an older `VERSION` repeats a value and breaks it. Zero
+recurrences and zero non-increasing steps here, so it holds; that is a fact about this repo, of this
+date. Same shape as the tag-rewrite rescue: **a sound argument resting on a premise nobody checked.**
 
 **A near-miss worth not chasing:** earlier figures here report 327 commits / 464 full-history where a
 later run reports 328 / 465. That is not a discrepancy — a release landed between the two runs.
