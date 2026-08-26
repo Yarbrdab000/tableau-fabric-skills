@@ -780,6 +780,27 @@ The tests that actually work on all three are mechanical, and both are one comma
 >
 > **A property is not validated or unvalidated as a whole — each of its jobs is, separately.**
 
+### A guard written against a class is not exempt from the class
+
+The two sharpest instances here were both committed *inside the work that fixes them*, minutes after
+the rule was written down:
+
+- The first version of the **vacuous-skip test was itself vacuously skipped.** `pytest.skip()` raises
+  `Skipped`, which derives from `BaseException`, so a `pytest.raises(Exception)` let it escape and
+  marked the test skipped — while its first assertion had already succeeded and gone unreported. A
+  test written to stop a silent pass, silently passing, on its first run.
+- The first **argument pin could never fail**: `re.search` found the *definition* line before the call
+  site, so it read the parameter list rather than the argument list. A pin written to catch "one level
+  short of the property" was itself one level short — and the injection script had made the identical
+  mistake two minutes earlier, rewriting the definition instead of the call.
+
+Neither is carelessness in any recoverable sense: the predicates were *reasoned*, and the reasoning
+was about the same failure the guard targets. **Assume your guard has the defect it guards against,
+and prove it red before believing it green** — which is why every gate here carries a positive control,
+and why every injection script must **assert its injection landed** before reading the result. Without
+that line, a patch that failed to apply plus a green suite reads as *"the guard survived"* when it
+means *"nothing was tested."* That happened twice in one hour.
+
 ### Which of these rules actually work
 
 Most of the rules above require you to **notice something first** — that a count is unexplained, that a
