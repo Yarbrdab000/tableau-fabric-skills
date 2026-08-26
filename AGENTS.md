@@ -485,6 +485,26 @@ anchor to revert a bad release). Do all three, every time:
 
 ### Concurrent releases: ask the INTEGRATOR for a version number
 
+**Do not describe your branch to another session. Ask git.** Every coordination question here that
+cost more than one message was a *state report* — "I'm at X", "nothing is allocated", "it merges
+clean" — and every one of them was true when written and stale when read. A message is a snapshot; a
+ref is the state, and this applies to the SENDER as much as the receiver. Measured: seven exchanges on
+a single sha, an "unallocated" line that was accurate at the moment it was typed, and a "merges clean"
+that was correct against a tip four commits old.
+
+The join is executable and costs one call:
+
+```
+git merge-base --is-ancestor <their-tip> HEAD     # already integrated?
+git merge-tree $(git merge-base HEAD <their-tip>) HEAD <their-tip>   # compatible? conflicts?
+git show <their-tip>:skills/tableau-migration/VERSION                # what number do they claim?
+git for-each-ref refs/tags/rollback/                                 # what is already anchored?
+```
+
+**An anchor tag is a lane declaring intent, not bookkeeping.** A `rollback/pre-vX` that exists for a
+number you are about to take means someone is mid-release on it — twice here that tag was archived and
+re-pointed as stale housekeeping, and twice it cost a duplicate implementation.
+
 **Version allocation is centralised. Do not claim a block. At your release step, ask the integrating
 session for a number; it reads `refs/tags` and hands you one.** If the integrator is unavailable,
 fall back to **take the next free number above every anchor, and renumber without ceremony if you
