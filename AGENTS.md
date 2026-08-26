@@ -61,9 +61,29 @@ not mirrored.
 
 - Windows + PowerShell. Do not use PowerShell 7-only syntax (`&&`, `||`, `??`, `?.`). PowerShell
   has no heredocs — write a temp file and run it.
+- **A backtick inside a `py -3.11 -c "..."` string is not a character.** PowerShell consumes it as an
+  escape, and what Python receives is a *different pattern that still runs*. Measured on the same
+  file in the same minute: the intended sentinel matched **154**, the mangled one **54** — both
+  well-formed, confident numbers. This produced a **vacuous chain parse** (`entries=0`, therefore
+  `0 breaks`, `no duplicates` — all true of an empty list) that was caught only by an accidental
+  `IndexError`, and it recurred **eight times in one session**, including inside the release written
+  to fix it. Any regex with a backtick, `$`, or nested quotes goes in a `.py` file. No exceptions —
+  the failure output is always plausible, so you will not notice.
 - Use `py -3.11` for Python. A bare `py` resolves to 3.14 here and lacks pytest.
 - Some files carry a UTF-8 BOM — read them as `utf-8-sig`. Write JSON manifests as UTF-8
   **without** a BOM.
+- **Each shell call is a fresh process, so a status read is not evidence about a preceding command.**
+  Verifying `git merge --abort` (or a rebase abort) needs the in-progress markers, not just
+  `git status --porcelain` from a later invocation — an abort can leave `MERGE_HEAD` behind under a
+  tree that reads clean. **In a worktree `.git` is a FILE**, so `Test-Path .git\MERGE_HEAD` is always
+  false and always reassuring; resolve the real directory first:
+
+  ```
+  $gd = git rev-parse --git-dir        # e.g. ...\.git\worktrees\<name>
+  foreach ($f in 'MERGE_HEAD','CHERRY_PICK_HEAD','REVERT_HEAD','rebase-merge','rebase-apply') {
+      if (Test-Path (Join-Path $gd $f)) { "in progress: $f" }
+  }
+  ```
 
 ## Tests and validation
 
