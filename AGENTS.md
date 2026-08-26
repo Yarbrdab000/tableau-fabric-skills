@@ -779,6 +779,17 @@ Everything else is a description of how these failures look afterwards. Useful f
 unreliable as a defence, because **the check is cheapest exactly when you are most sure you do not need
 it.**
 
+One further note on *when* they pay. Almost every catch recorded here was **retrospective** — an
+artifact already existed and someone measured it. Exactly one landed **before the action**: a version
+number about to be taken would have left a hole in the release chain, and the cheaper-looking escape
+(skip the number, declare a predecessor two releases back) **passes the gate on the day and breaks the
+moment the skipped entry is inserted above it**. A green gate at commit time would have been the worst
+outcome available, not the safe one.
+
+That is not a better application of the rules — it is the same rule reaching a different point in the
+sequence, and it is the only point at which it prevents rather than explains. **Reading a predicate is
+the only method available for a defect that has not happened yet.**
+
 ## Commits
 
 - Make the **user** the commit author, and append the trailer:
