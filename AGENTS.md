@@ -749,8 +749,10 @@ work:
 
 The tests that actually work on all three are mechanical, and both are one command:
 
-> **A hedge is only honest when the check is unavailable.** When it is available, the hedge is a claim
-> wearing modesty — ask *what would have to be true for "as far as I can tell" to mean "I looked"?*
+> **A hedge is only honest when the check is unavailable** — and only stays honest until it isn't. A
+> recorded "plausible cause" that is never revisited ages into folklore with none of the caveat
+> surviving, so retire it the moment the check becomes possible. Ask *what would have to be true for
+> "as far as I can tell" to mean "I looked"?*
 >
 > **A property is not validated or unvalidated as a whole — each of its jobs is, separately.**
 
