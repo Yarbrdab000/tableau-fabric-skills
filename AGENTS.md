@@ -646,6 +646,11 @@ useful artifact, so it was promoted to the remote. **The displaced remote object
 as `archive/remote-pre-v2.274.0-preannotation`, and the promotion refused to run unless both sides
 peeled to the same commit.
 
+> **Archive the displaced object → refuse unless both sides peel to the same commit → re-read the
+> remote instead of trusting the push output.** The **middle** step is what makes the other two safe:
+> promoting an annotation and silently moving a rollback path are **indistinguishable at the push**,
+> and an archive of the wrong thing plus a confirmation that it landed will both report success.
+
 Two related traps, both cheap to avoid:
 
 * **Never `git push --tags` into a shared namespace.** It would have silently overwritten that remote
