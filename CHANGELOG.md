@@ -14,6 +14,30 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ### Fixed
 
+- **`tableau-migration` (skill `2.326.0` → `2.327.0`): a stubbed calculation now carries the
+  translator's OWN diagnosis into the TMDL, where the person debugging it is already standing.**
+  `translate_tableau_calc_to_dax` returns `(dax, reason, tables_used)` and the emitter discarded the
+  middle element, so a stub reached the reader as a Tableau formula and a `BLANK()` with the cause
+  computed and thrown away. Measured on a real 12-workbook customer migration: a `BLANK()` dispatcher
+  drove two empty charts, and recovering the reason meant opening the TMDL, reading a 15-branch
+  `CASE`, cross-checking all 15 referenced measures against the model, and noticing that a *sibling*
+  8-branch dispatcher in the same file had translated cleanly -- hours, to re-derive one string the
+  engine already had. The string was not missing; it sat in `report.json`'s handover section, which
+  is a **different file the debugger was not in.** Same shape as the wrapper-label and dispatcher-blank
+  findings: correct, recorded, filed where the reader is not. Stubs now emit
+  `annotation TranslationStubReason = <reason>` -- e.g. `unsupported function REGEXP_MATCH`,
+  `CASE results return inconsistent types`, `bare row-level field [..] not valid in a measure` --
+  on measures and calculated columns alike. Additive and stub-only: a translated measure keeps
+  `TranslatedBy` and gains nothing, and `reason=None` is byte-identical to the previous output, so no
+  existing model churns. A stub carries **both** its reason and any assisted-pass suggestion (an
+  `elif` here would have suppressed the reason on exactly the stubs someone was already working on).
+  Six unit tests plus a parametrised end-to-end pair through `migrate_tds_to_semantic_model`, because
+  emitter-only coverage passes with the caller never threading the value -- which was the shipped
+  state. Four positive controls, all caught, source restored byte-identical; the one that only the
+  end-to-end test catches is *"caller stops threading `reason`, emitter untouched"*. Scope, stated so
+  the annotation is not over-trusted: the translator reports only the FIRST unsupported construct in
+  a formula, so this is where to start, not an exhaustive list.
+
 - **`tableau-migration` (skill `2.325.0` → `2.326.0`): an overlapping-bar rebuild now
   substitutes transparency for a mark-WIDTH difference Power BI cannot draw.** Tableau separates
   two overlaid series three ways -- length, WIDTH, and transparency -- and a clustered Power BI

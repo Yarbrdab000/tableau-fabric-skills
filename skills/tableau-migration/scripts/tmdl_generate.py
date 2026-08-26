@@ -318,7 +318,7 @@ def _tmdl_assignment(decl, expr, body_indent="\t\t\t"):
     return f"{decl} =\n{body}"
 
 def generate_measure_tmdl(field_name, formula, dax=None, *, suggestion=None,
-                          translated_by="deterministic", format_string=None):
+                          translated_by="deterministic", format_string=None, reason=None):
     """One measure for the _Measures table. When `dax` is provided the measure carries
     the translated DAX expression; otherwise it stays an inert `= 0` stub. EITHER WAY
     the original Tableau formula is ALWAYS preserved as a TableauFormula annotation --
@@ -347,7 +347,24 @@ def generate_measure_tmdl(field_name, formula, dax=None, *, suggestion=None,
     absence. ``BLANK()`` renders as empty, propagates as absence through arithmetic, and cannot be
     mistaken for data. This is what a stubbed calculated COLUMN has always emitted
     (:func:`generate_calc_column_tmdl`); measures were the lone inconsistency. Provenance is
-    unaffected -- the Tableau formula is still on the ``TableauFormula`` annotation."""
+    unaffected -- the Tableau formula is still on the ``TableauFormula`` annotation.
+
+    ``reason`` is the translator's OWN diagnosis -- the second element of
+    ``translate_tableau_calc_to_dax``'s ``(dax, reason, tables_used)`` -- emitted as a
+    ``TranslationStubReason`` annotation on a stub ONLY (#167). It was computed and then discarded
+    at emission for a long time, so a stub reached the reader as a formula and a ``BLANK()`` with
+    the cause dropped: tracing one required opening the TMDL, reading a 15-branch ``CASE``,
+    cross-checking every referenced measure against the model, and noticing that a sibling
+    dispatcher in the same file had translated fine. Hours of work to recover a string the engine
+    already had. The reasons are specific enough to end the search on sight -- *"CASE results return
+    inconsistent types"*, *"unresolved/ambiguous field [Modem Availability]"*, *"parameter reference
+    [Parameters].[Y-Axis] (unmodeled)"*.
+
+    Deliberately stub-only and additive: a TRANSLATED measure carries ``TranslatedBy`` and gains
+    nothing here, and when ``reason`` is None (the default) NO line is written, so existing output
+    is byte-for-byte unchanged. Note the known scope limit recorded against the translator: a
+    formula with several unsupported constructs reports only the FIRST one, so this annotation is a
+    starting point rather than an exhaustive list."""
     expr = dax if dax else "BLANK()"
     out = _tmdl_assignment(f"\n\tmeasure {q(field_name)}", expr)
     if format_string:
@@ -356,15 +373,20 @@ def generate_measure_tmdl(field_name, formula, dax=None, *, suggestion=None,
     out += tmdl_annotation_value("TableauFormula", formula)
     if dax:
         out += tmdl_annotation_value("TranslatedBy", translated_by)
-    elif suggestion:
-        out += tmdl_annotation_value("TranslationSuggestion", suggestion.get("dax", ""))
-        out += tmdl_annotation_value("TranslationSuggestionPattern", suggestion.get("pattern", ""))
+    else:
+        # Stub only: the translator's own diagnosis, next to the stub, where a debugger looks
+        # first (#167). Emitted BEFORE any suggestion so the cause reads before the proposal.
+        if reason:
+            out += tmdl_annotation_value("TranslationStubReason", str(reason))
+        if suggestion:
+            out += tmdl_annotation_value("TranslationSuggestion", suggestion.get("dax", ""))
+            out += tmdl_annotation_value("TranslationSuggestionPattern", suggestion.get("pattern", ""))
     out += "\t\tannotation SummarizationSetBy = Automatic\n"
     return out
 
 def generate_calc_column_tmdl(field_name, formula, dax=None, *, tmdl_type=None,
                               summarize="none", is_hidden=False, suggestion=None,
-                              translated_by="deterministic"):
+                              translated_by="deterministic", reason=None):
     """One calculated column for a row-level (dimension) calc -- the column-mode peer of
     ``generate_measure_tmdl``. The block is meant to be spliced onto an existing data table
     (via ``enrich_table_tmdl(..., calc_columns=...)``), so its DAX must resolve in that table's
@@ -385,7 +407,11 @@ def generate_calc_column_tmdl(field_name, formula, dax=None, *, tmdl_type=None,
     The suggestion is NEVER the live expression until approved.
 
     ``tmdl_type`` optionally pins the column ``dataType`` (e.g. ``string``/``int64``); when
-    omitted the engine infers it from the expression (matching the Date table's calc columns)."""
+    omitted the engine infers it from the expression (matching the Date table's calc columns).
+
+    ``reason`` is the translator's own diagnosis, emitted as a ``TranslationStubReason``
+    annotation on a stub ONLY -- the column-mode peer of the same contract on
+    :func:`generate_measure_tmdl` (#167). Additive: None writes nothing."""
     expr = dax if dax else "BLANK()"
     out = _tmdl_assignment(f"\n\tcolumn {q(field_name)}", expr)
     if is_hidden:
@@ -400,9 +426,12 @@ def generate_calc_column_tmdl(field_name, formula, dax=None, *, tmdl_type=None,
     out += tmdl_annotation_value("TableauFormula", formula)
     if dax:
         out += tmdl_annotation_value("TranslatedBy", translated_by)
-    elif suggestion:
-        out += tmdl_annotation_value("TranslationSuggestion", suggestion.get("dax", ""))
-        out += tmdl_annotation_value("TranslationSuggestionPattern", suggestion.get("pattern", ""))
+    else:
+        if reason:
+            out += tmdl_annotation_value("TranslationStubReason", str(reason))
+        if suggestion:
+            out += tmdl_annotation_value("TranslationSuggestion", suggestion.get("dax", ""))
+            out += tmdl_annotation_value("TranslationSuggestionPattern", suggestion.get("pattern", ""))
     out += "\t\tannotation SummarizationSetBy = Automatic\n"
     return out
 

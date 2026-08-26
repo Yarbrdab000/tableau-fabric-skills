@@ -1779,13 +1779,15 @@ def _measures_part(calcs, resolve, consumed=None, param_resolver=None, *,
                 row["assisted_pattern"] = sugg["pattern"]
         elif sugg:
             _gen_measure(name, formula, None, suggestion=sugg,
-                                                     format_string=_fmt(name))
+                                                     format_string=_fmt(name), reason=reason)
             row["status"] = "assisted-suggested"
             row["assisted_suggestion"] = sugg
             suggestions.append({"measure": name, **sugg})
         else:
+            # Stub. Carry the translator's own diagnosis onto the TMDL annotation (#167): it is
+            # already in `row["reason"]` for the handover, and a debugger opens the model first.
             _gen_measure(name, formula, None,
-                                                     format_string=_fmt(name))
+                                                     format_string=_fmt(name), reason=reason)
         report.append(row)
     # Emit the translated workbook table calcs (addressing-bearing) after the plain measures. Each
     # preserves its original Tableau formula as ``TableauFormula`` and is tagged with the addressing
