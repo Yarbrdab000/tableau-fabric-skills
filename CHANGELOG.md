@@ -14,6 +14,30 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ### Fixed
 
+- **`tableau-migration` (skill `2.334.0` → `2.335.0`): `pbir_lint` R11 catches a scatterChart that
+  validates clean and cannot render (#173).** A customer dashboard shipped a visual whose handover
+  status read `rebuilt` while Power BI Desktop showed a live
+  `DataViewMappingError_ScatterGroupingValues` -- *"a visual marked clean that's actually broken"*.
+  The per-visual status is what every downstream consumer trusts, so a false green there silently
+  defeats any gate keyed on it. Power BI's scatter dataViewMapping needs a grouping field to produce
+  more than one point: with `X` and `Y` both aggregated and no `Category` / `Series` / `Play`, every
+  row collapses to a single aggregate and the mapping fails. **No existing gate could see this, and
+  that is structural rather than an oversight:** `powerbi-report-author catalog describe
+  scatterChart` reports `requiredRoles: ["X", "Y"]` with `Category` merely **optional**, so R9 cannot
+  fire and the external validator PASSES the report -- the visual is genuinely structurally valid and
+  genuinely does not render. It is the exact mirror of R10 shipped one release earlier: there
+  *validate could see and we were blind*; here *validate is blind and we can see*. Conservative,
+  because "optional" means a legitimate ungrouped scatter exists: any grouping projection clears it,
+  and so does an unaggregated axis (a bare `Column` is itself the grain, and is the remedy the
+  message recommends -- flagging it would reject the fix). Measured on the 34-workbook corpus at
+  2.334.0: **7 scatterCharts, all 7 grouped**, so this fires on nothing we currently build; it is a
+  guard against a shape a customer hit, not a description of one we produce. Eight tests, eight
+  positive controls, all caught -- including *"also flags a grouped scatter"*, *"flags an
+  unaggregated axis"* and *"also fires on a MISSING axis"* (which would double-report R9's defect).
+  The injection harness now asserts each target matches **exactly once**, after 2.334.0's controls
+  silently patched the wrong dictionary; that guard immediately caught one ambiguous and one
+  zero-match target here.
+
 - **`tableau-migration` (skill `2.333.0` → `2.334.0`): `pbir_lint` R10 catches a bare `Column` in a
   MEASURE-only role, the defect that makes our own untouched output fail `validate` (#142).**
   `powerbi-report-author validate` reports `PBIR_ROLE_KIND_MISMATCH` and exits 1 on engine output

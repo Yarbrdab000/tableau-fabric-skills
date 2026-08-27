@@ -819,6 +819,78 @@ def _lint_measure_role_kind(parts):
     return problems
 
 
+_SCATTER_GROUPING_ROLES = ("Category", "Series", "Play")
+
+
+def _lint_scatter_grouping(parts):
+    """Validity R11: a scatterChart with aggregated X/Y and no grouping role cannot map (#173).
+
+    Power BI's scatter dataViewMapping needs a grouping field to produce more than one point. With
+    ``X`` and ``Y`` both aggregated and no ``Category`` / ``Series`` / ``Play``, every row collapses
+    to a single aggregate and Desktop raises ``DataViewMappingError_ScatterGroupingValues``.
+
+    THIS IS THE 'VALIDATE IS BLIND AND WE CAN SEE' CASE, and deliberately so:
+    ``powerbi-report-author catalog describe scatterChart`` lists ``requiredRoles: ["X", "Y"]`` with
+    ``Category`` merely OPTIONAL, so R9 cannot fire and the external validator passes the report.
+    The visual is structurally valid and does not render. That is precisely the gap #173 reports --
+    a handover status of ``rebuilt`` over a visual with a live Desktop error -- and it is why this
+    rule is keyed on the RENDER contract rather than on the catalog's role list.
+
+    Conservative by construction, because "optional" means a legitimate ungrouped scatter exists:
+    * a grouping projection on ANY of the three roles clears it;
+    * X or Y carrying a bare ``Column`` clears it -- an unaggregated axis is itself the grain, which
+      is the ordinary way to draw a per-row scatter;
+    * a visual with no query at all is the deliberate emptied placeholder and is never flagged.
+
+    Measured on the 34-workbook corpus at 2.334.0: 7 scatterCharts, **all 7 grouped**, so this fires
+    on nothing we currently build -- it is a guard against a shape a customer hit, not a description
+    of one we produce.
+    """
+    problems = []
+    for path in sorted(parts):
+        if not path.endswith("visual.json"):
+            continue
+        doc = _load_json(parts, path)
+        if not isinstance(doc, dict):
+            continue
+        vis = doc.get("visual")
+        if not isinstance(vis, dict) or vis.get("visualType") != "scatterChart":
+            continue
+        query = vis.get("query")
+        query_state = (query.get("queryState") if isinstance(query, dict) else None) or {}
+        if not isinstance(query_state, dict) or not query_state:
+            continue
+        if any((query_state.get(r) or {}).get("projections") for r in _SCATTER_GROUPING_ROLES):
+            continue
+        aggregated = []
+        for axis in ("X", "Y"):
+            projections = (query_state.get(axis) or {}).get("projections") or []
+            if not projections:
+                aggregated = []
+                break
+            for proj in projections:
+                field = (proj or {}).get("field")
+                if not isinstance(field, dict):
+                    aggregated = []
+                    break
+                if not ({"Aggregation", "Measure"} & set(field)):
+                    aggregated = []
+                    break
+                aggregated.append(axis)
+            else:
+                continue
+            break
+        if not aggregated:
+            continue
+        problems.append(
+            "%s: scatterChart projects aggregated X and Y with no grouping field (Category, Series "
+            "or Play) -- every row collapses to one point and Power BI Desktop raises "
+            "DataViewMappingError_ScatterGroupingValues. powerbi-report-author validate PASSES this "
+            "(the catalog marks Category optional), so the visual is structurally valid and does "
+            "not render; add the grain dimension to Category or leave an axis unaggregated" % path)
+    return problems
+
+
 def lint_pbir_parts(parts, model_surface=None):
     """Return a list of PBIR validity violations for an emitted ``{path: content}`` parts dict.
 
@@ -834,6 +906,7 @@ def lint_pbir_parts(parts, model_surface=None):
             + _lint_card_display_units(parts) + _lint_native_query_refs(parts)
             + _lint_page_order(parts) + _lint_required_roles(parts)
             + _lint_measure_role_kind(parts)
+            + _lint_scatter_grouping(parts)
             + _lint_dangling_select_refs(parts)
             + _lint_invisible_ink(parts)
             + lint_visual_model_bindings(parts, model_surface))
