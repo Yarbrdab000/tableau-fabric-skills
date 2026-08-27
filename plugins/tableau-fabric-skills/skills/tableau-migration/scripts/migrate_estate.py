@@ -1467,6 +1467,85 @@ def _strip_objects_for_refs(visual, dropped_refs):
     return removed
 
 
+def _entity_binding_mismatches(report_parts, model_parts):
+    """Bindings whose COLUMN does not live on the ENTITY they name (#166 Case A).
+
+    ``_crosscheck_report_refs`` validates against :func:`_model_object_names`, which flattens every
+    column in the model into ONE set. That is deliberate and right for its job -- it exists to drop
+    an optimistic ``_Measures[caption]`` bind that names nothing at all -- but it is **table-blind**,
+    so a projection that names the WRONG table passes as long as some other table happens to own a
+    column of that name. Reported from a 12-workbook Snowflake estate: a slicer and a chart bound to
+    ``'Custom SQL Query'[NEW_TECHNOLOGY]`` where the column belongs to
+    ``'Custom SQL Query (Upgrade Aircraft Installs)'``. Tableau writes a colliding base name as
+    ``<Field> (<Object>)``; the MODEL layer resolves that disambiguation and the REPORT layer did
+    not, so it fell back to the base table.
+
+    It stayed hidden because the table was a stub: with an empty partition there is nothing to
+    separate *"wrong table, still empty"* from *"right table, still empty"*. Power BI reports
+    ``Missing_References`` only once real data exists.
+
+    DISCLOSURE, NOT A DROP. The cross-check's contract is *drop rather than mis-bind*, and dropping
+    on an entity mismatch would be a behaviour change on a path that currently ships correct output:
+    measured across the 34-workbook corpus at 2.332.0 -- **544 visual query bindings, resolved
+    through each report's own ``definition.pbir`` byPath pointer** -- there are **0** entity
+    mismatches and 0 dangling columns, so this fires on nothing we can currently build. Naming it
+    costs nothing and makes the shape visible at BUILD time instead of at first refresh.
+
+    (Two earlier measurements of mine reported 109 and then 88 mismatches. Both compared the bare
+    ``reports/`` tree against the ``pbip/`` model -- different trees. Recorded because the wrong
+    number was confident, plausible, and produced twice.)
+    """
+    by_table = {}
+    for path, content in (model_parts or {}).items():
+        if not (isinstance(content, str) and path.endswith(".tmdl")):
+            continue
+        m = re.search(r"(?m)^table\s+(?:'((?:[^']|'')+)'|(\S+))\s*$", content)
+        if not m:
+            continue
+        name = (m.group(1) or m.group(2)).replace("''", "'").lower()
+        cols = {(a or b).replace("''", "'").lower()
+                for a, b in re.findall(r"(?m)^\s*column\s+(?:'((?:[^']|'')+)'|([^\s=]+))", content)}
+        by_table.setdefault(name, set()).update(cols)
+    if not by_table:
+        return []
+
+    out = []
+
+    def _walk(node, path, in_query=False):
+        if isinstance(node, dict):
+            for k, v in node.items():
+                _walk(v, path, in_query or k == "query")
+            if not in_query:
+                return
+            col = node.get("Column")
+            if not isinstance(col, dict):
+                return
+            ent = ((col.get("Expression") or {}).get("SourceRef") or {}).get("Entity")
+            prop = col.get("Property")
+            if not (ent and prop):
+                return
+            e, p = ent.lower(), prop.lower()
+            known = by_table.get(e)
+            if known is None or p in known:
+                return                      # unknown entity is the cross-check's business, not ours
+            owners = sorted(t for t, cs in by_table.items() if p in cs)
+            if not owners:
+                return                      # dangles everywhere -- already the cross-check's job
+            out.append({"part": path, "entity": ent, "column": prop, "owned_by": owners})
+        elif isinstance(node, list):
+            for v in node:
+                _walk(v, path, in_query)
+
+    for path, content in (report_parts or {}).items():
+        if not path.endswith("visual.json"):
+            continue
+        try:
+            _walk(json.loads(content) if isinstance(content, str) else content, path)
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
 def _crosscheck_report_refs(report_parts, model_parts, swap_specs=None):
     """Reconcile viz projections against the emitted model: REBIND a measure the model remodeled as
     a field parameter, else DROP a reference the model did not emit.
@@ -4014,6 +4093,18 @@ def _build_datasource_pbip(entry, wb_detail, twb_text, result, ds, *, label, mod
             tail = " (visual emptied)" if d["emptied"] else ""
             warns.append(_PBIP_WARN + f"visual {d['visual']!r} dropped {len(d['dropped'])} "
                          f"reference(s) the model did not emit: {', '.join(d['dropped'])}{tail}")
+    # A binding that names the WRONG TABLE passes the cross-check above, because that check is
+    # table-blind by construction (#166). Disclosed rather than dropped: the cross-check's contract
+    # is drop-rather-than-mis-bind and this fires on nothing the corpus can build, so a drop here
+    # would be a behaviour change with no measured subject.
+    _ent_mismatch = _entity_binding_mismatches(report_parts, res.get("parts"))
+    if _ent_mismatch:
+        entry["pbip_entity_binding_mismatches"] = _ent_mismatch
+        for m in _ent_mismatch[:8]:
+            warns.append(_PBIP_WARN + f"binding '{m['entity']}'[{m['column']}] names a table that "
+                         f"does not own that column -- it lives on {', '.join(m['owned_by'])}. "
+                         f"Power BI reports Missing_References once real data lands; while the "
+                         f"partition is a stub it renders empty either way")
     # A colour twin nothing in the SHIPPING report references is dead weight -- rungs 1 and 4 paint
     # the same encoding without any model object. Keyed on the emitted bytes rather than on a
     # predicate, so no two layers can disagree about it. Runs here, after the cross-check, because

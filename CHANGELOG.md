@@ -14,6 +14,32 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ### Fixed
 
+- **`tableau-migration` (skill `2.332.0` → `2.333.0`): a PBIR binding that names the WRONG TABLE is
+  disclosed at build time (#166 Case A).** Tableau writes a colliding base name as
+  `<Field> (<Object>)`. The MODEL layer resolves that disambiguation and the REPORT layer did not, so
+  a 12-workbook Snowflake estate shipped a slicer and a chart bound to
+  `'Custom SQL Query'[NEW_TECHNOLOGY]` when the column belongs to
+  `'Custom SQL Query (Upgrade Aircraft Installs)'` -- a table whose column set contains neither
+  field. Power BI reports `Missing_References`, but **only once real data exists**: while the
+  partition is a stub there is nothing to separate *"wrong table, still empty"* from *"right table,
+  still empty"*, which is why it reached a customer. **Why nothing caught it:**
+  `_crosscheck_report_refs` already validates every projection against the emitted model and passed
+  this, because it validates against `_model_object_names`, which flattens every column into ONE set
+  -- correct for its actual job (dropping an optimistic `_Measures[caption]` bind that names nothing
+  at all) and **table-blind**, so a reference to the wrong entity resolves as long as some other
+  table owns a column of that name. The gate could not express the defect; care with it would not
+  have helped. Disclosed as `pbip_entity_binding_mismatches` + a warning naming the column's REAL
+  owner, rather than dropped: the cross-check's contract is *drop rather than mis-bind*, and across
+  the 34-workbook corpus -- 544 visual query bindings, each report resolved through its OWN
+  `definition.pbir` byPath pointer -- there are **0** mismatches, so a behaviour change here would
+  have no measured subject. **Two earlier measurements of mine said 109 and then 88.** Both compared
+  the bare `reports/` tree against the `pbip/` model -- different trees, joined by filename. Recorded
+  because the wrong number was confident, plausible, and produced twice before the pointer was read.
+  Nine tests, nine positive controls. One initially **missed**: *"treats a Measure ref as a column
+  binding"*, because my fixture's measure was named `Total`, a column nowhere -- so a broken build
+  still filtered it on the *no-owner* branch and the test passed. The fixture now uses a name that IS
+  a column elsewhere, which is the only version able to tell the two paths apart.
+
 - **`tableau-migration` (skill `2.331.0` → `2.332.0`): placement drift is reported PER AXIS, with
   sign (#169).** A field report on four unrelated workbooks described a dead vertical gap between
   header and content, with the coordinate-level lead that *"X translates ~1:1 while Y visibly
