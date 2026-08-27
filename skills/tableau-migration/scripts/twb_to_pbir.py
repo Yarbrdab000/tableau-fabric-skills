@@ -2096,6 +2096,27 @@ def _lipstick_series_transparency(measures, pane_transp, pane_sizes):
     return out if any(out) else []
 
 
+def _folded_measure_groups(measures, folded):
+    """Group shelf measures into RECTANGLES: ``[[0], [1, 2], [3]]`` as index lists.
+
+    Tableau folds a secondary axis onto the one BEFORE it, so a pill whose instance is in
+    ``folded`` joins the group its predecessor opened. Everything else opens a new group.
+
+    This is the shape :func:`_pane_mark_map` reduces to a COUNT. That count is the right question
+    for "is this whole sheet one overlaid pane?" and the wrong one for a sheet that is N overlaid
+    panes side by side -- measured on ``0088 Service Provider Details``, six pills with three folds:
+    ``rectangles = 3``, so the ``<= 1`` gate said "not a dual axis" and the measure trellis fanned
+    all SIX measures into six single-measure charts where Tableau draws three overlaid pairs.
+    """
+    groups = []
+    for i, f in enumerate(measures or ()):
+        if groups and f.get("instance") in folded:
+            groups[-1].append(i)
+        else:
+            groups.append([i])
+    return groups
+
+
 def _lipstick_overlap_objects(query_state, vtype, series_colors=None, series_transparency=None):
     """PBIR format objects that rebuild Tableau's overlapping-bar idiom, or ``None``.
 
@@ -5205,6 +5226,8 @@ def _parse_worksheet(ws, index, ds_caption, warnings, internal_fields=None, date
     lipstick_overlap = False
     lipstick_series_colors = {}
     lipstick_series_transparency = []
+    fold_groups = []
+    pane_style_by_index = []
     lollipop = False
     lollipop_color = None
     mv_color_scales = []
@@ -5301,6 +5324,29 @@ def _parse_worksheet(ws, index, ds_caption, warnings, internal_fields=None, date
         if visual_type in (VT_COLUMN, VT_BAR, VT_LINE, VT_AREA):
             _measure_axis = _measure_shelf_axis(meas_rows, meas_cols)
             mark_by_instance, primary_mark, dual_axis = _pane_mark_map(table, _measure_axis)
+            # RECTANGLES, not a count. `_pane_mark_map` reduces the fold structure to "is the whole
+            # sheet ONE overlaid pane", which is binary and cannot express N overlaid panes side by
+            # side -- a trellis whose every column is itself a dual axis. Captured here for both
+            # readers: the single-rectangle case below, and the measure trellis, which otherwise
+            # fans one chart per MEASURE where the source draws one per PAIR.
+            _shelf_meas = list(meas_rows) + list(meas_cols)
+            _folded = _folded_axis_instances(
+                table, _measure_axis if _measure_axis in ("x", "y") else "y")
+            fold_groups = _folded_measure_groups(_shelf_meas, _folded)
+            if not any(len(g) > 1 for g in fold_groups):
+                fold_groups = []
+            _pane_cols_all = _pane_mark_colors(table, _measure_axis)
+            _pane_transp_all = _pane_mark_transparency(table, _measure_axis)
+            _pane_sizes_all = _pane_mark_sizes(table, _measure_axis)
+            if fold_groups:
+                # Per-shelf-position style, so a trellis band can colour its own overlaid pair
+                # without re-deriving the pane reads. Aligned to the shelf, and the emitter
+                # refuses to use it unless the lengths agree.
+                pane_style_by_index = [
+                    {"color": _pane_cols_all.get(f.get("instance")),
+                     "transparency": _pane_transp_all.get(f.get("instance")),
+                     "size": _pane_sizes_all.get(f.get("instance"))}
+                    for f in _shelf_meas]
             # OVERLAY vs TWO SCALES. Tableau serialises the overlapping-bar ("lipstick") idiom and
             # a genuine two-scale dual axis identically, so this is the discriminator -- see
             # _is_scale_pair. Deliberately NOT ``synchronized='true'``, which holds on 33 of the
@@ -5859,7 +5905,12 @@ def _parse_worksheet(ws, index, ds_caption, warnings, internal_fields=None, date
         "mark_color": (None if (lipstick_overlap and lipstick_series_colors)
                        else _constant_mark_color(table)),
         "lipstick_series_colors": lipstick_series_colors,
-        "lipstick_series_transparency": lipstick_series_transparency,        "mark_transparency": _mark_transparency_pct(table),
+        "lipstick_series_transparency": lipstick_series_transparency,
+        # RECTANGLE grouping of the measure shelf (index lists) plus the per-position pane
+        # style. Empty unless some rectangle holds more than one measure, so a sheet with no
+        # folded axis carries nothing new.
+        "fold_groups": fold_groups,
+        "pane_style_by_index": pane_style_by_index,        "mark_transparency": _mark_transparency_pct(table),
         "sort": sort,
         "kpi_title_card": kpi_title_card,
         "kpi_title_cards": kpi_title_cards,
@@ -8217,7 +8268,21 @@ def _emit_measure_trellis(ws, state, measures, x, y, w, h, tab,
     different invented heading over every band.
     """
     visuals, records = [], []
-    n = len(measures)
+    # BANDS ARE RECTANGLES, NOT MEASURES. A folded (dual) axis inside the strip means two measures
+    # share ONE pane, so fanning per measure draws twice as many charts as the source and loses the
+    # overlay in every one of them -- measured on ``0088 Service Provider Details``: six pills, three
+    # folds, six single-measure charts where Tableau draws three overlaid pairs.
+    #
+    # ``fold_groups`` is aligned to the measure SHELF, so it is refused unless it accounts for
+    # exactly the measures being fanned; a mismatch falls back to one band per measure, which is the
+    # behaviour every non-folded sheet already had.
+    groups = [list(g) for g in (ws.get("fold_groups") or [])]
+    if sum(len(g) for g in groups) != len(measures) or not groups:
+        groups = [[i] for i in range(len(measures))]
+    styles = list(ws.get("pane_style_by_index") or ())
+    if len(styles) != len(measures):
+        styles = [{} for _ in measures]
+    n = len(groups)
     # A column chart's measures came off the ROWS shelf, so its panes stack; a bar chart's came off
     # COLUMNS, so its panes sit side by side.
     stacked = ws["visual_type"] == VT_COLUMN
@@ -8225,7 +8290,8 @@ def _emit_measure_trellis(ws, state, measures, x, y, w, h, tab,
     # when fanned. Only the fanned case reserves an extra slot for them (see above).
     gutter_k = n - 1 if stacked else 0
     u = (h / n if n else h) if stacked else (w / (n + 1) if n else w)
-    for k, proj in enumerate(measures):
+    for k, group in enumerate(groups):
+        proj = measures[group[0]]
         cat_shown = (k == gutter_k)
         if stacked:
             xk, yk, wk, hk = x, y + k * u, w, u
@@ -8239,7 +8305,8 @@ def _emit_measure_trellis(ws, state, measures, x, y, w, h, tab,
         # trellis bands (the property travelled in ``data_point_objects``, the projection did not).
         # A hidden projection is never a visible band measure, so carrying it changes nothing else.
         hidden = [p for p in (state.get("Y") or {}).get("projections", []) if p.get("hidden")]
-        sub_state["Y"] = {"projections": [proj] + hidden}
+        band_projs = [measures[i] for i in group]
+        sub_state["Y"] = {"projections": band_projs + hidden}
         # Each band replaces Y with its OWN single measure, so a sort-by measure that was bound in
         # the parent's multi-measure Y is unbound in every other band -- and an unhonoured sort
         # still suppresses Power BI's default one, which would break exactly the row alignment this
@@ -8257,25 +8324,40 @@ def _emit_measure_trellis(ws, state, measures, x, y, w, h, tab,
             "valueAxis": [{"properties": {"show": _bool_literal(False)}}],
             "categoryAxis": [{"properties": {"show": _bool_literal(cat_shown)}}],
         }
+        # A band holding a folded PAIR is an overlay in its own right, so it carries the same
+        # Overlap card and per-series style the single-rectangle route emits.
+        band_overlay = len(group) > 1
+        band_colors = [styles[i].get("color") for i in group] if band_overlay else None
+        band_transp = (_lipstick_series_transparency(
+            [{"instance": i} for i in group],
+            {i: styles[i].get("transparency") for i in group},
+            {i: styles[i].get("size") for i in group}) if band_overlay else None)
         k_title = title if (k == 0 and show_title) else None
         visuals.append(_visual_json(
             vname_k, vtype, pos, sub_state, sub_sort,
             title=k_title, show_title=bool(k_title),
             label_objects=label_objects, data_point_objects=data_point_objects,
             extra_objects=extra, container_fill=ws.get("canvas_fill"),
+            lipstick_overlap=band_overlay,
+            lipstick_series_colors=band_colors,
+            lipstick_series_transparency=band_transp,
             continuous_axis=ws.get("continuous_axis")))
         rec = _candidate_record(page_name, vname_k, ws, vtype, sub_state, pos,
                                 page_display=page_display,
                                 model_table=model_table, field_map=field_map)
         rec["measure_trellis"] = {"index": k, "of": n,
+                                  "measures_in_band": len(group),
+                                  "overlaid_pair": band_overlay,
                                   "category_axis_shown": cat_shown,
                                   "orientation": "stacked" if stacked else "side-by-side"}
         records.append(rec)
+    _paired = sum(1 for g in groups if len(g) > 1)
+    _what = "measures" if not _paired else "panes (%d of them a folded dual-axis pair)" % _paired
     warnings.append(_warn(
         "worksheet", ws["name"],
-        f"measure-trellis ({n} measures on one axis) rebuilt as {n} "
+        f"measure-trellis ({len(measures)} measures on one axis, {n} {_what}) rebuilt as {n} "
         f"{'stacked' if stacked else 'side-by-side'} charts aligned on a shared category axis "
-        f"(Power BI has no native multi-measure trellis; the source draws one pane per measure)"))
+        f"(Power BI has no native multi-measure trellis; the source draws one pane per rectangle)"))
     return visuals, records
 
 

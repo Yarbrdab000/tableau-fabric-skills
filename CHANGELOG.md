@@ -14,6 +14,27 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ### Fixed
 
+- **`tableau-migration` (skill `2.335.0` → `2.336.0`): the measure trellis fans by RECTANGLE, so a
+  sheet with SEVERAL dual axes rebuilds as several overlaid pairs instead of one chart per measure.**
+  The overlapping-bar detector gated on `axis_panes >= 2 and rectangles <= 1`, which is correct for
+  the single-pair sheet it was built against and silently wrong for every sheet carrying more than
+  one. Measured on a Salesforce NPSP service-provider sheet: 8 measure pills across 4 folds give
+  `rectangles = 4`, so `dual_axis` came out FALSE and the trellis fanned all 8 into separate
+  single-measure bar charts -- the author's four before/after comparisons rebuilt as eight unrelated
+  charts, each showing half of a comparison.
+
+  A folded pill now groups onto its predecessor (`_folded_measure_groups`), the trellis iterates
+  those groups rather than the flat measure list, and a two-member band emits the Overlap card with
+  its own per-series colours and transparency. The shelf order still decides z-order, so the pair
+  keeps the source's front/back relationship.
+
+  A group of ONE is unchanged, which is what keeps the 33 unaffected corpus workbooks byte-identical:
+  this only ever merges pills the author folded together.
+
+  Verified by RENDER on the workbook that motivated it -- 6 single-measure bars became 3 overlaid
+  pairs, all 6 measures correctly paired, and the page's overlay count went 4 of 157 to 7 of 154,
+  measured on both corpus builds rather than inferred. Suite 5335 passed / 6 skipped / 1 xfailed.
+
 - **`tableau-migration` (skill `2.334.0` → `2.335.0`): `pbir_lint` R11 catches a scatterChart that
   validates clean and cannot render (#173).** A customer dashboard shipped a visual whose handover
   status read `rebuilt` while Power BI Desktop showed a live

@@ -10389,3 +10389,95 @@ def test_the_width_substitution_is_disclosed_as_the_engines_own():
     assert "engine's substitution" not in (authored["fidelity_note"] or ""), (
         "an authored transparency must NOT be reported as the engine's: %s"
         % authored["fidelity_note"])
+
+# --- N dual-axis PAIRS on one shelf: a trellis of OVERLAYS, not a fan of single measures -------
+
+def _multi_pair_ws(name, pairs=3, fold_all=True):
+    """A measures-on-Cols sheet with `pairs` folded Bar+Bar pairs -- Tableau's "several overlaid
+    panes side by side" shape, e.g. 0088 'Service Provider Details' (6 pills, 3 folds)."""
+    insts, deps, panes, folds = [], "", "", ""
+    for p in range(pairs):
+        a, b = "sum:M%dA:qk" % p, "sum:M%dB:qk" % p
+        insts += [a, b]
+        for col, inst in (("M%dA" % p, a), ("M%dB" % p, b)):
+            # BOTH halves are needed: the <column> declares the field to the datasource (without it
+            # the pill cannot resolve and the whole sheet comes back "unsupported"), the
+            # <column-instance> names the aggregated pill the shelf references.
+            deps += ("<column caption='%s' datatype='real' name='[%s]' role='measure' "
+                     "type='quantitative' />" % (col, col))
+            deps += ("<column-instance column='[%s]' derivation='Sum' name='[%s]' pivot='key' "
+                     "type='quantitative' />" % (col, inst))
+        panes += ("<pane x-axis-name='[federated.abc].[%s]'><mark class='Bar' /></pane>"
+                  "<pane x-axis-name='[federated.abc].[%s]'><mark class='Bar' /></pane>" % (a, b))
+        if fold_all:
+            folds += ("<style-rule element='axis'><encoding attr='space' class='0' "
+                      "field='[federated.abc].[%s]' field-type='quantitative' fold='true' "
+                      "scope='cols' synchronized='true' type='space' /></style-rule>" % b)
+    cols = "(" + " + ".join("[federated.abc].[%s]" % i for i in insts) + ")"
+    return _combo_worksheet(
+        name,
+        rows="[federated.abc].[none:Category:nk]",
+        cols=cols,
+        panes="<panes><pane><mark class='Bar' /></pane>" + panes + "</panes>",
+        deps_extra=_INST + deps,
+        style="<style>" + folds + "</style>")
+
+
+def test_several_dual_axis_pairs_become_one_overlay_per_PAIR():
+    # THE 0088 DEFECT. `_pane_mark_map` reduces the fold structure to "is the whole sheet ONE
+    # overlaid pane", which is binary: six pills with three folds gives rectangles=3, the `<= 1`
+    # gate says "not a dual axis", and the measure trellis then fans one chart per MEASURE. Measured
+    # on 'Service Provider Details': SIX single-measure charts where Tableau draws THREE overlaid
+    # pairs.
+    ir = parse_twb(_workbook(_multi_pair_ws("Three Pairs")))
+    w = ir["worksheets"][0]
+    assert w["fold_groups"] == [[0, 1], [2, 3], [4, 5]], w["fold_groups"]
+
+    vis = list(_visual_parts(emit_pbir(ir)).values())
+    charts = [v for v in vis if v["visual"]["visualType"] in
+              ("clusteredBarChart", "clusteredColumnChart")]
+    assert len(charts) == 3, "expected 3 overlaid bands, got %d" % len(charts)
+    for c in charts:
+        ys = [p["nativeQueryRef"] for p in c["visual"]["query"]["queryState"]["Y"]["projections"]
+              if not p.get("hidden")]
+        assert len(ys) == 2, "each band must keep its PAIR on one shelf: %s" % ys
+        layout = c["visual"]["objects"]["layout"][0]["properties"]
+        assert layout["clusteredGapOverlaps"]["expr"]["Literal"]["Value"] == "true", (
+            "an overlaid band must carry the Overlap card")
+
+
+def test_an_unfolded_multi_measure_shelf_still_fans_per_measure():
+    # The guard against over-collapsing. No fold => every pill is its own rectangle => the trellis
+    # behaves exactly as it did, one band per measure.
+    ir = parse_twb(_workbook(_multi_pair_ws("No Folds", pairs=3, fold_all=False)))
+    w = ir["worksheets"][0]
+    assert w["fold_groups"] == [], "no fold means no grouping: %s" % w["fold_groups"]
+    charts = [v for v in _visual_parts(emit_pbir(ir)).values()
+              if v["visual"]["visualType"] in ("clusteredBarChart", "clusteredColumnChart")]
+    assert len(charts) == 6, "expected 6 single-measure bands, got %d" % len(charts)
+
+
+def test_a_fold_group_pairs_with_the_pill_BEFORE_it():
+    # Tableau folds a secondary axis onto the one preceding it, so the grouping is positional. A
+    # rule that paired forwards would put every measure in the wrong band while still producing the
+    # right NUMBER of bands -- the count would look correct and every chart would be wrong.
+    ir = parse_twb(_workbook(_multi_pair_ws("Two Pairs", pairs=2)))
+    charts = [v for v in _visual_parts(emit_pbir(ir)).values()
+              if v["visual"]["visualType"] in ("clusteredBarChart", "clusteredColumnChart")]
+    got = [[p["nativeQueryRef"] for p in c["visual"]["query"]["queryState"]["Y"]["projections"]
+            if not p.get("hidden")] for c in charts]
+    got.sort()
+    assert got == [["Sum of M0A", "Sum of M0B"], ["Sum of M1A", "Sum of M1B"]], got
+
+
+def test_the_trellis_band_count_drives_the_geometry():
+    # Bands are RECTANGLES, so the strip is divided into 3 slots (+1 gutter), not 6. Fanning per
+    # measure while grouping per pair would overlap the bands on top of each other.
+    ir = parse_twb(_workbook(_multi_pair_ws("Geometry")))
+    parts = _visual_parts(emit_pbir(ir))
+    charts = [(k, v) for k, v in parts.items() if v["visual"]["visualType"] in
+              ("clusteredBarChart", "clusteredColumnChart")]
+    xs = sorted(round(v["position"]["x"]) for _k, v in charts)
+    assert len(set(xs)) == 3, "three bands must occupy three distinct x slots: %s" % xs
+    widths = [round(v["position"]["width"]) for _k, v in charts]
+    assert all(wd > 0 for wd in widths), widths
