@@ -278,12 +278,25 @@ def test_lint_catches_card_display_units_regression():
 # -- R6: nativeQueryRef uniqueness within a visual -----------------------------
 def _visual_parts_with_refs(*role_refs):
     """A minimal ``{path: visual.json}`` whose queryState roles carry the given nativeQueryRefs.
-    ``role_refs`` is a sequence of ``(role, [nref, ...])`` pairs."""
+    ``role_refs`` is a sequence of ``(role, [nref, ...])`` pairs.
+
+    A MEASURE-kind role (``Y`` on a barChart) gets its projection wrapped in an ``Aggregation``.
+    R10 (#142) reports a bare ``Column`` there, and these tests are about R6 nativeQueryRef
+    uniqueness -- an incidentally invalid fixture would fail them for an unrelated reason. The
+    ``nativeQueryRef`` and ``queryRef`` each projection carries are untouched, so every R6
+    assertion below means exactly what it meant before.
+    """
+    from pbir_lint import MEASURE_ROLES
+
     state = {}
     for i, (role, nrefs) in enumerate(role_refs):
-        state[role] = {"projections": [
-            {"field": {"Column": {"Expression": {"SourceRef": {"Entity": "T"}}, "Property": n}},
-             "queryRef": f"q{i}_{j}", "nativeQueryRef": n} for j, n in enumerate(nrefs)]}
+        projections = []
+        for j, n in enumerate(nrefs):
+            col = {"Expression": {"SourceRef": {"Entity": "T"}}, "Property": n}
+            field = ({"Aggregation": {"Expression": col, "Function": 0}}
+                     if role in MEASURE_ROLES.get("barChart", ()) else {"Column": col})
+            projections.append({"field": field, "queryRef": f"q{i}_{j}", "nativeQueryRef": n})
+        state[role] = {"projections": projections}
     doc = {"visual": {"visualType": "barChart", "query": {"queryState": state}}}
     return {"definition/pages/p/visuals/v/visual.json": json.dumps(doc)}
 
@@ -357,7 +370,15 @@ def _visual_with(entity, prop, kind="Column"):
     # is structurally valid PBIR: a clusteredColumnChart requires Category AND Y, and pbir_lint R9
     # (#144) rightly reports a visual missing one. The added projection resolves cleanly, so every
     # binding assertion below is unchanged -- only the incidental role-incompleteness is fixed.
-    ok = {"Column": {"Expression": {"SourceRef": {"Entity": "Orders"}}, "Property": "Region"}}
+    #
+    # WRAPPED IN AN AGGREGATION for the same reason, one rule later: Y is a MEASURE-kind role and
+    # R10 (#142) reports a bare Column there. The binding it names is identical -- the Aggregation's
+    # inner expression is still Orders[Region] -- so what these tests assert about model-binding
+    # resolution is untouched; only the incidental role-KIND invalidity is fixed.
+    ok = {"Aggregation": {
+        "Expression": {"Column": {"Expression": {"SourceRef": {"Entity": "Orders"}},
+                                  "Property": "Region"}},
+        "Function": 0}}
     doc = {"visual": {"visualType": "clusteredColumnChart",
                       "query": {"queryState": {
                           "Category": {"projections": [{"field": field}]},

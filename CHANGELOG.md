@@ -14,6 +14,39 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ### Fixed
 
+- **`tableau-migration` (skill `2.333.0` → `2.334.0`): `pbir_lint` R10 catches a bare `Column` in a
+  MEASURE-only role, the defect that makes our own untouched output fail `validate` (#142).**
+  `powerbi-report-author validate` reports `PBIR_ROLE_KIND_MISMATCH` and exits 1 on engine output
+  nobody has touched -- the same class as #108, and the reason it matters is that agents are told a
+  clean `validate` is the minimum bar, so pristine output that cannot clear it either forces a
+  hand-fix every run or trains them to ignore the gate. **It reproduces here, and the root cause is
+  one of the three the reporter guessed.** `0135_aggregation_types` -- a workbook explicitly about
+  aggregation types -- emits a `clusteredBarChart` whose `Y` carries `Orders[Sales]` bare while a
+  sibling visual on the same page wraps the identical field. Its source shelf carries three Sales
+  pills at once: `[sum:Sales:qk]` (`derivation='Sum'`, correct), `[attr:Sales:qk]`
+  (`derivation='Attribute'`) and `[none:Sales:qk]` (`derivation='None'`) -- so it is the
+  **disaggregated** pill, exactly *"an unaggregated/discrete pill … or a field whose Tableau
+  aggregation is absent"*. Confirmed by running the real validator on the emitted report: 1 error,
+  exit 1, same code. **`MEASURE_ROLES` is HARVESTED from `powerbi-report-author catalog describe`**,
+  the same provenance as R9's `REQUIRED_ROLES` -- the tool that raises the diagnostic is the tool
+  asked what the rule is. That was load-bearing: the catalog distinguishes THREE kinds, `Grouping` /
+  `Measure` / **`GroupingOrMeasure`**, and a hand-written first attempt of mine assumed
+  `scatterChart`'s `X`/`Y` and `multiRowCard`'s `Values` were measure-only. They are
+  `GroupingOrMeasure` and absent, so a guessed table would have rejected sound reports. Only
+  `Measure` is enforced. **Cross-checked against the authority itself:** R10 vs
+  `powerbi-report-author validate` over all 34 corpus reports agrees **34 of 34**, 1 hit each, zero
+  false positives and zero false negatives. Two existing `test_pbir_lint` fixtures were adjusted --
+  each put a bare Column in a `Y` role while testing an unrelated rule; the bindings and
+  `nativeQueryRef`s they assert are byte-identical, only the incidental role-KIND invalidity is
+  fixed, and both still catch their own regressions. **NOT fixed: the emitter still produces it.**
+  The faithful translation of a disaggregated pill is a rendering decision -- Power BI cannot plot
+  one mark per underlying row in a clustered bar without the row grain -- and that needs render
+  verification rather than a guess. Ten tests, eight positive controls. **Two initially missed, both
+  my harness's fault:** `"pivotTable": ("Values",),` appears in `REQUIRED_ROLES` *before*
+  `MEASURE_ROLES`, so a first-occurrence replace patched the wrong dict -- and the *"assert the
+  injection landed"* check passed, because the string WAS written, just somewhere else. An
+  injection target must be unambiguous, not merely present.
+
 - **`tableau-migration` (skill `2.332.0` → `2.333.0`): a PBIR binding that names the WRONG TABLE is
   disclosed at build time (#166 Case A).** Tableau writes a colliding base name as
   `<Field> (<Object>)`. The MODEL layer resolves that disambiguation and the REPORT layer did not, so

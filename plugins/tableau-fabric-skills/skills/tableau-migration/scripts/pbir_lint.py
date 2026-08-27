@@ -720,6 +720,105 @@ def _lint_required_roles(parts):
     return problems
 
 
+MEASURE_ROLES = {
+    "advancedSlicerVisual": ("Label", "Tooltips"),
+    "areaChart": ("Tooltips", "Y", "Y2"),
+    "azureMap": ("Size", "Tooltips"),
+    "barChart": ("Tooltips", "Y"),
+    "card": ("Values",),
+    "cardVisual": ("Data", "Tooltips"),
+    "clusteredBarChart": ("Tooltips", "Y"),
+    "clusteredColumnChart": ("Tooltips", "Y"),
+    "columnChart": ("Tooltips", "Y"),
+    "decompositionTreeVisual": ("Analyze", "Tooltips"),
+    "donutChart": ("Tooltips", "Y"),
+    "filledMap": ("Tooltips", "X", "Y"),
+    "funnel": ("Tooltips", "Y"),
+    "gauge": ("MaxValue", "MinValue", "TargetValue", "Tooltips", "Y"),
+    "hundredPercentStackedAreaChart": ("Tooltips", "Y"),
+    "hundredPercentStackedBarChart": ("Tooltips", "Y"),
+    "hundredPercentStackedColumnChart": ("Tooltips", "Y"),
+    "kpi": ("Goal", "Indicator"),
+    "lineChart": ("Tooltips", "Y", "Y2"),
+    "lineClusteredColumnComboChart": ("Tooltips", "Y", "Y2"),
+    "lineStackedColumnComboChart": ("Tooltips", "Y", "Y2"),
+    "listSlicer": ("Tooltips",),
+    "map": ("Size", "Tooltips"),
+    "matrix": ("Values",),
+    "pieChart": ("Tooltips", "Y"),
+    "pivotTable": ("Values",),
+    "ribbonChart": ("Tooltips", "Y"),
+    "scatterChart": ("Size", "Tooltips"),
+    "shapeMap": ("Tooltips", "Value"),
+    "stackedAreaChart": ("Tooltips", "Y"),
+    "treemap": ("Tooltips", "Values"),
+    "waterfallChart": ("Tooltips", "Y"),
+}
+
+
+def _lint_measure_role_kind(parts):
+    """Validity R10: a MEASURE-kind role must not carry a bare ``Column`` (#142).
+
+    ``powerbi-report-author validate`` reports ``PBIR_ROLE_KIND_MISMATCH`` and exits 1:
+    *"Column expression in Measure-only role 'Values' (use Measure or Aggregation)"*. Reported on a
+    ``pivotTable`` where **five of six** projections in the same role were correctly wrapped and one
+    was not -- so the engine already knew the shape and missed a per-field branch, most likely an
+    unaggregated/discrete pill whose Tableau aggregation is absent.
+
+    IT REPRODUCES HERE. Swept at 2.333.0, our own corpus emits it too, on a different visual type:
+    ``0135_aggregation_types`` -- a workbook literally about aggregation types -- has a
+    ``clusteredBarChart`` whose ``Y`` carries ``Orders[Sales]`` bare while its sibling visual on the
+    same page wraps the identical field in ``Aggregation``. Confirmed by running the real validator
+    against the emitted report: 1 error, exit 1, same diagnostic code.
+
+    ``MEASURE_ROLES`` is HARVESTED from ``powerbi-report-author catalog describe``, exactly as
+    ``REQUIRED_ROLES`` (R9) is -- the tool that raises the diagnostic is the tool asked what the rule
+    is. That mattered: the catalog distinguishes three kinds, ``Grouping`` / ``Measure`` /
+    **``GroupingOrMeasure``**, and my hand-written first attempt guessed ``scatterChart``'s ``X``/``Y``
+    and ``multiRowCard``'s ``Values`` were measure-only. They are not -- ``GroupingOrMeasure`` and
+    absent respectively -- so a guessed table would have failed sound reports. Only ``Measure`` is
+    enforced here; ``GroupingOrMeasure`` is deliberately untouched, since "cannot judge" must never
+    become "declare invalid".
+
+    An ``Aggregation``, a ``Measure``, a ``NativeVisualCalculation`` or a ``Hierarchy`` all satisfy
+    the role; only a bare ``Column`` is a violation.
+    """
+    problems = []
+    for path in sorted(parts):
+        if not path.endswith("visual.json"):
+            continue
+        doc = _load_json(parts, path)
+        if not isinstance(doc, dict):
+            continue
+        vis = doc.get("visual")
+        if not isinstance(vis, dict):
+            continue
+        measure_roles = MEASURE_ROLES.get(vis.get("visualType"))
+        if not measure_roles:
+            continue
+        query = vis.get("query")
+        query_state = (query.get("queryState") if isinstance(query, dict) else None) or {}
+        if not isinstance(query_state, dict):
+            continue
+        for role in measure_roles:
+            spec = query_state.get(role)
+            if not isinstance(spec, dict):
+                continue
+            for proj in spec.get("projections") or []:
+                field = (proj or {}).get("field")
+                if not isinstance(field, dict):
+                    continue
+                if "Column" in field and not ({"Aggregation", "Measure"} & set(field)):
+                    problems.append(
+                        "%s: visualType %r role %r is Measure-only but projection %r is a bare "
+                        "Column expression -- powerbi-report-author validate reports "
+                        "PBIR_ROLE_KIND_MISMATCH and exits 1; wrap it in an Aggregation or bind a "
+                        "Measure"
+                        % (path, vis.get("visualType"), role,
+                           (field.get("Column") or {}).get("Property")))
+    return problems
+
+
 def lint_pbir_parts(parts, model_surface=None):
     """Return a list of PBIR validity violations for an emitted ``{path: content}`` parts dict.
 
@@ -734,6 +833,7 @@ def lint_pbir_parts(parts, model_surface=None):
     return (_lint_visual_types(parts) + _lint_theme(parts)
             + _lint_card_display_units(parts) + _lint_native_query_refs(parts)
             + _lint_page_order(parts) + _lint_required_roles(parts)
+            + _lint_measure_role_kind(parts)
             + _lint_dangling_select_refs(parts)
             + _lint_invisible_ink(parts)
             + lint_visual_model_bindings(parts, model_surface))
