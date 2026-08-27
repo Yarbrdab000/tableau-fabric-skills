@@ -14,6 +14,68 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ### Fixed
 
+- **`tableau-migration` (skill `2.338.0` → `2.339.0`): the shown-state reflow fires on a REAL,
+  MATERIAL collision instead of on any sheet that merely shares the slicer band's height.**
+  `_reflow_worksheets_below_slicers` reproduces what Tableau does on "Show Filters" -- a sheet
+  authored at the hidden-state position sits where the band will be, so it is pushed below and
+  compressed. A necessary pass, with a collision test that asked only about **Y**.
+
+  Two rectangles collide only if they overlap on **both** axes. Measured on Salesforce NPSP: a
+  full-height left column at `x=0..439` spanning `y=72..768` has ZERO horizontal overlap with a
+  filter band at `x=505..962`, and tripped a whole-page reflow that compressed every other visual to
+  87.5% and pushed it down 88px -- moving the KPI band from its solved `y=163..273` to `239..336`,
+  where it overran the parameter row at 281 it had never touched. **The solver was innocent**: it
+  places that band at `163 h=110` against an authored `163 h=110`, and its rects are disjoint by
+  construction. The error was introduced after the solve, and the reflow's own arithmetic predicts
+  **11 of that page's 12 emitted rects to within 1.5px**, so it accounted for the whole vertical
+  error.
+
+  Fixing that exposed a second, subtler instance of the same thing. With the x-guard in place the
+  PARAMETER band fired instead and compressed the page to 61% -- on a **4.0px** overlap, 2.9% of the
+  sheet, and **0.0px against the band's own SOLVED extent**. The emit step floors a slicer's height
+  (45 → 57px here), so a band can grow past a sheet the solver placed clear of it: the pass was
+  reacting to damage the emitter did one step earlier. Hence a materiality guard, whose threshold is
+  stated as **the interval it must separate** rather than as a value -- the false positive overlaps
+  7% of the band, the case this pass exists for 72% -- with a test asserting
+  `0.07 < _REFLOW_MIN_OVERLAP < 0.72` so a later change argues with the measurements rather than
+  with a preference.
+
+  Both guards can only ever remove FALSE positives: a surfaced slicer genuinely drawn on top of a
+  sheet overlaps on both axes and by far more than a graze. A band's horizontal extent is the union
+  of every slicer in it, which is new logic -- the previous banding tracked only `y`.
+
+  Swept over the WHOLE corpus rather than only the pages that moved, because *"0 pages gained an
+  overlap"* over 8 pages and over 103 are different claims and only the second says the untouched
+  stayed untouched: **103 pages compared, 0 gained an overlap, 0 gained an off-page visual, 95
+  unchanged.** All 8 that moved got closer to their source dashboard's canvas coverage:
+
+  | page | overlaps | coverage → source |
+  |---|---|---|
+  | `0074_control_chart` | 0 → 0 | 68.1% → 82.7% (src 85.4%) |
+  | `0078_top_n_and_other` | 0 → 0 | 70.8% → 84.0% (src 85.3%) |
+  | `0063_remove_null_and_all` | 0 → 0 | 72.5% → 83.5% (src 85.8%) |
+  | `0064_waterfall_chart` | 0 → 0 | 76.0% → 82.6% (src 86.6%) |
+  | `0073_comparing_attributes…` | 0 → 0 | 76.1% → 82.7% (src 83.4%) |
+  | `0061_chart_selector` (Image) | 0 → 0 | 73.7% → 80.1% (src 83.6%) |
+  | `0061_chart_selector` (Solution) | 0 → 0 | 6.5% → 6.7% (src 83.6%) |
+  | `0088` Service Delivery | **4 → 0** | 77.0% → 86.6% (src 85.6%) |
+
+  **`0088` is the one page that ends ABOVE its source, by 1.0pp, and it is the page this was
+  diagnosed on -- so it is named rather than absorbed into "every one closer".** It is not
+  over-fitting: emitted coverage counts a slicer at its FLOORED height, and that floor contributes
+  0.24-1.12pp on these pages (1.12pp on `0088` itself). A page landing within ~1pp above its source
+  is inside the metric's own bias. Recorded because a reader who later sees `0088` drift further
+  above has no way to tell whether it was always above.
+
+  At the render, opened cold and refreshed: the three KPI values (-12.5%, -3, -12.7) are visible
+  instead of clipped, the slicers sit in their own row beneath the cards as the source has them, and
+  the page is exactly 768 tall rather than 776.
+
+  Suite 5353 passed / 6 skipped / 1 xfailed. Six positive controls, each caught by its NAMED test,
+  source hash-verified after every one -- and one initially came back NOT CAUGHT, which was a hole
+  in the TESTS rather than in the fix: every fixture used a single-slicer band while the real
+  dashboards run 3 and 4 wide, so the union logic was never exercised.
+
 - **`tableau-migration` (skill `2.337.0` → `2.338.0`): a zone the AUTHOR collapsed to zero takes
   no share of its flow container, so a parameter-driven show/hide pair stops displacing the twin it
   hides.** Tableau hides a zone by collapsing it to `w=0` (or `h=0`) -- that is the ordinary

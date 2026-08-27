@@ -15083,6 +15083,14 @@ def _emit_param_control_slicers(controls, db_name, page_name, ref_w, ref_h, warn
     return visuals
 
 
+# A slicer band must OVERLAP a sheet by at least this fraction of the band's own height before the
+# shown-state reflow treats it as a collision. Below it the overlap is a graze -- and on a real
+# dashboard a graze is usually OUR OWN doing, since the emit step floors a slicer's height and can
+# push a band past a sheet the solver placed clear of it. Measured endpoints: the case the reflow
+# exists for overlaps 72% of the band; the false positive that motivated this, 7%.
+_REFLOW_MIN_OVERLAP = 0.25
+
+
 def _reflow_worksheets_below_slicers(visuals, page_h, *, gap=8.0, tol=1.0):
     """Reproduce Tableau's SHOWN-state reflow when surfaced slicers collide with worksheet content.
 
@@ -15095,9 +15103,10 @@ def _reflow_worksheets_below_slicers(visuals, page_h, *, gap=8.0, tol=1.0):
     remaining canvas (Sample -> y~351, h~285). We reflow the worksheet-content visuals into
     ``[band_bottom+gap, page_h]`` proportionally, keeping their relative layout.
 
-    Guard: only fires when a worksheet visual actually intersects the slicer band -- a dashboard whose
-    slicers sit in their own clear band (no overlap) is untouched (never-regress). Slicers, the banner
-    and the backdrop plate are never moved; only worksheet content is reflowed.
+    Guard: only fires when a worksheet visual actually intersects the slicer band ON BOTH AXES -- a
+    dashboard whose slicers sit in their own clear band (no overlap) is untouched (never-regress),
+    and so is a sheet that merely sits at the band's HEIGHT in a side column the band never reaches.
+    Slicers, the banner and the backdrop plate are never moved; only worksheet content is reflowed.
 
     Banding: a dashboard can surface TWO separate slicer strips -- a top filter row and a lower
     ``Selections``/parameter-control row -- with authored content (e.g. a KPI-card band) SANDWICHED
@@ -15119,12 +15128,42 @@ def _reflow_worksheets_below_slicers(visuals, page_h, *, gap=8.0, tol=1.0):
         bot = top + v["position"]["height"]
         if bands and top <= bands[-1][1] + cluster_gap:
             bands[-1][1] = max(bands[-1][1], bot)
+            bands[-1][2] = min(bands[-1][2], v["position"]["x"])
+            bands[-1][3] = max(bands[-1][3], v["position"]["x"] + v["position"]["width"])
         else:
-            bands.append([top, bot])
+            bands.append([top, bot, v["position"]["x"],
+                          v["position"]["x"] + v["position"]["width"]])
     band = None
-    for band_top, band_bottom in bands:
-        if any(v["position"]["y"] < band_bottom - tol
-               and v["position"]["y"] + v["position"]["height"] > band_top + tol
+    for band_top, band_bottom, band_left, band_right in bands:
+        band_h = max(1.0, band_bottom - band_top)
+        # A collision needs BOTH axes, and it needs to be MATERIAL.
+        #
+        # Testing only Y asks "is this sheet at the band's height", which is true of every sheet in
+        # a side column the band never reaches -- and one such sheet then reflows the WHOLE page.
+        # Measured on Salesforce NPSP: a full-height left column at x=0..439 spanning y=72..768
+        # shares ZERO horizontal space with a filter band at x=505..962, and triggered a reflow that
+        # compressed every other visual to 87.5% and pushed it down 88px, moving the KPI band from
+        # its solved y=163..273 down to 239..336 where it overran a parameter row it had not
+        # touched. The reflow's own arithmetic predicted 11 of that page's 12 emitted rects to
+        # within 1.5px, so it accounted for the entire vertical error.
+        #
+        # Materiality matters for a second, subtler reason: the emit step FLOORS a slicer to a
+        # minimum height (45 -> 57 px on that dashboard), so a band can grow past a sheet that the
+        # SOLVER placed clear of it. On the same page the parameter band then claimed a 4.0 px
+        # overlap -- 2.9% of the sheet, and 0.0 px against the band's own solved extent -- and
+        # compressed the page to 61%. That is the reflow reacting to damage the emit step did one
+        # step earlier, not to anything the author wrote.
+        #
+        # The threshold is not tuned to that instance: the case this pass EXISTS for overlaps 79 px
+        # of a 109 px band (72%), and the false positive 4 px of a 57 px band (7%). Any value in a
+        # very wide interval separates them; a quarter of the band's height is a round one.
+        #
+        # Both guards can only ever remove FALSE positives -- a surfaced slicer genuinely drawn on
+        # top of a sheet overlaps on both axes and by much more than a graze.
+        if any(v["position"]["x"] < band_right - tol
+               and v["position"]["x"] + v["position"]["width"] > band_left + tol
+               and (min(v["position"]["y"] + v["position"]["height"], band_bottom)
+                    - max(v["position"]["y"], band_top)) > _REFLOW_MIN_OVERLAP * band_h
                for v in content):
             band = (band_top, band_bottom)
             break
