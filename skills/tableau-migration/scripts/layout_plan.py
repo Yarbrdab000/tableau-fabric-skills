@@ -10,6 +10,7 @@ this module is the single seam that runs all three and hands the emit path one l
     plan["background"]     -> frozenset(id)     full-canvas backdrops        (tier 1)
     plan["panel"]          -> frozenset(id)     sub-region decoration panels (tier 2)
     plan["overlay"]        -> frozenset(id)     author-intended floats       (tier 3)
+    plan["collapsed"]      -> frozenset(id)     zones the AUTHOR collapsed to zero (hidden)
     plan["page"]           -> (w, h)            possibly GROWN past the requested page
     plan["grew"]           -> bool              whether growth actually fired
 
@@ -107,6 +108,59 @@ def _place_float(node, extent, pw, ph, resolver):
     return _clamp_on_page((sx * kx, sy * ky, max(aw, mw), max(ah, mh)), pw, ph)
 
 
+def _collapsed_src(node):
+    """True when the AUTHOR collapsed this zone to zero size, i.e. hid it.
+
+    Tableau hides a zone by collapsing it to ``w=0`` (or ``h=0``). That is the mechanism behind a
+    parameter-driven show/hide pair -- two sheets share one slot and a parameter decides which is
+    drawn -- and it is the ordinary way a "vs Goal / vs PY" toggle is built.
+    """
+    src = node.get("src") or {}
+    try:
+        return float(src.get("w") or 0.0) <= 0.0 or float(src.get("h") or 0.0) <= 0.0
+    except (TypeError, ValueError):
+        return False
+
+
+def _prune_collapsed(node, removed):
+    """Drop author-collapsed zones so they take NO share of their flow container. In place.
+
+    A collapsed zone is a THIRD hiding mechanism, distinct from both things this module already
+    reasons about: ``SKIP_KINDS`` skips a ``blank`` spacer, and its comment weighs ``hidden-by-user``
+    and deliberately keeps it (a show/hide toggle is not a delete, and the emit path surfaces such a
+    zone anyway, so it occupies real page area). Neither describes a zone the author reduced to zero
+    width, so it walked past both -- reached :func:`default_min_for_leaf`, was floored to a real
+    box by ``leaf_kind``, and took a full share of a container that has none to give.
+
+    Measured on a Salesforce NPSP dashboard with four such show/hide pairs: each hidden twin claimed
+    ~160px of an ``hstack`` sized for one sheet, displacing its VISIBLE twin by up to 179px and
+    halving its width (277 -> 160). Excluding them takes the page from 20 of 43 zones drifting more
+    than 30px to 9, and mean drift from 52.2px to 32.4px.
+
+    :func:`_place_float` already declines exactly this condition (``if sw <= 0 or sh <= 0``) for an
+    absolutely-positioned zone, and states why -- inflating something with no flow siblings simply
+    grows it over its neighbour. The flow path had no equivalent guard; this is that rule, for flow.
+
+    A collapsed zone is NOT emitted as a visual either way, so nothing is lost by removing it: the
+    only thing it contributed was space it does not occupy in the source.
+    """
+    kids = node.get("children") or []
+    if not kids:
+        return
+    keep = []
+    for child in kids:
+        if _collapsed_src(child):
+            for lf in _leaves_of(child):
+                if lf.get("zone_id") is not None:
+                    removed.add(lf["zone_id"])
+            if child.get("zone_id") is not None:
+                removed.add(child["zone_id"])
+            continue
+        _prune_collapsed(child, removed)
+        keep.append(child)
+    node["children"] = keep
+
+
 def build_plan(db, device_zones=None, page_w=1280.0, page_h=720.0, min_for_leaf=None):
     """Build the solved layout plan for one ``<dashboard>`` Element, or ``None`` (fail-closed).
 
@@ -124,6 +178,8 @@ def build_plan(db, device_zones=None, page_w=1280.0, page_h=720.0, min_for_leaf=
         tree = parse_zone_tree(db, device_zones)
         if not tree:
             return None
+        collapsed = set()
+        _prune_collapsed(tree["root"], collapsed)
         resolver = min_for_leaf or default_min_for_leaf
         res = solve(tree, (0.0, 0.0, pw_req, ph_req), min_for_leaf=resolver)
         if res is None:
@@ -162,6 +218,10 @@ def build_plan(db, device_zones=None, page_w=1280.0, page_h=720.0, min_for_leaf=
             "background": _ids(_layers.background_leaves(visible, page_rect)),
             "panel": _ids(_layers.panel_leaves(visible)),
             "overlay": _ids(_layers.floating_overlay_leaves(visible)),
+            # Zones the AUTHOR collapsed to zero, excluded from allocation. Reported so the fidelity
+            # layer can say a show/hide twin was dropped rather than leaving a reader to infer it
+            # from an absent rect.
+            "collapsed": frozenset(collapsed),
             "page": (pw, ph),
             "grew": (pw > pw_req + TOL) or (ph > ph_req + TOL),
         }

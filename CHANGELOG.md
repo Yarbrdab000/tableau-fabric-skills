@@ -14,6 +14,53 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ### Fixed
 
+- **`tableau-migration` (skill `2.337.0` → `2.338.0`): a zone the AUTHOR collapsed to zero takes
+  no share of its flow container, so a parameter-driven show/hide pair stops displacing the twin it
+  hides.** Tableau hides a zone by collapsing it to `w=0` (or `h=0`) -- that is the ordinary
+  mechanism behind a "vs Goal / vs PY" toggle, where two sheets share one slot and a parameter
+  decides which is drawn.
+
+  Neither thing the layout module already reasons about covers it. `SKIP_KINDS` skips a `blank`
+  spacer, and its comment weighs `hidden-by-user` and deliberately KEEPS it (*"a show/hide toggle is
+  not a delete, and the emit path surfaces such a zone anyway, so it occupies real page area"*). A
+  collapsed zone is a THIRD mechanism and walked past both -- reaching `default_min_for_leaf`, being
+  floored to a real box by its `leaf_kind`, and claiming a full share of a container that has none
+  to give.
+
+  The asymmetry was already inside the same file: `_place_float` declines exactly this condition
+  (`if sw <= 0 or sh <= 0: return None`) for an absolutely-positioned zone, and says why --
+  inflating something with no flow siblings simply grows it over its neighbour. The flow path had no
+  equivalent guard. This is that rule, for flow.
+
+  Measured on a Salesforce NPSP dashboard carrying four such pairs: each hidden twin claimed ~160px
+  of an `hstack` sized for one sheet, displacing its VISIBLE twin by up to 179px and halving its
+  width (277 → 160). Solver rects, compared by `zone_id` (exact -- no matching): zones drifting more
+  than 30px from their authored rect go **20 of 43 → 9 of 43**, mean drift **52.2px → 32.4px**. At
+  the render: the three KPI cards regain their authored three-column layout, and the month
+  sparklines widen enough to show all twelve months instead of six behind a scrollbar.
+
+  **WHAT THIS DOES NOT FIX, stated because a mean-drift number reads as "layout fixed".** All four
+  collapsed zones on that page have `w=0` with a non-zero `h`, so this only ever corrects
+  HORIZONTAL apportioning. A separate VERTICAL misplacement is untouched: the KPI band is emitted at
+  y=240..336 where the source has it at 184..294, so it overruns the parameter row beneath it, and
+  the dashboard's filter-band container still drifts 250px. Both remain open.
+
+  **A consequence of that residual which looks like a regression and is not.** Emitted overlapping
+  visual pairs go 2 → 4 -- because the KPI cards are now their CORRECT width (160 → 267px) and so
+  reach both slicers in the row below instead of one. The evidence that it is one pre-existing
+  defect counted more times, rather than a new one, is that the vertical overlap is **55px in all
+  six pairs, before and after**: the same misplaced row, measured against wider cards.
+
+  A collapsed zone is not emitted as a visual on either engine, so nothing is lost by excluding it
+  -- the only thing it contributed was space it does not occupy in the source. Plans additively
+  report the excluded ids as `plan["collapsed"]`, so a dropped show/hide twin is stated rather than
+  inferred from an absent rect. A dashboard with no collapsed zone is untouched, which is what keeps
+  33 of the 34 corpus workbooks byte-identical.
+
+  Suite 5344 passed / 6 skipped / 1 xfailed. Eight positive controls, each caught by its NAMED test,
+  source hash-verified after every one -- including one asserting the guard is CALLED, since a
+  correct helper nothing invokes is a true statement about an artifact nobody ships.
+
 - **`tableau-migration` (skill `2.336.0` → `2.337.0`): a generated calendar makes ACTIVE the date
   its own island actually charts, not the one that sorts first.** `_activate_without_ambiguity`
   documented the rule in its own source -- *"a table whose primary date the workbook actually CHARTS
