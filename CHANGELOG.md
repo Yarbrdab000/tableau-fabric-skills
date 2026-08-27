@@ -14,6 +14,28 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ### Fixed
 
+- **`tableau-migration` (skill `2.331.0` → `2.332.0`): placement drift is reported PER AXIS, with
+  sign (#169).** A field report on four unrelated workbooks described a dead vertical gap between
+  header and content, with the coordinate-level lead that *"X translates ~1:1 while Y visibly
+  drifts"*. `summary.placement` already existed and is **axis-blind** -- `max_edge_px` is a max over
+  all four edges -- so a claim of the form *"one axis is fine and the other is not"* was not
+  expressible in it, and neither the reporter nor we could confirm or refute the one specific lead
+  the report contained. Additive `by_axis` now carries per-axis exact counts, median/mean/worst
+  absolute error, **signed** mean and direction counts. What it then measured on the 34-workbook
+  corpus, 104 zone-to-visual pairs: **21 of 29** scorable workbooks are pixel-exact on BOTH axes;
+  **6** show the reported shape, and on **4 of those X is exactly 0.0 px** while Y is 60-256 px out
+  (`0067_global_filter`: X 8/8 exact at 0.0 px, Y 3/8 at 60.3 px). Every affected workbook is a
+  multi-zone dashboard. So the asymmetry is REAL and reproduces here -- but the hypothesised
+  mechanism does not: a header band subtracted from one axis predicts a consistent sign, and the sign
+  is **not** consistent (37 down against 23 up, signed mean +4.3 px; per workbook +108, +65, −56,
+  +7.6). Reporting only the absolute figures would have corroborated a mechanism the signed figures
+  rule out, which is why `mean_signed_px` and the direction counts are part of the rollup rather than
+  an afterthought -- and why the test pins that two populations with identical magnitudes and
+  opposite scatter must not read the same. The markdown report gains a by-axis line directly under
+  the axis-blind one, since that is where a reader stands when forming the belief "the layout
+  drifted". Every pre-existing key is unchanged. Six tests, eight positive controls, all caught --
+  including *"Y axis reads the LEFT delta"* and *"signed mean dropped"*.
+
 - **`tableau-migration` (skill `2.330.0` → `2.331.0`): `estate_survey.py` can be scoped below site
   level, and reports progress by default (#175).** An engineer needed **12 workbooks** from one
   project on a site holding **273**. The survey ran site-wide -- ~275 REST calls, 6+ minutes -- and

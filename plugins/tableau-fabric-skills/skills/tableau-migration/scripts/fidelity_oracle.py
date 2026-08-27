@@ -1501,6 +1501,29 @@ def _object_target(obj, dashboard, page_display, canvas_w, canvas_h):
     return rec
 
 
+def _axis_rollup(placements, dim, off):
+    """Per-axis placement statistics for one axis: ``dim`` is 'w'/'h', ``off`` is 'left'/'top'."""
+    vals = [p["delta_px"][off] for _w, p in placements
+            if isinstance(p.get("delta_px"), dict) and p["delta_px"].get(off) is not None]
+    if not vals:
+        return None
+    a = sorted(abs(v) for v in vals)
+    mid = len(a) // 2
+    median = a[mid] if len(a) % 2 else (a[mid - 1] + a[mid]) / 2.0
+    return {
+        "evaluated": len(vals),
+        "exact": sum(1 for v in a if v <= PLACEMENT_EXACT_PX),
+        "median_abs_px": round(median, 2),
+        "mean_abs_px": round(sum(a) / len(a), 2),
+        "worst_abs_px": round(a[-1], 2),
+        # SIGNED, because it is the only thing that separates "scattered both ways" from a
+        # systematic offset -- and those demand completely different investigations.
+        "mean_signed_px": round(sum(vals) / len(vals), 2),
+        "positive": sum(1 for v in vals if v > PLACEMENT_EXACT_PX),
+        "negative": sum(1 for v in vals if v < -PLACEMENT_EXACT_PX),
+    }
+
+
 def _placement_rollup(visual_results):
     """Aggregate the per-visual minute placement deltas into one dashboard-level layout verdict.
 
@@ -1508,6 +1531,28 @@ def _placement_rollup(visual_results):
     band vs drifted, and reports the worst/mean worst-edge offset and which worksheet drifted most.
     Render-free and purely additive -- it summarizes the existing ``placement`` diagnostics and does
     not touch the score. ``None`` when no visual carried a placement delta (no canvas/zone).
+
+    ``by_axis`` (#169) is additive and exists because every other number here is **axis-blind**:
+    ``max_edge_px`` is a max over all four edges, so it structurally cannot express a claim of the
+    form *"X translates ~1:1 while Y drifts"* -- the exact shape of a field report on four unrelated
+    workbooks. A reader could not have confirmed or refuted it with this instrument, and neither
+    could we.
+
+    Measured on the 34-workbook corpus at 2.331.0, 104 zone-to-visual pairs:
+
+    ==========  ======  ============  ==========  =============================
+    axis        exact   median |px|   mean |px|   signed
+    ==========  ======  ============  ==========  =============================
+    x (left)    60      0.0           20.4        +9.2   (20 right / 24 left)
+    y (top)     44      5.0           37.0        +4.3   (37 down / 23 up)
+    ==========  ======  ============  ==========  =============================
+
+    So the asymmetry is REAL -- Y is placed exactly less often than X and its median error is 5 px
+    against X's 0 -- and it is **not** the hypothesised constant offset: 37 down against 23 up, with
+    a signed mean of +4.3 px. Both halves matter. Reporting only the absolute figures would have
+    corroborated a mechanism (a header band subtracted from one axis) that the signed figures rule
+    out, which is why ``mean_signed_px`` and the direction counts are here rather than just the
+    magnitudes.
     """
     placements = [(r["worksheet"], r["placement"]) for r in visual_results if r.get("placement")]
     if not placements:
@@ -1525,6 +1570,11 @@ def _placement_rollup(visual_results):
         verdict = "acceptable"
     else:
         verdict = "drifted"
+    by_axis = {}
+    for axis, dim, off in (("x", "w", "left"), ("y", "h", "top")):
+        stats = _axis_rollup(placements, dim, off)
+        if stats:
+            by_axis[axis] = stats
     return {
         "evaluated": n,
         "pixel_exact": exact,
@@ -1534,6 +1584,7 @@ def _placement_rollup(visual_results):
         "mean_max_edge_px": mean_edge,
         "worst_worksheet": worst_ws,
         "verdict": verdict,
+        "by_axis": by_axis,
     }
 
 
@@ -4196,6 +4247,18 @@ def render_markdown(report):
                 pr["worst_max_edge_px"],
                 "" if pr["verdict"] == "pixel-exact" or not pr.get("worst_worksheet")
                 else " (`%s`)" % pr["worst_worksheet"]))
+        # PER-AXIS, right under the axis-blind line, because that line is where a reader stands
+        # when they form the belief "the layout drifted" -- and it cannot tell them WHICH WAY (#169).
+        ax = pr.get("by_axis") or {}
+        if ax.get("x") and ax.get("y"):
+            lines.append(
+                "  - by axis: **X** %d/%d exact, median %s px, mean signed %+g px "
+                "(%d right / %d left) — **Y** %d/%d exact, median %s px, mean signed %+g px "
+                "(%d down / %d up)" % (
+                    ax["x"]["exact"], ax["x"]["evaluated"], ax["x"]["median_abs_px"],
+                    ax["x"]["mean_signed_px"], ax["x"]["positive"], ax["x"]["negative"],
+                    ax["y"]["exact"], ax["y"]["evaluated"], ax["y"]["median_abs_px"],
+                    ax["y"]["mean_signed_px"], ax["y"]["positive"], ax["y"]["negative"]))
     if s.get("dashboard_objects"):
         lines.append(
             "- **Dashboard objects:** %d non-worksheet object(s) captured as placement targets "
