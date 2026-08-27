@@ -3399,6 +3399,34 @@ def _date_usage_from_ir(result):
         return {}
 
 
+def _date_usage_by_island_from_ir(result):
+    """``{island: {date column (lowered): shelf uses}}`` this workbook's IR reports, or ``{}``.
+
+    Sibling of ``_date_usage_from_ir``, and the reason it cannot be reused: the workbook-wide map
+    is keyed by COLUMN NAME alone, so two datasources that both carry a ``CreatedDate`` share one
+    tally. Its own docstring says ranking is only ever valid WITHIN one table's columns -- ordering
+    candidate TABLES against each other is outside that guarantee, and doing it anyway moves one
+    island's calendar by another island's evidence.
+
+    Never raises: an IR that cannot be read, or an engine predating the helper, supplies no
+    per-island usage and the model build falls back to the workbook-wide map exactly as before.
+    """
+    try:
+        ir = (result or {}).get("ir") if isinstance(result, dict) else None
+        if not ir:
+            return {}
+        try:
+            from . import twb_to_pbir as _tp
+        except ImportError:
+            import twb_to_pbir as _tp
+        fn = getattr(_tp, "date_field_usage_by_island", None)
+        if fn is None:
+            return {}
+        return fn(ir) or {}
+    except Exception:
+        return {}
+
+
 def _colour_palettes_from_ir(result):
     """The AUTHORED discrete-colour palettes this workbook's IR carries, or ``{}``.
 
@@ -3818,6 +3846,7 @@ def _build_datasource_pbip(entry, wb_detail, twb_text, result, ds, *, label, mod
                                  # active date and lost their whole calendar hierarchy. Empty -> the
                                  # naming conventions, byte-for-byte as before.
                                  date_usage=_date_usage_from_ir(result),
+        date_usage_by_island=_date_usage_by_island_from_ir(result),
                                  semantic_colours=semantic_colours)
     except Exception as exc:
         warns.append(_PBIP_WARN + f"could not rebuild embedded datasource {label!r} "

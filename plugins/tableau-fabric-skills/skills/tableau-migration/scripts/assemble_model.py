@@ -3014,7 +3014,8 @@ def _stub_backed_tables(tables):
 
 
 def _build_date_dimensions(tables, emitted_names, relationships, *, mark_as_date=True,
-                           mode="import", date_range=None, date_usage=None):
+                           mode="import", date_range=None, date_usage=None,
+                           date_usage_by_island=None):
     """One Date dimension PER DATASOURCE ISLAND -> ``([(name, part)], rels, report)``.
 
     A workbook with several datasources keeps them as ISLANDS: Tableau never lets one datasource's
@@ -3053,10 +3054,15 @@ def _build_date_dimensions(tables, emitted_names, relationships, *, mark_as_date
         own = [r for r in tables if (r.get("source_datasource") or "").strip() == ds]
         if not own:
             continue
+        # THIS ISLAND'S OWN shelf evidence. A workbook-wide count ranks candidate TABLES
+        # against each other using uses that may all belong to a different island -- see
+        # ``twb_to_pbir.date_field_usage_by_island``. Falls back to the global map when the
+        # island has no date usage of its own, which is the previous behaviour.
+        own_usage = (date_usage_by_island or {}).get((ds or "").strip().lower()) or date_usage
         name, part, rels, report = _build_date_dimension(
             own, taken, relationships, mark_as_date=mark_as_date,
             name_pref="Date (%s)" % ds, mode=mode, date_range=date_range,
-            date_usage=date_usage)
+            date_usage=own_usage)
         if part is None:
             continue
         built.append((name, part))
@@ -3086,7 +3092,7 @@ def _filter_reach(adjacency, start):
     return seen
 
 
-def _activate_without_ambiguity(candidates, relationships, date_name):
+def _activate_without_ambiguity(candidates, relationships, date_name, usage=None):
     """Which tables may keep an ACTIVE calendar relationship -> ``{display_name, ...}``.
 
     POWER BI REFUSES TO OPEN A PROJECT THAT HAS TWO ACTIVE FILTER PATHS BETWEEN ANY TWO TABLES.
@@ -3123,9 +3129,28 @@ def _activate_without_ambiguity(candidates, relationships, date_name):
         if rel.get("cross_filter") == "both":
             adjacency.setdefault(dst, set()).add(src)
 
-    # Stable order: a table whose primary date the workbook actually charts wins the direct edge,
+    # Stable order: a table whose primary date the workbook actually CHARTS wins the direct edge,
     # then alphabetical so the outcome never depends on dict iteration order.
-    ordered = sorted((c for c in candidates if c[2] is not None), key=lambda c: c[0])
+    #
+    # The usage term was documented here and NOT IMPLEMENTED -- the key was the display name
+    # alone, so the winner was decided by the first letter of a table name. Measured on
+    # Salesforce NPSP: ``caseman__Goal__c`` took the active edge to ``Date (Service Delivery)``
+    # over ``pmdm__ServiceDelivery__c`` purely because 'c' sorts before 'p', leaving the
+    # workbook's MOST-charted date (``pmdm__DeliveryDate__c``, on 5 shelves against
+    # ``CreatedDate``'s 4) inactive. A date pill can only rebind to the calendar when it is the
+    # ACTIVE business date, so every Month axis over Delivery Date degraded to the fact's raw
+    # date column -- and a previous-year/current-year pair then plots at DIFFERENT x positions
+    # (PY on 2019 dates, CY on 2020) instead of sharing twelve months, which silently defeats
+    # the overlapping-bar rebuild those sheets are built on.
+    #
+    # ``usage`` is the same map ``_select_primary_date`` already consults (date column name ->
+    # how many shelves the author placed it on), so this reuses the workbook's own evidence
+    # rather than introducing a second notion of "important". Ties keep the alphabetical
+    # tiebreak, so the outcome stays deterministic.
+    _usage = usage or {}
+    ordered = sorted(
+        (c for c in candidates if c[2] is not None),
+        key=lambda c: (-_usage.get((c[2] or "").strip().lower(), 0), c[0]))
 
     activated = set()
     for disp, _cols, _primary in ordered:
@@ -3220,7 +3245,8 @@ def _build_date_dimension(tables, emitted_names, relationships, *, mark_as_date=
                 f"USERELATIONSHIP or a model edit.")
         candidates.append((disp, date_cols, primary))
 
-    activated = _activate_without_ambiguity(candidates, relationships, date_name)
+    activated = _activate_without_ambiguity(candidates, relationships, date_name,
+                                            usage=date_usage)
     for disp, date_cols, primary in candidates:
         if primary is not None and disp not in activated:
             warnings.append(
@@ -4461,7 +4487,8 @@ def assemble_import_model(descriptor, *, model_name, calcs=None, dim_calcs=None,
                           calc_lookup=None, approved_calc_dax=None, date_range=None,
                           parameters=None, table_calc_usages=None, calc_outer_aggs=None,
                           scatter_keys=None, storage_decision=None,
-                          colour_palettes=None, semantic_colours=False, date_usage=None):
+                          colour_palettes=None, semantic_colours=False, date_usage=None,
+                          date_usage_by_island=None):
     """Assemble the Import/DirectQuery semantic model definition for a parsed descriptor.
 
     Returns ``{"parts": {path: text}, "report": {...}}``. Raises ``ValueError`` if the
@@ -4610,7 +4637,8 @@ def assemble_import_model(descriptor, *, model_name, calcs=None, dim_calcs=None,
     if date_table:
         _date_built, date_rels, date_report = _build_date_dimensions(
             tables, table_names, all_rels, mark_as_date=mark_as_date, mode=mode,
-            date_range=date_range, date_usage=date_usage)
+            date_range=date_range, date_usage=date_usage,
+            date_usage_by_island=date_usage_by_island)
         for _dn, _dp in _date_built:
             parts[f"definition/tables/{_dn}.tmdl"] = _dp
             table_names.append(_dn)
@@ -5574,7 +5602,7 @@ def migrate_tds_to_semantic_model(tds_text, *, model_name, calcs=None, dim_calcs
                                   emit_linguistic=False, calc_outer_aggs=None,
                                   scatter_keys=None, storage_decision=None,
                                   colour_palettes=None, semantic_colours=False,
-                                  date_usage=None):
+                                  date_usage=None, date_usage_by_island=None):
     """One-call convenience: parse ``.tds``/``.twb`` text and assemble the Import/DirectQuery model.
 
     ``calcs`` are the MEASURE-role calculated fields and ``dim_calcs`` the DIMENSION/row-level ones
@@ -5685,7 +5713,8 @@ def migrate_tds_to_semantic_model(tds_text, *, model_name, calcs=None, dim_calcs
                                    scatter_keys=scatter_keys, storage_decision=storage_decision,
                                    colour_palettes=colour_palettes,
                                    semantic_colours=semantic_colours,
-                                   date_usage=date_usage)
+                                   date_usage=date_usage,
+                                   date_usage_by_island=date_usage_by_island)
     # Splice harvested Group/Bin calc columns onto their resolved home tables -- the same additive
     # pre-partition injection as dim_calcs (byte-for-byte unchanged when there are no groups/bins).
     harvest_parts = result.get("parts") if isinstance(result, dict) else None

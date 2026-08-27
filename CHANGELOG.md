@@ -14,6 +14,54 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ### Fixed
 
+- **`tableau-migration` (skill `2.336.0` → `2.337.0`): a generated calendar makes ACTIVE the date
+  its own island actually charts, not the one that sorts first.** `_activate_without_ambiguity`
+  documented the rule in its own source -- *"a table whose primary date the workbook actually CHARTS
+  wins the direct edge, then alphabetical so the outcome never depends on dict iteration order"* --
+  and then keyed the sort on the display name alone. The usage term was never implemented, so the
+  winner was decided by the first letter of a table name.
+
+  This is a render defect, not a modelling nicety. A date pill can only rebind to `Date[Month]` when
+  its column is the active business date; lose the edge and every Month axis degrades to the fact's
+  raw date column. Measured on Salesforce NPSP: `caseman__Goal__c` took the edge to
+  `Date (Service Delivery)` over `pmdm__ServiceDelivery__c` **because `c` sorts before `p`**, leaving
+  `pmdm__DeliveryDate__c` -- on 5 shelves against `CreatedDate`'s 4 -- inactive. Three
+  previous-year/current-year pairs then plotted **PY on 2019 dates and CY on 2020**, never sharing an
+  x position, which silently defeats the overlapping-bar rebuild those sheets exist for. All three
+  already carried the correct overlap recipe and rendered as nothing.
+
+  The evidence is scoped PER ISLAND, and the first implementation that was not is why. Ranking with
+  the workbook-wide `date_field_usage` map regressed a *different* island: that map is keyed by
+  column name alone and its own docstring forbids this use -- *"ranking is only ever used WITHIN one
+  table's own columns"*. Ordering candidate TABLES against each other is a cross-table comparison it
+  cannot make. `pmdm__DeliveryDate__c` is charted 5 times, **all 5 on Service Delivery sheets**, and
+  it won the Assessments calendar on a count earned entirely elsewhere, degrading two Assessments
+  charts from `Date (Assessments)[Month Start]` to a raw column. New
+  `twb_to_pbir.date_field_usage_by_island` keys on the field's `datasource` -- the same island
+  identifier `_build_date_dimensions` already splits on -- so the scoping is exact rather than
+  inferred. **The corpus caught that regression; the suite did not.**
+
+  Absent or partial evidence falls back to the workbook-wide map, which is the previous behaviour,
+  and no evidence at all falls back to the alphabet -- so 33 of the 34 corpus workbooks are
+  byte-identical.
+
+  Verified by RENDER, which is the only instrument that could see this: the model opened cold,
+  refreshed and persisted, and the three sparklines now share Jan-Aug with grey PY behind magenta CY
+  on the same month. `powerbi-report-author validate` was clean before and after. Both islands
+  confirmed active on their own date. Suite 5335 passed / 6 skipped / 1 xfailed at engine 2.337.0.
+  Ten positive controls, each caught by its NAMED test, sources hash-verified after every one.
+
+  Two of this change's own tests passed VACUOUSLY before they passed correctly, and both are recorded
+  because neither was catchable by re-reading. The first pin read the SOURCE for `date_usage_by_island`
+  and `own_usage`; a control replacing the scoped lookup with `own_usage = date_usage` leaves both
+  strings in place, so the guard stayed green against the exact defect it was written for. Rewritten
+  behaviourally, it then failed for a second reason: `_build_date_dimension` treats a table that is
+  only ever the `to` (ONE) side as a PURE DIMENSION and gives it no calendar edge, so a fixture of
+  "two tables, one joined to the other" leaves exactly ONE candidate per island -- and a ranking test
+  over a single candidate proves nothing. **Fixing the first layer is what revealed the second, so
+  "the guard went green after I fixed it" was itself not evidence.** There is now an explicit
+  anti-vacuity control asserting the candidates actually compete.
+
 - **`tableau-migration` (skill `2.335.0` → `2.336.0`): the measure trellis fans by RECTANGLE, so a
   sheet with SEVERAL dual axes rebuilds as several overlaid pairs instead of one chart per measure.**
   The overlapping-bar detector gated on `axis_panes >= 2 and rectangles <= 1`, which is correct for

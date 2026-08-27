@@ -10442,6 +10442,39 @@ def date_field_usage(ir):
     return out
 
 
+def date_field_usage_by_island(ir):
+    """``{datasource caption (lowered): {date column (lowered): shelf count}}``.
+
+    The island-scoped sibling of :func:`date_field_usage`, and it exists because that map's own
+    contract forbids the use this enables: *"ranking is only ever used WITHIN one table's own
+    columns, so a shared name cannot promote a column its table does not have"*. Ordering CANDIDATE
+    TABLES against each other is a cross-table comparison, and a workbook-wide count cannot make it.
+
+    Measured on Salesforce NPSP, which keeps four datasource islands: ``pmdm__DeliveryDate__c`` is
+    charted 5 times and ``caseman__AssessmentCompletedDate__c`` twice, but every one of those 5 is on
+    a SERVICE DELIVERY sheet. Ranked workbook-wide, Delivery Date therefore won the active calendar
+    edge on the ASSESSMENTS island too -- where it is charted zero times -- and knocked that island's
+    real business date off the calendar, degrading two Assessments charts from
+    ``Date (Assessments)[Month Start]`` to a raw fact column.
+
+    A field's ``datasource`` is the island caption, which is the identifier the model build and the
+    report already share (see ``_build_date_dimensions``), so scoping is exact rather than inferred.
+    """
+    out = {}
+    for ws in (ir or {}).get("worksheets") or []:
+        for shelf in ("rows", "cols", "filters"):
+            for f in (ws.get(shelf) or []):
+                if not isinstance(f, dict):
+                    continue
+                if (f.get("datatype") or "").lower() not in _DATE_TYPES:
+                    continue
+                key = (f.get("property") or "").strip().lower()
+                island = (f.get("datasource") or "").strip().lower()
+                if key and island:
+                    out.setdefault(island, {})[key] = out.setdefault(island, {}).get(key, 0) + 1
+    return out
+
+
 def discrete_colour_palettes(ir):
     """``{measure caption: [(member, "#rrggbb"), ...]}`` -- AUTHORED colours for each discrete
     colour measure this report paints with.
