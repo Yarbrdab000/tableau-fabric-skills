@@ -1468,6 +1468,47 @@ because the checking was supposedly over. **A summary is unchecked by constructi
 numbers go once nobody is looking at them any more. Write *"this kept happening"*: it costs nothing
 and cannot be wrong.
 
+### A confirmed numerator makes a wrong denominator feel checked
+
+The sharpest member of the ratio family, because **re-measuring is what sustained it.** A claim was
+filed three times — *"`COALESCE(…, 0)` from `ZN()` makes measures never blank, so 901 categories
+render where 24 have data"* — and sat at the top of an open-defects list as the recommended next item.
+It is false, and the mechanism is not carelessness:
+
+```
+the visual RENDERS       94 members     <- the authored filters ARE applied
+the claim said          901 members     <- VALUES([Name]) with NO filter context
+of the 94: 25 have data, 64 legitimately empty (2017-2019 rows under a current-vs-prior-year measure)
+```
+
+**Only the denominator was wrong.** The *"24 with data"* was `PY <> 0` over all 901 members; the true
+filtered figure is 25 of 94. Two different populations landing on nearly the same number. So every
+re-check of *"is 24 right?"* came back **yes**, and each one felt like corroboration — while the term
+that made the ratio damning, the 10×-wrong denominator, was never re-derived, **because the number
+being doubted was the small one.**
+
+> **When a ratio looks dramatic, the suspect term is the one you did NOT re-derive.**
+
+And the corollary that explains three survivals: **re-measuring the right quantity in the wrong frame
+produces stable, reproducible, wrong answers. Stability is not validity.** This is the one defence
+"measure it again" cannot provide, because measuring it again is the thing that goes wrong.
+
+**What settled it was a MEMBERSHIP test, not a better count.** The render's first categories were
+`Adeline… / Adriena… / Aigneis… / Alexand… / Alika…` — every one in the filtered set, and not one
+name unique to the unfiltered set (`Addia`, `Adara`, `Adan`, `Adaline`, `Abigail`) appeared. **A
+membership test cannot be satisfied by a coincidence of magnitudes**, which is exactly the failure
+mode a count comparison is exposed to. Prefer *"is this specific object in the set I claim?"* over
+*"do the totals agree?"* whenever the question is which population you are looking at.
+
+**And the drafted fix would have broken a contract.** `IF(ISBLANK(v) && ISEMPTY('<fact>'), BLANK(),
+COALESCE(v, 0))` was written before a cross-tab showed **every member has fact rows** — there were no
+empty categories to resurrect. Both emission sites carry their rationale within two lines:
+`calc_to_dax.py` documents `ZN(x) -> COALESCE(x, 0)` as the literal translation (`ZN` *means*
+zero-if-null, so a blank-guard misrepresents what the author wrote), and `assemble_model.py` says
+outright *"`COALESCE(..., 0)` (not `BLANK`) is deliberate fidelity: RUNNINGSUM / PREVIOUS / window
+math"*. Same shape as the `nativeQueryRef` rebind: **a systematic divergence that is a contract, with
+the reason sitting in a comment beside the code.**
+
 **A second instance landed minutes later, from the other direction, and it was a credit rather than a
 count.** A closing message said of a lane *"you found both of your own wrongs"*. The record showed one
 joint and one found entirely by someone else — **zero self-caught**. The lane handed the credit back:
