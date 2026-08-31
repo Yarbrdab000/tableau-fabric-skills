@@ -14,6 +14,33 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ### Fixed
 
+- **`tableau-migration` (skill `2.343.0` → `2.344.0`): REVERTS 2.342.0. The dropdown-slicer floor
+  goes back to 57px, because the premise I called false is true (#180).** 2.342.0 restored the 76px
+  floor on the finding that `SLICER_FONT_PT` is unreferenced and *"zero of 94 emitted slicers contain
+  the substring `fontSize` anywhere"*, concluding that no size is stamped and the default face's
+  arithmetic (header 28 + selector 32 + padding 8/8) therefore applies. **The property is `textSize`,
+  not `fontSize`.** Re-measured with the right predicate: **94 of 94 slicers stamp a `textSize` on
+  BOTH the `header` and `items` wells**, and the value is the AUTHORED point size rather than a fixed
+  9 -- `9D` ×182, `8D` ×4, `11D` ×2. Zero slicers lack it. So 2.295.0's render verification was
+  sound, and 2.342.0 grew every dropdown card in every workbook by up to 19px against its authored
+  height. Caught by the user, not by any gate. **The unreferenced constant was the trap:** it is
+  genuinely unused, that half of the analysis was correct, and it is not evidence about whether a
+  size is stamped -- the emit path writes `textSize` directly. Both facts are now asserted together
+  so neither can be read as implying the other. **Two of the deleted tests are worth naming.**
+  `test_no_emitted_slicer_declares_a_font_size` asserted `"fontSize" not in raw` and **passed** --
+  correctly, vacuously, and about nothing, since that property never appears under any behaviour; a
+  test can pass for the wrong reason and read as coverage of what it never checked. The replacement
+  asserts the premise POSITIVELY on a real emitted slicer, and fails with the arithmetic spelled out
+  if a slicer ever ships unstamped or at ≥12pt. **`PBIR_SLICER_HEIGHT_BELOW_FLOOR` will flag this
+  again on 8 corpus workbooks, and that is now documented as expected:** the rule computes the
+  default face's chrome and cannot see the stamped size, so on our output it is a known false
+  positive -- the one place we knowingly fail a first-party rule, because the render is the authority
+  over the rule and satisfying it costs a third of the authored card height. If the trade is ever
+  revisited, re-render; do not re-argue it from the validator. Six tests. Building the fixture took
+  four attempts -- dropped `filters=`, missing card zone, wrong emit signature, wrong detector -- and
+  **every one emitted zero slicers**, which without the anti-vacuity assert would have read as *"no
+  slicer stamps a size"*: the same false-absence that caused the release being reverted.
+
 - **`tableau-migration` (skill `2.342.0` → `2.343.0`): workbook-path telemetry NAMES its tables
   instead of only counting them (#182).** The datasource path's `ds_details` has always emitted
   `tables: ["FACT_ORDERS", "DIM_CUSTOMER", ...]`; `embedded_datasources` emitted only `table_count`.
