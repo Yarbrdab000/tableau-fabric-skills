@@ -14,6 +14,30 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ### Fixed
 
+- **`tableau-migration` (skill `2.339.0` → `2.340.0`): the post-wrap openability re-check no longer
+  drops the additive keys it does not name (#183).** `_recheck_openability_after_wrap` rebuilt
+  `openability_selfcheck` from scratch, naming four keys, so two the gate documents as **always
+  present** were read from nowhere and vanished: `not_evaluated` (#141) -- *"cross-reference the two
+  keys for the tri-state: a check named here did not run, whatever `checks` says"* -- and
+  `reference_case_mismatches` (#164) -- *"present and empty on a healthy build, so its absence is
+  never mistaken for 'not evaluated'"*. After the merge its absence was exactly that. Measured by the
+  reporter at 2.339.0 over 45 workbooks: 43 of 44 payloads carried `not_evaluated`, the one that did
+  not was the only workbook with `rechecked_after_row_predicate_wrap: true`, and it was missing
+  `endpoints_distinct` from `checks` -- precisely the case `not_evaluated` exists to explain.
+  **The consumer this hurt most is the careful one:** reading `checks.get(name)` naively is
+  unaffected, and implementing the documented tri-state is what breaks, silently. Reproduced at the
+  function before changing anything. **The fix is the shape, not the two keys** -- carrying them by
+  name would fix the report and reintroduce the defect the next time a key is added, because nothing
+  fails when a new key is forgotten. The merge now layers `before` then `post` and overrides only the
+  three fields it genuinely computes, so a new key is carried by default. Order is load-bearing in
+  both directions: `post` wins for a key both runs emit (`not_evaluated` describes the run that
+  produced `checks`, so a stale one would pair a fresh verdict with an old account of what it omits),
+  and a key only `before` carries survives -- which is what a key added to the gate between two runs
+  looks like. **My first fix based the merge on `post` alone and the future-key test caught it:**
+  every assertion naming the two reported keys passed against a version that still lost a
+  `before`-only key. Eight tests, eight positive controls, all caught -- including *"allow-list of the
+  two named keys"*, which is the one that separates fixing the class from fixing the report.
+
 - **`tableau-migration` (skill `2.338.0` → `2.339.0`): the shown-state reflow fires on a REAL,
   MATERIAL collision instead of on any sheet that merely shares the slicer band's height.**
   `_reflow_worksheets_below_slicers` reproduces what Tableau does on "Show Filters" -- a sheet

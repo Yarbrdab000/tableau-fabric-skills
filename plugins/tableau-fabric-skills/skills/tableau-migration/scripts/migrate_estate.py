@@ -1958,14 +1958,35 @@ def _recheck_openability_after_wrap(res_report, wrapped_model_parts):
             seen.add(key)
             issues.append(issue)
 
-    res_report["openability_selfcheck"] = {
+    # START FROM BOTH PAYLOADS so every additive key survives, whichever run produced it (#183).
+    # The previous shape listed the keys to KEEP, which silently drops any key it does not name --
+    # and did: ``not_evaluated`` (#141) and ``reference_case_mismatches`` (#164) are both documented
+    # as ALWAYS PRESENT, and both vanished on exactly the payload whose check set was recomputed.
+    #
+    # An allow-list of keys to carry would fix the reported instance and reintroduce the defect the
+    # next time a key is added, because nothing fails when a new key is forgotten. Layering the two
+    # payloads inverts that: a new key is carried by default, and only a field that must be MERGED
+    # rather than replaced needs a line here.
+    #
+    # ``before`` first, then ``post`` on top, and the order is load-bearing in both directions. For
+    # a key BOTH runs emit, ``post`` wins because it describes the model that actually shipped --
+    # ``not_evaluated`` in particular is a statement about the run that produced ``checks``, so
+    # taking the earlier one would pair a fresh verdict with a stale account of what it omits. For a
+    # key only ``before`` carries, it survives rather than being dropped, which is what a key added
+    # to the gate between two runs looks like. Basing the merge on ``post`` alone passes every
+    # test naming the two reported keys and still loses that one; the future-key test is what
+    # caught it.
+    merged = dict(before)
+    merged.update(post)
+    merged.update({
         "ok": bool(before.get("ok", True)) and bool(post.get("ok", True)),
         "checks": checks,
         "issues": issues,
         # Additive provenance: a reader can see the verdict covers the model that actually shipped,
         # not the one assembled before the wrap added measures to it.
         "rechecked_after_row_predicate_wrap": True,
-    }
+    })
+    res_report["openability_selfcheck"] = merged
 
 
 def _apply_row_predicate_wrapped_measures(report_parts, model_parts, result, res_report):
