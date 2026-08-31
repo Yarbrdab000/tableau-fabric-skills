@@ -2511,6 +2511,18 @@ def workbook_datasources(xml_text):
             "connection_class": cls,
             "named_connection_count": nconns,
             "table_count": len(tables),
+            # ADDITIVE (#182): the NAMES behind the count, which was already computed here and
+            # thrown away. The datasource path's ``ds_details`` has emitted ``tables: [...]`` all
+            # along, so a consumer could give a per-table verdict there and only a per-model one
+            # here -- a workbook mixing a preserved connector with one materialised table could
+            # only be reported "cannot attribute, inspect by hand". A reporter's blind review of
+            # their own fidelity checker found THREE false passes traceable to having a count
+            # where the sibling path gives a list.
+            #
+            # ``_table_display`` is the same function the emitted TMDL filename comes from, so the
+            # names join to the model without a mapping step -- which is the property that makes
+            # the datasource path's list usable rather than merely present.
+            "tables": [d for d in (_table_display(r) for r in tables) if d],
         })
     return out
 

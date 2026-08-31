@@ -4345,6 +4345,12 @@ def _embedded_datasource_telemetry(twb_text, all_ds):
             "connection_class": ds.get("connection_class"),
             "named_connection_count": ds.get("named_connection_count"),
             "table_count": ds.get("table_count"),
+            # ADDITIVE (#182). The datasource path's ``ds_details`` emits ``tables: [...]``; this
+            # path emitted only the count, so a workbook model could be checked per-MODEL and not
+            # per-TABLE. Same names, from the same ``_table_display`` the emitted TMDL filenames
+            # use, so they join to the model with no mapping step. Defaults to ``[]`` rather than
+            # being absent, so a consumer can tell "no tables" from "this engine predates the key".
+            "tables": list(ds.get("tables") or []),
             "connections": [],
         }
         try:

@@ -14,6 +14,26 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ### Fixed
 
+- **`tableau-migration` (skill `2.342.0` → `2.343.0`): workbook-path telemetry NAMES its tables
+  instead of only counting them (#182).** The datasource path's `ds_details` has always emitted
+  `tables: ["FACT_ORDERS", "DIM_CUSTOMER", ...]`; `embedded_datasources` emitted only `table_count`.
+  Everything needed for the list was already computed to produce the count -- `len(tables)` threw the
+  names away one line after building them. **A count is not a small version of a list:** a workbook
+  model mixing a preserved connector with one materialised table could only be reported *"cannot
+  attribute -- inspect by hand"*, because nothing said which table belonged to which source, while
+  the identical shape on the datasource path yields a precise per-table verdict. The reporter ran a
+  blind review of their own fidelity checker against 2.339.0 output and found **three separate false
+  passes**, all on the workbook path, all traceable to that one missing field. **The property that
+  makes it useful is the JOIN, not the presence:** the names come from `_table_display`, the same
+  function the emitted TMDL filename is derived from, so they match the model with no mapping step --
+  a list that needed translating would be a count with extra work. Asserted against a real build
+  rather than by inspection. Strictly additive: every field a 2.339.0 consumer reads is unchanged,
+  `table_count` stays, and `tables` defaults to `[]` rather than being absent so a consumer can tell
+  *"no tables"* from *"this engine predates the key"* -- the same tri-state discipline #141 and #183
+  exist for. Six tests, six positive controls, all caught -- including *"names no longer join"* and
+  *"key absent instead of empty"*. The secondary ask (a stable id for `sqlproxy` binding correlation)
+  is not addressed here.
+
 - **`tableau-migration` (skill `2.341.0` → `2.342.0`): the dropdown-slicer height floor returns to
   76px, because the premise 2.295.0 lowered it on has never been true (#180).** Stock
   `Superstore.twbx` went from validating clean at 2.208.0 to **16 errors** under the unchanged
