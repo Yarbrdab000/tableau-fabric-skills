@@ -14,6 +14,34 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ### Fixed
 
+- **`tableau-migration` (skill `2.341.0` → `2.342.0`): the dropdown-slicer height floor returns to
+  76px, because the premise 2.295.0 lowered it on has never been true (#180).** Stock
+  `Superstore.twbx` went from validating clean at 2.208.0 to **16 errors** under the unchanged
+  first-party CLI: `PBIR_SLICER_HEIGHT_BELOW_FLOOR -- Dropdown slicer height 57px < 76px minimum
+  (header 28 + selector 32 + padding 8/8)`. 16 of 28 slicers moved, every one downward, from exactly
+  76.0. **Reproduced independently on our own corpus: 48 of 94 slicers below the floor and 8
+  workbooks failing the real validator.** 2.295.0 lowered the floor for a genuine fidelity reason --
+  a 57px Tableau card grown to 76px is a third taller than the author drew it -- and justified 57 as
+  *"the height a Power BI dropdown demonstrably needs at the 9pt face this emitter stamps
+  (`SLICER_FONT_PT`)"*. That reads exactly like the contracts this repo has three times declined to
+  "fix". **It is not one: the premise is false, and checkably so.** `SLICER_FONT_PT` was introduced
+  at 1.55.0 and has **never been referenced by any code at any commit in its history** -- verified
+  three ways: zero non-definition uses in `scripts/`, **zero of 94 emitted slicers containing the
+  substring `fontSize` anywhere** (a raw search, immune to a wrong guess about where the property
+  lives), and `git log -S` returning only the commit that wrote the constant and the one that wrote
+  the comment citing it. So every slicer renders at the DEFAULT face -- precisely the face 76 is the
+  arithmetic for, and the one issue #100 measured clipping against. The fidelity cost is real and is
+  the smaller harm: a card 19px too tall is a layout inaccuracy, a card below the floor clips its
+  header or its selector. **The path back to 57 is to make the premise true** -- stamp the font,
+  re-render, re-measure -- so `SLICER_FONT_PT` is deliberately kept as the anchor for that work, with
+  a test that FAILS the moment it is referenced. Verified at the authority: corpus
+  `PBIR_SLICER_HEIGHT_BELOW_FLOOR` **8 workbooks → 0**. `layout_solve.MIN_SLICER` moves with it and
+  the equality is now pinned by a test rather than by a comment claiming it. Five tests, five
+  positive controls. **One correction to my own work in passing:** I wrote that `MIN_SLICER` had
+  drifted from the emitter for 46 releases, then checked -- 2.294.0 was 76/76 and 2.295.0 correctly
+  moved both to 57/57. The pin protects a property that holds rather than repairing one that broke,
+  and the false claim was caught before it became a permanent comment.
+
 - **`tableau-migration` (skill `2.340.0` → `2.341.0`): a join key the source PROJECTS but never
   DECLARES is materialised instead of dropped, so the relationship lands (#181).** A `.tds` declaring
   two inner joins with explicit equality clauses produced *"the source declared no join for it, so

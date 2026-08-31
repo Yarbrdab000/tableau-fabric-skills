@@ -210,23 +210,34 @@ SLICER_CTRL_H = 40.0
 # chrome pad added) -- the emitted box tracks the SOURCE card number-for-number, per the user. A small
 # absolute floor (SLICER_DROPDOWN_MIN_H) guarantees a degenerate tiny card still renders its control.
 #
-# The floor is 57px: the height Tableau itself authors for a filter card, and the height a Power BI
-# dropdown demonstrably needs at the 9pt face this emitter stamps (SLICER_FONT_PT). Render-verified
-# 2026-08-25 on the Salesforce NPSP "Staff Capacity" band -- every card showed its full label AND its
-# selector, with no clipping and no dead space.
+# THE FLOOR IS 76px, AND 2.295.0 LOWERING IT TO 57 WAS WRONG ON A PREMISE THAT NEVER HELD (#180).
+# 76 is the arithmetic of Power BI's DEFAULT (~12pt) chrome: header 28 + selector 32 + padding 8/8.
+# It was measured at issue #100 -- 16 slicers between 45px and 64px, every one clipped -- and it is
+# the same rule the first-party validator enforces as PBIR_SLICER_HEIGHT_BELOW_FLOOR.
 #
-# It was 76.0, and that number is the arithmetic of Power BI's DEFAULT (~12pt) chrome: header 28 +
-# selector 32 + padding 8/8. That was correct when it was measured (issue #100: 16 slicers between
-# 45px and 64px, every one clipped) -- and it was measured BEFORE this emitter began stamping the
-# source's 9pt point size, which is the other half of that same fix. A floor calibrated against the
-# larger face outlived the reason for it, and then overrode the authored size on every dashboard:
-# a 57px Tableau card was silently grown to 76px, i.e. a third taller than the author drew it.
+# 2.295.0 lowered it to 57 with a real fidelity motive and a specific justification: that 76 was
+# "calibrated against the larger face" and had "outlived the reason for it", because this emitter now
+# stamps the source's 9pt point size. **It does not.** ``SLICER_FONT_PT`` was introduced at 1.55.0
+# and has never been referenced by any code at any commit in its history -- verified three ways at
+# 2.341.0: zero non-definition uses in ``scripts/``, zero of 94 emitted slicers containing the
+# substring ``fontSize`` anywhere in their JSON, and ``git log -S`` showing only the two commits that
+# wrote the constant and the comment. So every slicer renders at the DEFAULT face, which is exactly
+# the face 76 is the arithmetic for.
 #
-# Keep a floor -- a degenerate tiny card still has to render its control -- but set it to the
-# smallest height actually shown to work at the font we emit, not to the chrome of a font we do not.
-SLICER_DROPDOWN_MIN_H = 57.0
+# The fidelity cost 2.295.0 identified is real -- a 57px Tableau card grown to 76px is a third taller
+# than the author drew it -- and it is the smaller of the two harms. A card 19px too tall is a
+# layout inaccuracy; a card below the floor clips its header or its selector, which is a broken
+# render, and the reporter measured 16 validation errors on stock Superstore where 2.208.0 was clean.
+#
+# THE PATH TO 57 IS TO MAKE THE PREMISE TRUE, not to assert it: stamp ``SLICER_FONT_PT`` on the
+# emitted slicer, re-render, and re-measure the floor at the face actually emitted. Until then the
+# floor must match the font we really ship. ``SLICER_FONT_PT`` is deliberately KEPT rather than
+# deleted, as the anchor for that work -- see the guard in ``tests/test_slicer_height_floor.py``,
+# which fails the moment it is referenced, so wiring it forces this comment to be re-derived.
+SLICER_DROPDOWN_MIN_H = 76.0
 SLICER_PAD_X = 7.0
 SLICER_ROW_GUTTER = 8.0
+# NOT WIRED. Defined at 1.55.0, never referenced. See SLICER_DROPDOWN_MIN_H above (#180).
 SLICER_FONT_PT = 9.0
 
 

@@ -85,7 +85,15 @@ MAX_GROWTH = FRAME_DEMAND_CAP
 # A leaf minimum must be at least what the EMIT path will actually give that leaf: emit re-floors a
 # slicer to its own dropdown minimum after placement, so a smaller reservation here does not shrink
 # the emitted box, it just makes it overrun whatever the solver seated below it.
-MIN_SLICER = (120.0, 57.0)       # dropdown: matches the emitter's own SLICER_DROPDOWN_MIN_H floor
+MIN_SLICER = (120.0, 76.0)       # dropdown: MUST equal the emitter's SLICER_DROPDOWN_MIN_H (#180).
+# Not imported, to keep this module free of a twb_to_pbir dependency -- but the equality is PINNED by
+# ``tests/test_slicer_height_floor.py::test_the_solver_reservation_matches_the_emitter_floor``,
+# because a duplicated constant with a comment merely CLAIMING it matches is the shape that drifts.
+# It has not drifted so far -- measured across history, 2.294.0 was 76/76 and 2.295.0 correctly moved
+# both to 57/57 -- so the pin protects a property that currently holds rather than repairing one that
+# broke. Worth having because the comment above states the cost precisely: emit re-floors a slicer
+# after placement, so a reservation SMALLER than the emitter's floor does not shrink the emitted box,
+# it makes it overrun whatever the solver seated below it.
 MIN_SLICER_LIST_H = 100.0        # list/checklist mode is taller
 MIN_PARAMCTRL = (120.0, 56.0)
 MIN_TEXT = (120.0, 32.0)
