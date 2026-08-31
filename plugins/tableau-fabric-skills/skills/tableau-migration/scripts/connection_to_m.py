@@ -2215,13 +2215,81 @@ def _extract_join_relationships(datasource, relations):
     back. Returns ``(relationships, warnings)``.
     """
     name_index = {}
+    kind_index = {}
     for r in relations:
         if r.get("kind") in ("table", "custom_sql"):
             disp = _table_display(r)
             if disp:
                 name_index.setdefault(disp.lower(), disp)
+                kind_index.setdefault(disp.lower(), r)
     cols_index = _columns_index(relations)
     out, warnings, seen = [], [], set()
+
+    def _materialize_join_key(table_disp, col_op, commit=True):
+        """Add a join-key column the source projects but never DECLARES (#181).
+
+        Tableau writes a join key into the ``<clause>`` predicate and, when the key is not also on a
+        shelf, into nothing else -- no ``<cols>`` entry, no ``<metadata-record>``. TMDL columns are
+        built from the latter, so the key never landed, no relationship could be declared, and the
+        engine then reported the absence of a RELATIONSHIP as *"the source declared no join"*. One
+        dropped column, and a reporter measured the cascade: a routine FIXED LOD stubbed to
+        ``BLANK()`` for "cross-table terms", two visual bindings re-homed onto the fact table, and
+        all 3 visuals in the dependent workbook degraded.
+
+        SCOPED TO WHOLE-TABLE RELATIONS, and the scope is the whole safety argument. Measured on the
+        emitted M: a ``kind='table'`` relation navigates to ``{[Name=..., Kind="Table"]}[Data]`` with
+        **no projection**, so the key is provably in the query result already and declaring it is a
+        write-out of something that exists. A ``custom_sql`` relation runs
+        ``Value.NativeQuery(..., "SELECT ORDER_KEY, TOTAL_PRICE ...")`` and returns exactly what the
+        SQL selects -- declaring a column the SQL does not project would emit *"The column 'X' of the
+        table wasn't found"* at refresh, trading a missing relationship for a broken table. So custom
+        SQL keeps the honest skip.
+
+        ``commit=False`` asks only whether it COULD be done, changing nothing. Both sides of a
+        predicate are probed before either is written, because a relationship needs both: writing one
+        side and then refusing the join leaves a column on a table for a relationship that does not
+        exist. Caught by probing the custom-SQL refusal case, where the dimension side succeeded and
+        the fact side could not.
+
+        Returns the materialised (or materialisable) column name, or ``None``.
+        """
+        rel = kind_index.get((table_disp or "").lower())
+        if not rel or rel.get("kind") != "table":
+            return None
+        remote = _strip_brackets(col_op)
+        if not remote:
+            return None
+        # ``clean_col`` is the SAME sanitiser every declared column goes through (see the column
+        # build at the top of this module), so a materialised key cannot acquire a name shape no
+        # other column could have.
+        model_name = clean_col(remote)
+        cols = rel.setdefault("columns", [])
+        # NO dedup loop here, deliberately. It looks necessary and is unreachable: ``_columns_index``
+        # holds this relation's OWN column list by reference, so the moment a key is materialised it
+        # is visible to ``_resolve_rel_column``, and a second clause naming the same key resolves
+        # normally and never reaches this function. Verified by injection -- a control that disabled
+        # a dedup guard here could not be caught by any test, because no input reaches it.
+        # A guard nothing can reach is worse than no guard: it reads as protection and measures
+        # nothing. The property it appeared to provide (a key is written once) is real and is
+        # asserted by ``test_the_same_key_materialised_by_TWO_clauses_is_written_once``, through the
+        # path that actually enforces it.
+        if not commit:
+            return model_name
+        # No datatype is recorded anywhere for a key the source never declared, and a join key is
+        # overwhelmingly an id. ``string`` is the safe default: it is the one type every source
+        # value renders into without a conversion error, and a relationship compares values rather
+        # than doing arithmetic on them.
+        cols.append({"remote_name": remote, "model_name": model_name,
+                     "tmdl_type": "string", "local_name": remote,
+                     # Provenance: this column was recovered from a join predicate, not declared by
+                     # the source. A reader diffing against the .tds will not find it there.
+                     "materialized_join_key": True})
+        # NO separate cols_index update: ``_columns_index`` stores the relation's OWN column list by
+        # reference, so appending above is already visible through the index. Appending again put a
+        # bare string into a list of dicts and blew up a downstream consumer -- the kind of thing a
+        # 'both are right' guess produces.
+        return model_name
+
     for rel in _findall_local(datasource, "relation"):
         if not _is_combination_relation(rel):
             continue
@@ -2248,10 +2316,33 @@ def _extract_join_relationships(datasource, relations):
                 continue
             from_col = _resolve_rel_column(fc_op, cols_index.get(from_table.lower(), []))
             to_col = _resolve_rel_column(tc_op, cols_index.get(to_table.lower(), []))
+            # A key the source PROJECTS but never DECLARES is materialised rather than skipped
+            # (#181) -- see ``_materialize_join_key``. PROBE BOTH SIDES FIRST, then commit: a
+            # relationship needs both columns, so writing one and refusing the join would leave a
+            # column on a table for a relationship that does not exist.
+            if not (from_col and to_col):
+                cand_from = from_col or _materialize_join_key(from_table, fc_op, commit=False)
+                cand_to = to_col or _materialize_join_key(to_table, tc_op, commit=False)
+                if cand_from and cand_to:
+                    from_col = from_col or _materialize_join_key(from_table, fc_op)
+                    to_col = to_col or _materialize_join_key(to_table, tc_op)
             if not from_col or not to_col:
+                # NAME THE MECHANISM. The previous wording -- "did not resolve to emitted columns" --
+                # left a reporter looking at the workbook author's modelling for a join the .tds
+                # declares explicitly, because the message described our lookup rather than their
+                # source. Say which column, on which table, and why it could not be recovered.
+                unresolved = []
+                if not from_col:
+                    unresolved.append((from_table, fc_op))
+                if not to_col:
+                    unresolved.append((to_table, tc_op))
+                detail = ", ".join(
+                    "%s on '%s' is not projected by that table's query"
+                    % (_strip_brackets(c) or c, t) for t, c in unresolved)
                 warnings.append(
-                    f"join clause columns ({fc_op} / {tc_op}) between '{from_table}' and "
-                    f"'{to_table}' did not resolve to emitted columns; skipped")
+                    f"join declared on {fc_op} = {tc_op} between '{from_table}' and '{to_table}', "
+                    f"but {detail}, so the column could not be materialised and no relationship "
+                    "was declared; add the key to the source query (or to a shelf) and re-run")
                 continue
             dedup = (from_table.lower(), from_col.lower(), to_table.lower(), to_col.lower())
             rdedup = (to_table.lower(), to_col.lower(), from_table.lower(), from_col.lower())

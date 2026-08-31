@@ -14,6 +14,36 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ### Fixed
 
+- **`tableau-migration` (skill `2.340.0` → `2.341.0`): a join key the source PROJECTS but never
+  DECLARES is materialised instead of dropped, so the relationship lands (#181).** A `.tds` declaring
+  two inner joins with explicit equality clauses produced *"the source declared no join for it, so
+  none was invented."* The keys appear **only** inside the `<clause>` predicates -- never in `<cols>`,
+  never in a `<metadata-record>` -- which is what Tableau writes when a key is not also placed on a
+  shelf. TMDL columns are built from the latter, so the keys never landed, no relationship could be
+  declared, and the engine reported the absence of a RELATIONSHIP as the absence of a declared JOIN.
+  The reporter measured the cascade from that one dropped column: a routine `FIXED` LOD stubbed to
+  `BLANK()` for *"cross-table terms"*, two visual bindings re-homed onto the fact table -- caught and
+  correctly attributed by the #166 disclosure, which named the real owner -- and all 3 visuals in the
+  dependent workbook degraded into a `DOD_FAILED` bundle. **The scope is the safety argument, and it
+  was measured rather than assumed:** a `kind='table'` relation navigates to
+  `{[Name=..., Kind="Table"]}[Data]` with **no projection**, so the key is provably in the query
+  result and declaring it writes out something that exists; a `custom_sql` relation runs
+  `Value.NativeQuery(..., "SELECT ...")` and returns exactly what the SQL selects, so declaring a
+  column it does not project would produce *"The column 'X' of the table wasn't found"* at refresh --
+  trading a missing relationship for a broken table. Custom SQL keeps the honest skip, with a message
+  that now names the **mechanism**: *"join declared on … but CUSTOMER_KEY on 'X' is not projected by
+  that table's query"* rather than *"did not resolve to emitted columns"*, which described our lookup
+  and sent a reporter to inspect the workbook author's modelling. Both sides of a predicate are
+  probed before either is written, after a probe showed the dimension side being materialised for a
+  join the fact side then refused. Corpus blast radius: **34 workbooks, 90 relationships before and
+  after, 0 changed** -- the fix fires only on the reported shape, which the corpus does not contain.
+  Nine tests, seven positive controls. **One control could not be caught and that was the finding:**
+  a dedup loop inside the materialiser is unreachable, because `_columns_index` holds the relation's
+  own column list by reference, so a materialised key is immediately visible to `_resolve_rel_column`
+  and a second clause never reaches the function. Removed rather than kept -- **a guard nothing can
+  reach reads as protection and measures nothing** -- and the property it appeared to provide is
+  asserted through the path that actually enforces it.
+
 - **`tableau-migration` (skill `2.339.0` → `2.340.0`): the post-wrap openability re-check no longer
   drops the additive keys it does not name (#183).** `_recheck_openability_after_wrap` rebuilt
   `openability_selfcheck` from scratch, naming four keys, so two the gate documents as **always
