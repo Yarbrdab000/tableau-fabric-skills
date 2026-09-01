@@ -14,6 +14,37 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ### Fixed
 
+- **`tableau-migration` (skill `2.349.0` → `2.350.0`): a text table with a MULTI-LEVEL row shelf
+  rebuilds FLAT, instead of as a collapsed matrix nobody can read.** Tableau's text table gives every
+  row-shelf field its own column and shows every row; a Power BI matrix renders a multi-level row
+  shelf as a **stepped, collapsed** hierarchy. So a sheet whose rows are Segment / Ship Mode /
+  Order ID arrived as **three expandable `Segment` rows** where Tableau draws one row per order —
+  every value correct, and almost none of them on screen. This is a ROUTING fix, not a formatting
+  one: `expansionStates` passes validation and is a **no-op on initial render**, while a `tableEx`
+  needs no expansion because it has no hierarchy to collapse. `_route_measure_values` previously read
+  `if dims_rows or dims_cols: vt = VT_MATRIX` — correct that a matrix renders measures-as-columns
+  natively, silent that it also collapses the rows. Now `dims_cols` decides **first**, so a genuine
+  cross-tab (real dimensions on BOTH axes) can never be flattened; more than one row dimension with
+  no column dimension routes to `tableEx`. A **single** row dimension deliberately stays a matrix:
+  one level has no hierarchy to collapse, so it already renders one row per member, and switching it
+  would change three corpus visuals that are correct today for no visible gain. Population, measured:
+  of 9 emitted `pivotTable`s, 5 are genuine cross-tabs that stay, 3 are single-row-field and are left
+  alone, and **1** changes. Verified at the render, row-for-row against the Tableau source — same
+  three columns in the same order, same row sequence (`CA-2023-153738`, `CA-2024-153738`,
+  `CA-2025-126627`, …) and the same values, the only difference being that Tableau rounds for display
+  (`37.68` → `38`); that number-format difference is real, has its own population, and is
+  deliberately **not** bundled here, because doing so would make the render comparison ambiguous
+  about which change produced which delta. Both positive controls fire with the restore
+  hash-verified: reverting the rule flips the emitted visual `tableEx` → `pivotTable` **and** turns
+  the named test red, so neither the artifact check nor the test is vacuous. Also checked, because
+  this release routes MORE visuals to `tableEx` and that type carries a known `reports/`-vs-`pbip/`
+  role divergence on 2 of 35 corpus instances: the newly-routed visual's `queryState` role set is
+  identical in both trees (`['Values']`), so the object verified at the render is the object the
+  fidelity report describes. Corpus: 34/34, 1607 files, 0 added, 0 removed, and the only 4 that
+  differ are run manifests carrying 0 non-timestamp differences — zero corpus impact by
+  construction, since the sole visual with more than one row dimension and no column dimension is
+  the reference workbook.
+
 - **`tableau-migration` (skill `2.348.0` → `2.349.0`): a Tableau SET named as a filter column no
   longer vanishes behind a generic "could not resolve field" — the visual that renders over an
   UNFILTERED SUPERSET now says so, names the set, and is ranked `high` (#185).**

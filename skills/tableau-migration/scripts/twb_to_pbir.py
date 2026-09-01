@@ -3481,7 +3481,22 @@ def _route_measure_values(mark, locs, members, dummy_count, has_param_swap, stat
     #     (VT_CARD), Power BI's native row of labelled big numbers, NOT a single-column text table.
     # Either way the implicit Measure Names pill stays unbound -- Power BI's labels ARE the measure
     # names; the member measures fill the value well.
-    if dims_rows or dims_cols:
+    #
+    # WITH dimensions on ROWS ONLY the faithful visual is a FLAT ``tableEx``, not a matrix. Tableau's
+    # text table gives every row-shelf field its own column and shows every row; a Power BI matrix
+    # renders a multi-level row shelf as a STEPPED, COLLAPSED hierarchy, so a sheet whose rows are
+    # Segment / Ship Mode / Order ID arrived as three expandable ``Segment`` rows instead of one row
+    # per order. ``expansionStates`` does not fix it -- it passes validation and is a no-op on
+    # initial render -- and a ``tableEx`` needs no expansion because it has no hierarchy to collapse.
+    # A genuine CROSS-TAB (real dimensions on BOTH axes) still needs the matrix, so ``dims_cols``
+    # decides first. A SINGLE row dimension is deliberately left as a matrix: with one level there is
+    # no hierarchy to collapse, so it already renders one row per member and switching it would
+    # change three visuals that are correct today for no gain.
+    if dims_cols:
+        vt = VT_MATRIX
+    elif len(dims_rows) > 1:
+        vt = VT_TABLE
+    elif dims_rows:
         vt = VT_MATRIX
     elif names_at == "rows" or values_at == "rows":
         vt = VT_TABLE
