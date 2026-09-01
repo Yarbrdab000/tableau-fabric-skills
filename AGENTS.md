@@ -900,8 +900,26 @@ The historical block rules, kept because old anchors and CHANGELOG entries still
   is just moved later.
 * **`refs/tags` is SHARED across every worktree** (`git rev-parse --git-common-dir` is one `.git`), so
   a version collision is also an ANCHOR collision: one name, one slot, last writer wins. **Never
-  `git tag -d` an anchor you did not create** — `git for-each-ref --format='%(taggername)
-  %(taggerdate)'` identifies the owner in one call, and a BATCH delete is where this happens, because
+  `git tag -d` an anchor you did not create** — and **do NOT try to establish that with
+  `%(taggername)`, which carries ZERO BITS in this repo.** Every worktree commits under one GitHub
+  identity, so authorship cannot distinguish lanes; measured over the whole namespace:
+
+  ```
+  368 anchors
+    360 annotated    tagger identical on every one   -> zero bits
+      8 lightweight  no tagger, no taggerdate at all -> the check returns EMPTY
+  ```
+
+  Neither mode returns a *wrong* owner — both mean the check **cannot answer**, which is worse,
+  because an empty or matching name reads as confirmation. This bit in **both directions within one
+  hour**: the file already warns that *a name you created can silently become someone else's object*;
+  the unstated inverse is that **a tag you never created appears in your own list, minutes old, under
+  your own name, indistinguishable from one you did.** One shared namespace, and `refs/tags` lives in
+  the common git-dir, so a lane's unpushed anchor shows up in every sibling's `git tag -l`. A routine
+  "delete my stale unpushed tags" sweep is therefore the *exact* failure this rule exists to prevent,
+  reached by following the rule. Nothing in the tag object discriminates; the message is the only
+  varying content, and only by convention. What actually survives this is **archive before any
+  delete** — plus the fact that a BATCH delete is where it happens, because
   the batch reads as a single intent ("my old numbers") while acting on a global namespace. Leave a
   dead block's anchors in place: an unused anchor is inert to every gate here, while a wrongly deleted
   one destroys a rollback path and reads to the next person as "reported but absent". Deletion is the
