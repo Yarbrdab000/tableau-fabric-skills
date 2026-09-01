@@ -14,6 +14,62 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ### Fixed
 
+- **`tableau-migration` (skill `2.347.0` → `2.348.0`): an UNAGGREGATED measure pill no longer emits
+  a bare `Column` into a Measure-only role, which made the report fail first-party validation and
+  refuse to import (#142).** `powerbi-report-author validate` reports `PBIR_ROLE_KIND_MISMATCH` and
+  exits 1 on that shape. Measured estate-wide before and after, on both emitted trees:
+
+  ```
+                     reports/            pbip/
+  baseline 2.347.0   4 failed  RK=1      9 failed  RK=1
+  fixed    2.348.0   3 failed  RK=0      8 failed  RK=0
+  ```
+
+  Every remaining failure is `PBIR_SLICER_HEIGHT_BELOW_FLOOR`, the known deliberate false positive
+  documented at `SLICER_DROPDOWN_MIN_H` (#180) — so **after this change the corpus has no unexplained
+  validator error left.**
+
+  Ground truth is `0135_aggregation_types`, a workbook whose entire subject is aggregation types.
+  Its `Bar chart Example` shelf carries the same field three times: `sum:Sales:qk` → `Aggregation
+  Sum` (already correct), `attr:Sales:qk` → `Aggregation Min` (correct since `2.229.0`), and
+  `none:Sales:qk` → **a bare `Column`**, the defect.
+
+  **Tableau writes `derivation='None'` on a measure in two unrelated situations, and the base
+  `<column>` declaration is byte-identical for both** — `role='measure' type='quantitative'`. Only
+  the pill INSTANCE separates them, via the trailing role code, so a new reader `_pill_role_code`
+  reads it:
+
+  - **`:qk` continuous (green)** — *Aggregate Measures OFF*, a disaggregated measure drawing one mark
+    per underlying row. Power BI has no disaggregated value role, so it is summed **and warned** —
+    `Sum` rather than a drop for the same reason as the ATTR branch (a reader cannot notice a missing
+    value), and rather than any other aggregate because it is what *both* products do by default with
+    this field.
+  - **`:ok` / `:nk` discrete (blue)** — a measure dragged onto a shelf **as a dimension**. It groups;
+    no wrapping is correct, since `Sum` would invent an aggregate the author never asked for. This is
+    the shape reported upstream, diagnosed there as *"the emitter's error is not that it failed to
+    wrap, it is that it put the pill in the wrong role"* — that diagnosis is theirs and it is right.
+    **Scoped honestly: this half has NO corpus coverage.** The one discrete instance in the estate is
+    an `Age` bin that reaches zero emitted projections, so it ships on the reporter's evidence with
+    unit coverage only.
+  - **no role code → UNCHANGED, deliberately.** `_is_continuous_pill` reads any unknown pill as
+    discrete, and reusing it here would silently reclassify all 29 caption-fallback measure visuals
+    in the corpus as grouping fields. `_pill_role_code` returns `None` instead of a default so
+    "discrete" and "unknown" cannot be confused.
+
+  **A filter pill is never rewrapped.** A filter on an unaggregated measure filters ROWS —
+  `Sales BETWEEN 10 AND 500` selects rows, it does not compare a SUM to that range — so the branch
+  declines `for_filter`. The first version of this change omitted that and the pre-existing
+  `test_numeric_range_selection_emits_advanced_comparison_filter` went red; the guard is now pinned
+  by its own test.
+
+  Corpus differential, with build noise normalised (a fresh `lineageTag` GUID per column and the
+  output directory baked into each M `File.Contents` path differ between *any* two builds): **92
+  files differ raw, 84 explained as noise, 8 real** — 6 `visual.json` (3 visuals × 2 trees, all in
+  `0135`), plus `report.json` and `summary.md`. **No other workbook changes.** One visual disappears
+  where the disaggregated pill now produces DAX identical to its `Sum` sibling and the existing dedup
+  collapses them; that is disclosed on the worksheet through `additional_reasons`, the
+  `remediation_worklist`, and a `degraded` tier — not silently.
+
 - **`tableau-migration` (skill `2.346.0` → `2.347.0`): an implicit row count of a DIMENSION
   respects the visual's filters, instead of returning the whole table.** `2.346.0` made
   "Count of People" bind and render; this makes it *right*. The translation was never the problem —

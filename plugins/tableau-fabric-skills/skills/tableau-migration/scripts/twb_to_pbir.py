@@ -500,6 +500,24 @@ def _is_continuous_pill(field):
     return str(field.get("instance") or "").rsplit(":", 1)[-1].strip().lower() == "qk"
 
 
+def _pill_role_code(field):
+    """Tableau's explicit pill role code (``qk`` / ``ok`` / ``nk``), or ``None`` when absent.
+
+    ``_is_continuous_pill`` answers a BOOLEAN question and is deliberately conservative -- anything
+    that is not explicitly ``qk`` reads as discrete, *including a pill with no role code at all*.
+    That is right for choosing a colour ramp (an unknown pill keeps Power BI's own default) and
+    wrong for #142, where "discrete" and "unknown" need different outcomes: a discrete measure pill
+    is reclassified as a grouping field, and an unknown one must keep its previous behaviour rather
+    than be reclassified on a guess.
+
+    So this returns the code itself and ``None`` for absent/unrecognised, letting the caller
+    distinguish the three cases. A synthesized caption-fallback instance carries no code and lands
+    in ``None`` -- which is the whole reason this exists as a separate reader.
+    """
+    code = str(field.get("instance") or "").rsplit(":", 1)[-1].strip().lower()
+    return code if code in ("qk", "ok", "nk") else None
+
+
 def _norm_date_col(name):
     """Normalize a column name for active-date matching (case/space/underscore-insensitive)."""
     return re.sub(r"\s+", " ", (name or "").strip().lower().replace("_", " ").replace("-", " "))
@@ -1572,6 +1590,59 @@ def _resolve_field(ds, field_id, base_cols, instances, index, ds_caption,
             "worksheet", worksheet,
             f"unsupported derivation '{deriv}' on '{caption}' (skipped)"))
         return None
+
+    if role == "measure" and not for_filter:
+        # An UNAGGREGATED measure pill (#142). Tableau writes ``derivation='None'`` on a measure in
+        # two unrelated situations, and emitting both as a bare column put a ``Column`` expression
+        # into a Measure-only role -- ``powerbi-report-author validate`` reports
+        # PBIR_ROLE_KIND_MISMATCH and exits 1, so the report does not import. Tableau's own pill role
+        # code separates them, and it is the only signal that does: the base ``<column>`` says
+        # ``role='measure'`` for both, byte-identically.
+        #
+        # NOT for a filter. ``for_filter`` marks a pill that becomes a FILTER CARD, and a filter on
+        # an unaggregated measure filters ROWS -- ``Sales BETWEEN 10 AND 500`` selects rows whose
+        # Sales is in range, it does not compare a SUM to that range. Wrapping it here would change
+        # what every quantitative filter on a raw measure means, which the existing
+        # ``test_numeric_range_selection_emits_advanced_comparison_filter`` catches.
+        code = _pill_role_code(field)
+
+        if code == "qk":
+            # CONTINUOUS (green) = Analysis -> Aggregate Measures OFF: one mark per underlying row.
+            # Power BI has no disaggregated mode for a value role, so this cannot be reproduced -- it
+            # is warned, not silently equated. ``Sum`` is chosen over dropping the pill for the same
+            # reason as the ATTR branch above (a missing value cannot be noticed by a reader), and
+            # over any other aggregate because it is what BOTH products do by default with this
+            # field: Tableau with Aggregate Measures back ON, and Power BI for a numeric column
+            # dropped in a value well.
+            if datatype in _NUMERIC_TYPES:
+                warnings.append(_warn(
+                    "worksheet", worksheet,
+                    f"disaggregated measure '{caption}' rebuilt as SUM -- Tableau draws one mark "
+                    f"per underlying row (Aggregate Measures off); Power BI has no disaggregated "
+                    f"value role, so the marks are summed to the visual's grain"))
+                field["aggregation"] = "Sum"
+                field["binding"] = "aggregation"
+                field["kind"] = "value"
+                return field
+            # A non-numeric measure cannot be summed. It is still unaggregated, so it groups.
+            field["binding"] = "column"
+            field["kind"] = "category"
+            return field
+
+        if code in ("ok", "nk"):
+            # DISCRETE (blue) = a measure dragged onto a shelf AS A DIMENSION. It is a grouping
+            # field -- one row per distinct value, which is what Tableau draws -- so no wrapping
+            # choice is correct: ``Sum`` would invent an aggregate the author did not ask for.
+            # Reported upstream on a pivotTable whose ``Rows`` shelf held the pill in the source and
+            # whose ``Values`` role received it in the rebuild.
+            field["binding"] = "column"
+            field["kind"] = "category"
+            return field
+
+        # No explicit role code (e.g. a synthesized caption-fallback instance): UNCHANGED. Deliberate
+        # -- ``_is_continuous_pill`` reads any unknown pill as discrete, and reusing it here would
+        # silently reclassify every caption-fallback measure as a grouping field. An unrecognised
+        # pill keeps the previous behaviour rather than being guessed onto either branch.
 
     # plain field: role decides axis vs value placement.
     field["binding"] = "column"
