@@ -56,6 +56,13 @@ _WARNING_RULES = (
     (("no visual emitted", "zone left empty", "no visual was emitted"), "unsupported_visual", "blocking"),
     (("nothing to rebuild", "empty worksheet"), "empty_worksheet", "blocking"),
     (("no usable field bindings",), "no_field_bindings", "blocking"),
+    # A DROPPED FILTER is its own category, deliberately separate from ``filter`` and from
+    # ``field_binding`` (#185). Those describe a control that is missing or bound loosely; this one
+    # describes a visual that RENDERS COMPLETE over more rows than the source. It is ``high`` rather
+    # than ``blocking`` because the visual is emitted, and ``high`` is defined above as "a data /
+    # binding gap that CHANGES WHAT IS SHOWN" -- which is exactly the failure: right-looking output,
+    # wrong population. Placed near the top so it can never be absorbed by a looser ``filter`` rule.
+    (("filter dropped", "unfiltered superset"), "dropped_filter", "high"),
     (("bound by caption fallback",), "field_binding", "high"),
     (("has no model binding", "could not resolve field", "unsupported derivation"),
      "field_binding", "high"),
@@ -98,6 +105,11 @@ _REMEDIATION = {
     "parameter_control": "Rebuild the Tableau parameter as a single-select slicer once its target "
                          "column/measure is identified.",
     "filter": "Reproduce the Tableau filter as a visual/page filter or slicer selection.",
+    "dropped_filter": "The source filter is NOT applied -- this visual shows MORE rows than "
+                      "Tableau. Re-create it as a visual/page filter before trusting any number "
+                      "on it: a Tableau set becomes a Categorical filter (fixed member list), an "
+                      "Advanced filter (condition, or a numeric/date range), or a TopN filter "
+                      "(top/bottom N by a measure).",
     "aggregation": "Recreate the aggregation as a model measure and bind it to the value slot.",
     "measure_shelf": "Reproduce the Measure Names/Values member set (or small multiples).",
     "small_multiples": "Rebuild as small multiples -- one pane per measure.",

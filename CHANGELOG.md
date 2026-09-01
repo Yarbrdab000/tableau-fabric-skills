@@ -14,6 +14,55 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ### Fixed
 
+- **`tableau-migration` (skill `2.348.0` → `2.349.0`): a Tableau SET named as a filter column no
+  longer vanishes behind a generic "could not resolve field" — the visual that renders over an
+  UNFILTERED SUPERSET now says so, names the set, and is ranked `high` (#185).**
+
+  A set is serialised as a `<group name='[Set 1]'>` holding a nested `<groupfilter>` tree — it is
+  **not** a `<column>`, so it never enters `base_cols`, `_resolve_field` returned `None`, and the
+  filter loop did `continue`. The visual then emitted **without the filter**.
+
+  The generic message was the defect, not merely its absence. It came from **one site that never
+  consults `for_filter`**, so two failures with opposite consequences produced identical text:
+
+  ```
+  dropped SHELF pill  -> the visual is VISIBLY missing a column
+  dropped FILTER      -> the visual looks COMPLETE and shows MORE rows than Tableau
+  ```
+
+  Now: a new `_set_definitions` index reads every `<group>` by `(datasource, name)` with its kind
+  (`top-n` / `range` / `crossjoin` / `member-list`), its `level`, and the attributes a future
+  translation needs (`from`/`to`/`count`/`units`/`direction`/`expression`). A dropped set filter
+  warns with the set, its kind, its level and **the consequence**, carries a machine-readable
+  `dropped_set_filter` marker, and lands in the remediation worklist under a new
+  **`dropped_filter` / `high`** category — `high` being the module's own "a data / binding gap that
+  changes what is shown", as against `medium` = "DATA still correct".
+
+  **Tableau's own dashboard machinery is indexed but never warned about.** `Action (…)` /
+  `Tooltip (…)` / `Highlight (…)` groups are generated for dashboard actions and tooltips; measured
+  across the corpus, **26 of 56 uniquely-named groups are these and none reaches the resolver** (0
+  occurrences in `report.json`). Warning on them would report 26 non-defects per build and teach the
+  reader to skip the message that matters.
+
+  **Scope, stated because the corpus cannot prove the impact.** Of 65 `<group>` elements, exactly
+  **two** are referenced: `0063 Remove Nulls` (range) as a filter and `0078 Set 1` (top-n) as a
+  shelf pill. And 0063's worksheet *also* carries `Customer Segment IN ("Consumer")`, which is
+  strictly stricter than the range set — so its emitted numbers already matched Tableau. This
+  release makes the drop **loud and specific**; it does not translate sets. Corpus differential:
+  **86 files differ raw, 85 explained as build noise, 1 real — `report.json` alone.** No emitted
+  PBIR or model artifact changes.
+
+  Translation targets are researched and recorded rather than guessed, against the PBIR JSON schema
+  and the official Tableau XSD: a literal-count Top-N set maps to the native **`TopN`** filter
+  (a `Where`/`In` whose right side is a subquery carrying `OrderBy` + `Top`); numeric/date ranges
+  map to **`Between`** (both bounds documented inclusive); fixed and crossjoin sets map to a
+  single- or multi-column **`In`**. Three things are **not** reproducible and are now disclosed
+  rather than approximated: a `count` bound to a **parameter** (PBIR's `Top` is a JSON *number*,
+  with no expression form), `units="percent"`, and a set used as a shelf pill for Tableau's IN/OUT
+  split (Power BI cannot group rows by a measure). A string-level `range` is deliberately left
+  untranslated: the faithful target needs the level's member domain, and the `.twb` does not carry
+  it — `0063` contains only `"Consumer"` and `%null%`.
+
 - **`tableau-migration` (skill `2.347.0` → `2.348.0`): an UNAGGREGATED measure pill no longer emits
   a bare `Column` into a Measure-only role, which made the report fail first-party validation and
   refuse to import (#142).** `powerbi-report-author validate` reports `PBIR_ROLE_KIND_MISMATCH` and

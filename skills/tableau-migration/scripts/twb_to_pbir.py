@@ -2760,6 +2760,101 @@ def _dedupe_str(values):
     return out
 
 
+_SET_FUNCTION_KINDS = (
+    # Tableau's ``Function-ST`` set-function vocabulary, as enumerated in the official
+    # ``tableau/tableau-document-schemas`` XSD. Ordered most-specific first: a Top-N set nests
+    # ``end`` > ``order`` > ``level-members``, so a scan that returned the OUTERMOST match would
+    # call it "level-members" and lose what makes it a Top-N.
+    ("end", "top-n"),
+    ("range", "range"),
+    ("crossjoin", "crossjoin"),
+    ("union", "member-list"),
+    ("member", "member-list"),
+)
+
+
+def _set_definitions(root):
+    """Index the workbook's Tableau SETS by ``(datasource, set name)``.
+
+    A set is serialised as a ``<group name='[Set 1]'>`` holding a nested ``<groupfilter>`` tree --
+    it is **not** a ``<column>``, so it never enters ``base_cols`` and a filter that names one
+    fails column resolution. Before this index existed that produced a bare *"could not resolve
+    field 'Set 1' (skipped)"* and the filter was dropped, leaving the visual rendering over an
+    UNFILTERED SUPERSET with nothing to distinguish it from a typo (#185).
+
+    Returns ``{(ds_name, set_name): {"kind": str, "level": str|None, "auto": bool, ...}}`` with
+    names stored UNBRACKETED, because Tableau writes the group as ``[Remove Nulls]`` and references
+    it from a filter token as ``[Remove Nulls]`` but from a shelf as an instance ``[io:Set 1:nk]``.
+
+    ``auto`` marks Tableau's own dashboard machinery -- ``[Action (Region)]``, ``[Tooltip (...)]``,
+    ``[Highlight (...)]`` -- which are generated for dashboard actions and tooltips rather than
+    authored. Measured across the 34-workbook corpus: 26 of 56 uniquely-named groups are these, and
+    **none of them reaches the resolver** (0 occurrences in ``report.json``), so they are indexed
+    and flagged rather than warned about.
+    """
+    out = {}
+    for ds in _findall_local(root, "datasource"):
+        ds_name = ds.get("name") or ""
+        for group in _findall_local(ds, "group"):
+            raw = group.get("name") or ""
+            name = raw.strip().strip("[]")
+            if not name:
+                continue
+            funcs = [gf.get("function") for gf in _findall_local(group, "groupfilter")]
+            kind = next((label for fn, label in _SET_FUNCTION_KINDS if fn in funcs), "other")
+            level = None
+            extra = {}
+            for gf in _findall_local(group, "groupfilter"):
+                if gf.get("level") and level is None:
+                    level = gf.get("level")
+                for attr in ("from", "to", "count", "units", "end", "direction", "expression"):
+                    if gf.get(attr) is not None and attr not in extra:
+                        extra[attr] = gf.get(attr)
+            out[(ds_name, name)] = {
+                "name": name,
+                "caption": group.get("caption") or name,
+                "kind": kind,
+                "level": (level or "").strip().strip("[]") or None,
+                "auto": bool(_AUTO_SET_RE.match(name)),
+                "detail": extra,
+            }
+    return out
+
+
+_AUTO_SET_RE = re.compile(r"^(?:Action|Tooltip|Highlight)\s*\(")
+
+
+def _set_filter_warning(sd, worksheet, ds_name):
+    """A dropped SET filter must not read like a dropped shelf pill.
+
+    Both used to emit the identical *"could not resolve field 'X' (skipped)"* from one site that
+    never consulted ``for_filter``, and their consequences are opposite: a dropped shelf pill leaves
+    a visual VISIBLY missing a column, while a dropped filter leaves a complete-looking visual over
+    an UNFILTERED SUPERSET -- confidently wrong, and invisible unless the reader already knows the
+    right number. Naming the consequence is the whole point (#185).
+    """
+    kind = sd.get("kind")
+    level = sd.get("level")
+    what = {
+        "top-n": "a Top-N set",
+        "range": "a range set",
+        "crossjoin": "a multi-dimension (fixed) set",
+        "member-list": "a fixed member-list set",
+    }.get(kind, "a set")
+    on = f" on [{level}]" if level else ""
+    w = _warn(
+        "worksheet", worksheet,
+        f"FILTER DROPPED: Tableau set '{sd.get('caption')}' ({what}{on}) has no Power BI "
+        f"equivalent the engine can emit yet, so this visual renders over an UNFILTERED SUPERSET "
+        f"-- it will look complete and show MORE rows than Tableau")
+    # Machine-readable, so a consumer can gate on it without parsing prose.
+    w["dropped_set_filter"] = {
+        "set": sd.get("name"), "caption": sd.get("caption"), "kind": kind,
+        "level": level, "datasource": ds_name, "detail": sd.get("detail") or {},
+    }
+    return w
+
+
 def _shared_view_filter_index(root):
     """Index the filters Tableau hoists OUT of worksheets into a workbook-level ``<shared-views>``.
 
@@ -2813,7 +2908,7 @@ def _worksheet_shared_filters(ws, shared_index):
 def _parse_filters(ws, ds_default, base_cols, instances, index, ds_caption,
                    worksheet, warnings, warn_special=True, internal_fields=None,
                    date_binding=None, table_calc_filters=None, table_calc_peers=0,
-                   extra_filters=()):
+                   extra_filters=(), set_defs=None):
     """Returns ``(filters, swap_controls)``. ``swap_controls`` carries any parameter-driven
     sheet-swap visibility controls detected on this worksheet (a categorical filter pinned to a
     pure parameter-passthrough calc). Recognising them structurally keeps them from being
@@ -2835,6 +2930,20 @@ def _parse_filters(ws, ds_default, base_cols, instances, index, ds_caption,
         cls = (filt.get("class") or "").lower()
         ds, fid = _split_token_attr(filt.get("column"))
         if fid is None:
+            continue
+        # A Tableau SET named as the filter column (#185). It is a ``<group>``, not a ``<column>``,
+        # so ``base_cols`` has no entry and ``_resolve_field`` would emit the generic
+        # "could not resolve field" -- the same string a mistyped column produces, and the same
+        # string a dropped SHELF pill produces, whose consequence is the opposite. Intercept it here
+        # so the warning can name the set, its kind, its level, and the consequence.
+        #
+        # Tableau's own dashboard machinery (``Action (...)`` / ``Tooltip (...)``) is indexed as a
+        # set too but never reaches the resolver, so it is skipped rather than warned about --
+        # warning on it would report 26 non-defects per corpus build and teach the reader to ignore
+        # the message that matters.
+        _sd = (set_defs or {}).get((ds or ds_default, (fid or "").strip().strip("[]")))
+        if _sd is not None and not _sd.get("auto"):
+            warnings.append(_set_filter_warning(_sd, worksheet, ds or ds_default))
             continue
         # Thread ``date_binding`` so a discrete date PART filter on the active business date (e.g. a
         # "keep Year in {2021, 2022}" card) rebinds to the marked Date table's calendar column
@@ -5224,7 +5333,7 @@ def _pane_has_ring_encodings(pane):
 def _parse_worksheet(ws, index, ds_caption, warnings, internal_fields=None, date_binding=None,
                      row_count_binding=None, measure_binding=None, column_binding=None,
                      measure_palette=None, ds_color_palettes=None, workbook_root=None,
-                     shared_filters=None):
+                     shared_filters=None, set_defs=None):
     name = ws.get("name")
     table = _first(ws, "table")
     if table is None:
@@ -5294,7 +5403,8 @@ def _parse_worksheet(ws, index, ds_caption, warnings, internal_fields=None, date
                                             internal_fields=internal_fields, date_binding=date_binding,
                                             table_calc_filters=_tc_filters,
                                             table_calc_peers=_worksheet_table_calc_count(ws),
-                                            extra_filters=_worksheet_shared_filters(ws, shared_filters))
+                                            extra_filters=_worksheet_shared_filters(ws, shared_filters),
+                                            set_defs=set_defs)
     sort = _parse_sort(view, ds_default, base_cols, instances, index,
                        ds_caption, name, warnings, internal_fields=internal_fields)
 
@@ -7179,6 +7289,7 @@ def parse_twb(xml_text, *, date_binding=None, row_count_binding=None, measure_bi
     # Built once for the workbook -- see _shared_view_filter_index: the lookup walks the tree, and a
     # 49-worksheet workbook would otherwise walk it 49 times.
     shared_filters = _shared_view_filter_index(root)
+    set_defs = _set_definitions(root)
     worksheets = []
     for ws in ws_elems:
         parsed = _parse_worksheet(ws, index, ds_caption, warnings,
@@ -7189,7 +7300,7 @@ def parse_twb(xml_text, *, date_binding=None, row_count_binding=None, measure_bi
                                   measure_palette=measure_palette,
                                  ds_color_palettes=ds_color_palettes,
                                  workbook_root=root,
-                                 shared_filters=shared_filters)
+                                 shared_filters=shared_filters, set_defs=set_defs)
         if parsed:
             worksheets.append(parsed)
     worksheet_names = {w["name"] for w in worksheets}
