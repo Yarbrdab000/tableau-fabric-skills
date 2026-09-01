@@ -911,10 +911,14 @@ The historical block rules, kept because old anchors and CHANGELOG entries still
   ```
 
   Neither mode returns a *wrong* owner — both mean the check **cannot answer**, which is worse,
-  because an empty or matching name reads as confirmation. This bit in **both directions within one
-  hour**: the file already warns that *a name you created can silently become someone else's object*;
-  the unstated inverse is that **a tag you never created appears in your own list, minutes old, under
-  your own name, indistinguishable from one you did.** One shared namespace, and `refs/tags` lives in
+  because an empty or matching name reads as confirmation. **The namespace is symmetric, and the two
+  directions were observed in separate incidents — not together:** the file already warns that *a name
+  you created can silently become someone else's object* (the `2.314.0` collision, two lanes three
+  minutes apart); the unstated inverse, observed on its own the day this was written, is that **a tag
+  you never created appears in your own list, minutes old, under your own name, indistinguishable
+  from one you did.** No anchor was overwritten on that day — checked, rather than assumed, by
+  sweeping the 90 unreachable tag objects for one dated that day or naming that version, since an
+  overwrite leaves a dangling tag object behind. One shared namespace, and `refs/tags` lives in
   the common git-dir, so a lane's unpushed anchor shows up in every sibling's `git tag -l`. A routine
   "delete my stale unpushed tags" sweep is therefore the *exact* failure this rule exists to prevent,
   reached by following the rule. Nothing in the tag object discriminates; the message is the only
@@ -1598,6 +1602,26 @@ only by listing what the classifier had excluded.
 
 > **After filtering a population, print what you EXCLUDED, not only what you kept.** The kept set looks
 > correct by construction; the excluded set is where a wrong boundary shows.
+
+**And the filter need not be a tool's default, or even unwritten, to escape you — an existence check
+reads as ROBUSTNESS rather than as scope.** Measured: a sweep collected a model only
+`if os.path.exists(relationships_tmdl)`, then printed `models swept: 24`. Eleven models with zero
+relationships were silently excluded and the kept set was reported as the population. That line was
+written by the person reporting the number, was on screen, and still did not read as a filter,
+because guarding a missing file is what careful code looks like. The file's existing framing locates
+this hazard in *defaults you did not write*; this one was written, deliberately, by its own victim.
+The arithmetic guard is what caught it — `assert kept + excluded == swept` — and it costs one line.
+
+**A related shape in throwaway probes, which is where it is least likely to be looked for: a probe
+that PRINTS a conclusion it did not COMPUTE.** A reachability script ended with a hardcoded
+`print("clause is NOT reachable")`, written before the run and left unchanged after it, sitting
+directly beneath its own output listing five hits. The predicate bug above it was ordinary; the
+hardcoded line was **unfalsifiable by construction** — the `--all`-makes-the-gate-tautological shape,
+relocated into a script nobody will audit. It would have been the sentence quoted onward, and the
+real numbers around it would have lent it credibility they did not cover.
+
+> **A conclusion a probe did not compute is a claim wearing a measurement's clothes.** Derive the
+> verdict from the data so it can contradict you, or print no verdict at all.
 
 **Three filters were written for that one population and all three were wrong**, by three different
 routes, in scripts whose authors had each just read the previous one's:
