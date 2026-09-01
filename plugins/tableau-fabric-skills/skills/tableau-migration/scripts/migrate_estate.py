@@ -715,11 +715,12 @@ def _viz_adapter(cand, layout=None):
     supports_model_table = "model_table" in params
     supports_field_map = "field_map" in params
     supports_column = "column_binding" in params
+    supports_region = "region_binding" in params
     supports_resources = "resources" in params
     supports_layout = "layout" in params
     def _call(twb_text, name, date_binding=None, measure_binding=None, row_count_binding=None,
               param_binding=None, model_table=None, field_map=None, column_binding=None,
-              resources=None):
+              resources=None, region_binding=None):
         if name_kwargs:
             kwargs = {k: name for k in name_kwargs}
             if supports_date and date_binding is not None:
@@ -736,6 +737,8 @@ def _viz_adapter(cand, layout=None):
                 kwargs["field_map"] = field_map
             if supports_column and column_binding is not None:
                 kwargs["column_binding"] = column_binding
+            if supports_region and region_binding is not None:
+                kwargs["region_binding"] = region_binding
             if supports_resources and resources:
                 kwargs["resources"] = resources
             if supports_layout and layout:
@@ -2347,6 +2350,64 @@ def _parse_tmdl_columns(content):
         if cname:
             cols.append((cname, is_calc))
     return table, cols
+
+
+def _viz_accepts(viz, name):
+    """Does this viz stage accept keyword ``name``?
+
+    ``_attach_workbook_pbip`` takes an INJECTED ``viz`` callable, and a test (or an older stage)
+    supplies one raw -- NOT wrapped by ``_viz_adapter``, which is where the capability checks
+    normally live. Passing a kwarg such a callable does not declare raises ``TypeError``, the caller
+    swallows it, and the whole rebind pass is silently skipped: a new optional binding turns into a
+    LOST re-run rather than an error. So the call site inspects too. ``**kwargs`` counts as accepting.
+    """
+    try:
+        import inspect
+        sig = inspect.signature(viz)
+    except (TypeError, ValueError):
+        return False
+    params = sig.parameters
+    if name in params:
+        return True
+    return any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
+
+
+def _region_binding_from_model(model_parts):
+    """``{table: {source_column_lower: region_column}}`` read from the BUILT model's TMDL parts.
+
+    Peer of :func:`_column_binding_from_model`, derived the same way and for the same reason: from
+    what the model ACTUALLY EMITTED, never from an intention. An azureMap choropleth binds its
+    Location to the normalising region column only when that column is literally present in the
+    shipped TMDL, so a report can never reference a column this build did not write -- a dangling
+    reference errors the WHOLE visual, which is a worse failure than the blank map being repaired.
+
+    The source column must live on the same table, so a name-shaped coincidence cannot bind.
+    Returns ``None`` when the model emitted none, leaving the binder's standing resolution and the
+    emitted report byte-for-byte unchanged.
+    """
+    if not isinstance(model_parts, dict) or not model_parts:
+        return None
+    try:
+        from . import assemble_model as _am
+    except ImportError:
+        import assemble_model as _am
+    suffix = getattr(_am, "REGION_COLUMN_SUFFIX", " (Region)")
+    out = {}
+    for path, content in model_parts.items():
+        p = str(path).replace("\\", "/")
+        if not (isinstance(content, str) and p.endswith(".tmdl")):
+            continue
+        table, cols = _parse_tmdl_columns(content)
+        if not table:
+            continue
+        present = {(c or "").casefold() for c, _is_calc in cols}
+        for cname, _is_calc in cols:
+            if not (cname and cname.endswith(suffix)):
+                continue
+            source = cname[: -len(suffix)].strip()
+            if source and source.casefold() in present:
+                out.setdefault(table, {})[source.casefold()] = cname
+    return out or None
 
 
 def _column_binding_from_model(model_parts):
@@ -4049,6 +4110,9 @@ def _build_datasource_pbip(entry, wb_detail, twb_text, result, ds, *, label, mod
     # fallback that ships an empty/mis-bound visual. Read from the BUILT model parts (res["parts"]);
     # None when the model materialised no such calc column (byte-unchanged standing resolution).
     column_binding = _column_binding_from_model(res.get("parts"))
+    # Which state-grain geo columns got a normalising region companion, read back from the
+    # SHIPPED TMDL so a choropleth can only bind to a column that really exists.
+    region_binding = _region_binding_from_model(res.get("parts"))
     # Packaged dashboard images (logos / export-filter-info icons stored inside the .twbx). Extracted
     # once here and threaded to the viz stage so each image object rebuilds as a positioned PBIR image
     # visual. Empty for a bare .twb / live source (never-regress: viz emits no image visuals).
@@ -4060,7 +4124,9 @@ def _build_datasource_pbip(entry, wb_detail, twb_text, result, ds, *, label, mod
                           date_binding=date_binding, measure_binding=measure_binding,
                           row_count_binding=row_count_binding, param_binding=param_binding,
                           model_table=field_model_table, field_map=field_map,
-                          column_binding=column_binding, resources=wb_images or None)
+                          column_binding=column_binding, resources=wb_images or None,
+                          **({"region_binding": region_binding}
+                             if region_binding and _viz_accepts(viz, "region_binding") else {}))
             if isinstance(rebuilt, dict) and rebuilt.get("parts"):
                 report_parts = _rebind_report_byPath(rebuilt["parts"], model_safe)
                 report_parts, wrapped_model_parts, row_wraps = _apply_row_predicate_wrapped_measures(

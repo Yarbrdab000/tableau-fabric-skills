@@ -189,6 +189,11 @@ _PAGE_H_OVERRIDE = None
 LAYOUT_ENGINES = ("legacy", "solver")
 LAYOUT_DEFAULT = "solver"
 _LAYOUT_PLAN = None
+# ``{table: {source_column_lower: region_column}}`` for the state-grain geo columns the MODEL
+# emitted a normalising companion for. Set per build beside ``_LAYOUT_PLAN`` and reset with it,
+# so it can never leak across builds. ``None`` whenever the model emitted none, which keeps the
+# emitted report byte-for-byte unchanged.
+_REGION_BINDING = None
 # Authored-px -> emitted-px scale for zone PADDING. Tableau stores a zone's margins in real pixels
 # while its rect is in normalized 0..100000 units, so the two need different scales; this is set per
 # dashboard beside the page overrides and reset with them.
@@ -8006,8 +8011,8 @@ def _build_query_state(ws, model_table, field_map, warnings):
             + ([size] if size and size["kind"] == "value" else [])
             + ([label] if label and label["kind"] == "value" else []))
         if loc:
-            state["Category"] = {"projections": _role_projections(
-                loc, model_table, field_map, used_refs)}
+            state["Category"] = {"projections": _region_rebound_projections(_role_projections(
+                loc, model_table, field_map, used_refs))}
         if meas:
             # azureMap has NO ``Value`` and no ``Gradient`` role (catalog describe azureMap ->
             # Category/Y/X/Series/Size/Tooltips/PathID/PointOrder). ``Tooltips`` IS a real measure
@@ -8030,8 +8035,8 @@ def _build_query_state(ws, model_table, field_map, warnings):
             + ([size] if size and size["kind"] == "value" else [])
             + ([label] if label and label["kind"] == "value" else []))
         if loc:
-            state["Category"] = {"projections": _role_projections(
-                loc, model_table, field_map, used_refs)}
+            state["Category"] = {"projections": _region_rebound_projections(_role_projections(
+                loc, model_table, field_map, used_refs))}
         if meas:
             # azureMap has no ``Gradient`` role; the shading measure rides ``Tooltips`` (a real
             # measure role) so the referenceLayer FillRule can resolve it. See VT_SHAPE_MAP above.
@@ -11303,6 +11308,17 @@ _SHAPE_MAP_DIVERGING_MAX = "#4A88C2"    # blue   -> most-positive (high profit);
 _SHAPE_MAP_DIVERGING_CENTRE = "0D"      # PBIR double-literal 0 -> the pinned centre value (break-even)
 
 
+# A choropleth's referenceLayer joins the visual's Location values against this file's feature
+# ``name`` property, which carries the FULL region name ("Colorado"). That join key is why
+# ``assemble_model._US_REGION_NAME_BY_CODE`` exists and why its 52 entries are pinned to THIS
+# file: a source storing two-letter postal codes matches nothing, and with
+# ``unmappedObjectVisibility: false`` that renders as a COMPLETELY BLANK MAP, silently, with a
+# clean ``validate``.
+#
+# RE-POINTING THIS URL SILENTLY DECOUPLES THAT MAPPING. A boundary asset keyed on anything other
+# than full region names (ISO codes, FIPS ids, a different vintage of the name set) puts the
+# normalised values back to matching nothing -- the same blank map, from the opposite direction.
+# ``test_choropleth_region_names`` pins the pair together so the swap fails loudly instead.
 _AZURE_MAP_US_STATES_GEOJSON = (
     "https://raw.githubusercontent.com/PublicaMundi/MappingAPI/master/data/geojson/us-states.json")
 # Closest render-verified match to Tableau's own map chrome: white background, soft grey borders, no
@@ -11470,6 +11486,54 @@ def _azure_map_objects(ws, visual_type, shading_field=None):
          "selector": {"data": [{"dataViewWildcard": {"matchingOption": 1}}]}},
     ]
     return objects
+
+
+def _region_rebound_projections(projections, region_binding=None):
+    """Rebind a choropleth's Location projections onto the model's normalising region column.
+
+    An azureMap choropleth shades through a ``referenceLayer`` joined on the boundary file's feature
+    ``name`` property, which carries the FULL region name. A source that stores two-letter POSTAL
+    CODES matches nothing -- and because the emitted layer sets ``unmappedObjectVisibility: false``,
+    "nothing matched" renders as a COMPLETELY BLANK MAP rather than an unshaded one.
+
+    Measured on Salesforce NPSP: ``MailingState`` holds AL/AK/AZ/..., 0 of the boundary file's 52
+    features matched, on two dashboards. Confirmed at the RENDER rather than argued -- patching a
+    copy to make unmapped shapes visible drew the polygons, unshaded, which proves the file loads
+    and the JOIN is what fails.
+
+    ``region_binding`` reports the companion columns the model ACTUALLY WROTE, read back from the
+    shipped TMDL, so a Location is rebound only where a real column exists: a dangling reference
+    errors the whole visual, which is worse than the blank map being repaired.
+
+    Both the binding AND the label are rewritten, deliberately. Leaving ``nativeQueryRef`` on the
+    source column would reproduce the label-vs-binding divergence that has already cost this project
+    an afternoon of investigation, and a map's Location label is not a user-facing caption.
+
+    Returns the input list unchanged (the same objects) when nothing rebinds, so a report with no
+    state-grain choropleth is byte-for-byte identical.
+    """
+    binding = region_binding if region_binding is not None else _REGION_BINDING
+    if not binding or not projections:
+        return projections
+    out, changed = [], False
+    for proj in projections:
+        col = ((proj.get("field") or {}).get("Column") or {})
+        ent = (((col.get("Expression") or {}).get("SourceRef") or {}).get("Entity") or "")
+        prop = col.get("Property") or ""
+        per_table = binding.get(ent)
+        repl = per_table.get(prop.casefold()) if isinstance(per_table, dict) else None
+        if not repl:
+            out.append(proj)
+            continue
+        p2 = copy.deepcopy(proj)
+        p2["field"]["Column"]["Property"] = repl
+        if p2.get("queryRef"):
+            p2["queryRef"] = "%s.%s" % (ent, repl)
+        if p2.get("nativeQueryRef"):
+            p2["nativeQueryRef"] = repl
+        out.append(p2)
+        changed = True
+    return out if changed else projections
 
 
 def _azure_map_state_grain(ws):
@@ -14051,7 +14115,7 @@ def _stitched_band_zone(zones):
     return merged
 
 
-def emit_pbir(ir, *, dataset_name="Model", report_name="Report",
+def emit_pbir(ir, *, dataset_name="Model", report_name="Report", region_binding=None,
               model_table=None, field_map=None, table_calc_usages=None, resources=None):
     """Emit a PBIR report definition (a ``{relative_path: text}`` parts dict) from the IR.
 
@@ -14123,7 +14187,15 @@ def emit_pbir(ir, *, dataset_name="Model", report_name="Report",
     page_order = []
     placed = set()
 
-    global _PAGE_H_OVERRIDE, _PAGE_W_OVERRIDE, _LAYOUT_PLAN, _ZONE_PAD_SCALE
+    global _PAGE_H_OVERRIDE, _PAGE_W_OVERRIDE, _LAYOUT_PLAN, _ZONE_PAD_SCALE, _REGION_BINDING
+    # The model's normalising region columns, for a choropleth Location bind. Scoped to the whole
+    # BUILD, deliberately unlike ``_LAYOUT_PLAN`` beside it: a layout plan describes one dashboard's
+    # zone tree and must be cleared before the standalone-worksheet pass, whereas this is a fact
+    # about the MODEL and is equally true of every page. Setting it per dashboard and clearing it
+    # with the plan left the worksheet pass unbound -- measured on corpus workbook 0063, whose three
+    # choropleths live on one dashboard page AND two standalone worksheet pages: only the dashboard
+    # one rebound, and the two worksheet pages kept the raw code column and stayed blank.
+    _REGION_BINDING = region_binding
     for db in ir["dashboards"]:
         page_name = _sanitize("page-" + (db["name"] or "dashboard"))
         # A worksheet whose ONLY appearance on this dashboard is an author-hidden zone is still
@@ -15429,7 +15501,8 @@ def _deoverlap_captions(visuals, page_w, page_h, *, gap=8.0, tol=1.0, min_frac=0
 def migrate_twb_to_pbir(xml_text, *, dataset_name="Model", report_name="Report",
                         model_table=None, field_map=None, date_binding=None,
                         row_count_binding=None, measure_binding=None, column_binding=None,
-                        param_binding=None, resources=None, layout=LAYOUT_DEFAULT):
+                        param_binding=None, resources=None, layout=LAYOUT_DEFAULT,
+                        region_binding=None):
     """One-call convenience: parse ``.twb`` text and emit the PBIR parts.
 
     Returns ``{"ir": ..., "parts": ..., "warnings": ..., "candidate_records": ...,
@@ -15499,7 +15572,8 @@ def migrate_twb_to_pbir(xml_text, *, dataset_name="Model", report_name="Report",
             table_calc_usages = None
     parts = emit_pbir(ir, dataset_name=dataset_name, report_name=report_name,
                       model_table=model_table, field_map=field_map,
-                      table_calc_usages=table_calc_usages, resources=resources)
+                      table_calc_usages=table_calc_usages, resources=resources,
+                      region_binding=region_binding)
     result = {"ir": ir, "parts": parts, "warnings": ir["warnings"],
               "candidate_records": ir.get("candidate_records", [])}
     # Additive per-visual remediation worklist (folds warnings + candidate_records into a structured,

@@ -3013,6 +3013,153 @@ def _stub_backed_tables(tables):
     return stubs
 
 
+# -- choropleth region-name normalisation --------------------------------------------------------
+#
+# An azureMap choropleth shades through a data-bound ``referenceLayer`` whose boundary file is joined
+# on its feature ``name`` property, and that property carries the FULL region name ("Colorado"). A
+# source whose geo column holds two-letter POSTAL CODES ("CO") therefore matches nothing -- and
+# because the emitted layer sets ``unmappedObjectVisibility: false`` so unmatched shapes are hidden,
+# "nothing matched" renders as a COMPLETELY BLANK MAP rather than an unshaded one.
+#
+# Measured on Salesforce NPSP: ``MailingState`` holds AL/AK/AZ/... and 0 of the boundary file's 52
+# features matched, on two dashboards. Confirmed at the RENDER rather than argued -- patching a copy
+# to make unmapped shapes visible drew the polygons, unshaded, which proves the file loads and the
+# JOIN is what fails.
+#
+# The engine's own note stated the premise that fails (``twb_to_pbir._azure_map_state_grain``): the
+# boundary "feature ``name`` property is the full state name, WHICH IS WHAT TABLEAU'S STATE CAPTIONS
+# CARRY" -- true of the workbook it was built against, false for any source that stores codes.
+#
+# Keyed to match that boundary file EXACTLY -- 52 features: 50 states + District of Columbia +
+# Puerto Rico -- verified by fetching it rather than assumed. The file is
+# ``twb_to_pbir._AZURE_MAP_US_STATES_GEOJSON``, and this mapping is COUPLED TO IT: the join is on
+# that file's feature ``name`` property, so re-pointing the URL at a boundary asset keyed on
+# anything else (ISO codes, FIPS ids, a different name vintage) silently un-matches every value
+# again. The pair is pinned by ``test_choropleth_region_names``.
+#
+# WHY THIS IS NON-REGRESSIVE RATHER THAN USUALLY-RIGHT: an unrecognised value cannot invent a
+# match, only preserve the old behaviour. A full-name source passes through untouched (0 of the
+# 52 names is mutated), an unknown value like 'Ontario' or '' is returned as-is, and no region
+# name is two characters, so a code key can never shadow a name. The corpus exercises both
+# paths on every build -- Superstore stores FULL NAMES, Salesforce stores CODES.
+_US_REGION_NAME_BY_CODE = {
+    "AL": "Alabama",
+    "AK": "Alaska",
+    "AZ": "Arizona",
+    "AR": "Arkansas",
+    "CA": "California",
+    "CO": "Colorado",
+    "CT": "Connecticut",
+    "DE": "Delaware",
+    "DC": "District of Columbia",
+    "FL": "Florida",
+    "GA": "Georgia",
+    "HI": "Hawaii",
+    "ID": "Idaho",
+    "IL": "Illinois",
+    "IN": "Indiana",
+    "IA": "Iowa",
+    "KS": "Kansas",
+    "KY": "Kentucky",
+    "LA": "Louisiana",
+    "ME": "Maine",
+    "MD": "Maryland",
+    "MA": "Massachusetts",
+    "MI": "Michigan",
+    "MN": "Minnesota",
+    "MS": "Mississippi",
+    "MO": "Missouri",
+    "MT": "Montana",
+    "NE": "Nebraska",
+    "NV": "Nevada",
+    "NH": "New Hampshire",
+    "NJ": "New Jersey",
+    "NM": "New Mexico",
+    "NY": "New York",
+    "NC": "North Carolina",
+    "ND": "North Dakota",
+    "OH": "Ohio",
+    "OK": "Oklahoma",
+    "OR": "Oregon",
+    "PA": "Pennsylvania",
+    "PR": "Puerto Rico",
+    "RI": "Rhode Island",
+    "SC": "South Carolina",
+    "SD": "South Dakota",
+    "TN": "Tennessee",
+    "TX": "Texas",
+    "UT": "Utah",
+    "VT": "Vermont",
+    "VA": "Virginia",
+    "WA": "Washington",
+    "WV": "West Virginia",
+    "WI": "Wisconsin",
+    "WY": "Wyoming",
+}
+
+# Suffix for the normalising companion column. The REPORT layer binds a state-grain choropleth to it,
+# but only after reading it back from the SHIPPED TMDL (see ``migrate_estate._region_binding_from_model``),
+# so a report can never reference a column a build did not write.
+REGION_COLUMN_SUFFIX = " (Region)"
+
+
+def region_companion_name(column_name):
+    """The normalising companion column's name for ``column_name``."""
+    return "%s%s" % ((column_name or "").strip(), REGION_COLUMN_SUFFIX)
+
+
+def _region_name_dax(table_display, source_col):
+    """``SWITCH`` mapping a two-letter region code to the boundary file's full name.
+
+    The fall-through returns the ORIGINAL value, so a source that already stores full names passes
+    through unchanged. That is what makes the column safe to emit without reading the data -- which
+    the engine cannot do at build time anyway: it can only ever rewrite a value that IS a recognised
+    two-letter code, and no US region name is two characters, so a key can never collide with a name.
+    """
+    ref = "%s[%s]" % (T._dax_table_ref(table_display), source_col)
+    pairs = ",\n        ".join('"%s", "%s"' % (code, _US_REGION_NAME_BY_CODE[code])
+                               for code in sorted(_US_REGION_NAME_BY_CODE))
+    return "SWITCH(\n        UPPER(TRIM(%s)),\n        %s,\n        %s\n    )" % (ref, pairs, ref)
+
+
+def region_name_columns(tables):
+    """``({table_display: rendered TMDL}, {(table_display, column): companion_name})``.
+
+    One normalising companion column per column the descriptor tagged
+    ``dataCategory: StateOrProvince`` -- the tag the model already derives from Tableau's geo
+    ``semantic-role``, so the population is the model's own and needs no new cross-layer channel to
+    DECIDE (only to report what it wrote).
+
+    Additive and fail-closed: a descriptor with no state-grain geo column yields ``({}, {})`` and
+    every table part is byte-for-byte unchanged. A table that already owns the companion NAME is
+    skipped rather than duplicated -- a TMDL table declaring one column twice will not open.
+    """
+    blocks, mapping = {}, {}
+    for rel in (tables or []):
+        disp = _table_display(rel)
+        if not disp:
+            continue
+        cols = rel.get("columns") or []
+        owned = {(c.get("model_name") or "").casefold() for c in cols}
+        for col in cols:
+            if (col.get("data_category") or "") != "StateOrProvince":
+                continue
+            src = col.get("model_name")
+            if not src:
+                continue
+            name = region_companion_name(src)
+            if name.casefold() in owned:
+                continue
+            blocks.setdefault(disp, []).append(T.generate_calc_column_tmdl(
+                name,
+                "<region-name normalisation for %s>" % src,
+                dax=_region_name_dax(disp, src),
+                tmdl_type="string",
+                translated_by="deterministic (choropleth region-name normalisation)"))
+            mapping[(disp, src)] = name
+    return {k: "\n".join(v) for k, v in blocks.items()}, mapping
+
+
 def _build_date_dimensions(tables, emitted_names, relationships, *, mark_as_date=True,
                            mode="import", date_range=None, date_usage=None,
                            date_usage_by_island=None):
@@ -4902,6 +5049,19 @@ def assemble_import_model(descriptor, *, model_name, calcs=None, dim_calcs=None,
     # hidden calculated column. Additive and fail-closed: ``scatter_keys`` is empty for any report
     # with no multi-dimension scatter, so output is byte-identical.
     for disp, block in _composite_key_columns_tmdl(scatter_keys, set(table_names)).items():
+        path = f"definition/tables/{disp}.tmdl"
+        if path in parts:
+            parts[path] = T.enrich_table_tmdl(parts[path], calc_columns=block)
+
+    # Normalising companion column for every state-grain geo column, so an azureMap choropleth's
+    # referenceLayer can join a two-letter postal code against a boundary file keyed on full region
+    # names (see ``region_name_columns``). Spliced HERE, not in the ``migrate_tds_to_semantic_model``
+    # convenience wrapper: a WORKBOOK's embedded datasource calls this function DIRECTLY
+    # (``migrate_estate._migrate_one_datasource``) and never reaches that wrapper, so a splice there
+    # fired for .tds files and silently did nothing for every workbook -- which is the only shape
+    # this defect appears in. Additive and byte-identical when there is no such column.
+    _region_blocks, _region_map = region_name_columns(tables)
+    for disp, block in _region_blocks.items():
         path = f"definition/tables/{disp}.tmdl"
         if path in parts:
             parts[path] = T.enrich_table_tmdl(parts[path], calc_columns=block)

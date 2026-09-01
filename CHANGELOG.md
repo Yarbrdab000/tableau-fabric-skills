@@ -14,6 +14,66 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ### Fixed
 
+- **`tableau-migration` (skill `2.344.0` → `2.345.0`): a choropleth whose geo column stores POSTAL
+  CODES renders its map instead of a blank rectangle.** An azureMap choropleth shades through a
+  data-bound `referenceLayer`, and that layer joins the visual's Location values against the boundary
+  file's feature **`name`** property -- which carries the FULL region name (`"Colorado"`). A source
+  storing two-letter codes (`"CO"`) matches nothing, and because the emitted layer sets
+  `unmappedObjectVisibility: false` so unmatched shapes are hidden, "nothing matched" renders as a
+  **completely blank map** rather than an unshaded one. Nothing warns and
+  `powerbi-report-author validate` is clean, because every emitted object is individually valid.
+
+  Measured on Salesforce NPSP: `MailingState` holds AL/AK/AZ/..., **0 of the boundary file's 52
+  features matched**, on two dashboards. Root-caused at the RENDER rather than argued -- patching a
+  copy to make unmapped shapes visible drew the polygons, unshaded, which proves the file loads, the
+  geometry renders, and the JOIN is the only thing that fails.
+
+  The engine's own note stated the premise that fails: the boundary "feature `name` property is the
+  full state name, **which is what Tableau's state captions carry**" -- true of the workbook it was
+  built against, false for any source that stores codes.
+
+  The model now emits a normalising companion column beside each column it tagged
+  `dataCategory: StateOrProvince`, and a choropleth's Location binds to it:
+
+  ```
+  column 'MailingState (Region)' =
+      SWITCH(UPPER(TRIM('Contact1'[MailingState])),
+             "AK", "Alaska", ... 52 entries keyed to that exact boundary file ...,
+             'Contact1'[MailingState])      -- fall-through: any other value passes through UNCHANGED
+  ```
+
+  **Strictly non-regressive rather than usually-right**: an unrecognised value cannot invent a match,
+  only preserve the old behaviour. A full-name source passes through untouched (0 of the 52 names is
+  mutated), an unknown value such as `Ontario` or `""` is returned as-is, and no US region name is
+  two characters so a code key can never shadow a name. That is what lets the column be emitted
+  WITHOUT reading the data, which the engine cannot do at build time anyway. The corpus exercises
+  **both** paths on every build -- Superstore stores full names, Salesforce stores codes.
+
+  The report binds only to columns read back from the **shipped TMDL**, so it can never emit a
+  dangling reference -- which errors the whole visual, a worse failure than the blank map. And the
+  mapping is **pinned to the boundary asset it joins against**: re-pointing that URL at a file keyed
+  on ISO codes, FIPS ids or a different name vintage would silently un-match every value and restore
+  the blank map from the opposite direction, so a test fails loudly on the swap.
+
+  Verified: **blank → 50 states shaded by value**, opened cold, refreshed and persisted, whole page
+  re-checked with every other visual unchanged. Choropleths rebound **0 of 5 → 5 of 5**. Corpus 34/34
+  both sides; of 25 differing files, 16 are the additive model column, 5 are choropleth visuals and 4
+  are reports -- **0 non-choropleth visuals changed**. Suite 5382 → 5409. Twelve positive controls,
+  each caught by its NAMED test, sources hash-verified after every one.
+
+  Two defects were found inside this fix and are recorded because neither was caught by a test. The
+  first attempt spliced the column into `migrate_tds_to_semantic_model` -- but a WORKBOOK's embedded
+  datasource calls `assemble_import_model` **directly** and never reaches that wrapper, so it fired
+  for `.tds` files and did nothing for every workbook, which is the only shape this defect appears
+  in. The second was found by **reconciling a count**: the corpus showed 3 visuals rebound where the
+  blast-radius scan had said 5 were exposed, and the missing pair turned out to be standalone
+  worksheet pages, which `emit_pbir` emits in a second loop after the binding had been cleared beside
+  `_LAYOUT_PLAN`. Copying a scoping pattern copies its lifetime, and the lifetime is the part that
+  was reasoned about -- a layout plan is per-dashboard and must be cleared, a model fact is per-build
+  and must not. It reproduced the original defect on 2 of 5 exposed visuals, inside the fix for that
+  defect, past 25 passing tests; only the arithmetic `3 != 5` found it. Both now have a test and a
+  positive control.
+
 - **`tableau-migration` (skill `2.343.0` → `2.344.0`): REVERTS 2.342.0. The dropdown-slicer floor
   goes back to 57px, because the premise I called false is true (#180).** 2.342.0 restored the 76px
   floor on the finding that `SLICER_FONT_PT` is unreferenced and *"zero of 94 emitted slicers contain
