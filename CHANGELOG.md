@@ -14,6 +14,44 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ### Fixed
 
+- **`tableau-migration` (skill `2.345.0` → `2.346.0`): an implicit `COUNT(*)` column on a shelf
+  becomes a real measure instead of dropping.** Tableau's object model gives every relation a hidden
+  per-row identity, so dragging "Count of Orders" onto a shelf emits
+  `COUNT([__tableau_internal_object_id__].[Orders_<32-hex>])` — a pill with no calculated field and
+  no formula. Every such column was lost, to **two independent defects** that each had to be fixed:
+  `_classify_row_count` asked a WORKSHEET-WIDE sweep which relations were counted and required the
+  answer to be unique, so the ordinary Measure Values shape (Count of Orders + Count of People +
+  Count of Returns side by side) reported three candidates for **every** pill and bound none — even
+  though each pill names its own relation in `base_id`, which the existing `_oid_table` already
+  resolves; and `assemble_model` synthesised a `COUNTROWS` measure only for a view-only QUICK TABLE
+  CALC, so even a single unambiguous pill had nothing to bind to. Fixing either alone still renders
+  nothing, which is why they ship together and are covered by **separate** positive controls: with
+  the classifier reverted the 3 measures are still synthesised and 0 bind; with synthesis disabled
+  0 measures exist and 0 bind — distinguishable, so neither half can be dead while the other's
+  control passes. New `workbook_table_calcs.extract_implicit_count_tables` recovers the counted
+  relations (preferring the object-id column's caption, so a Union's friendly name wins over its
+  internal relation id) and is threaded on the auto-extract/override contract `table_calc_usages`
+  already uses — including the extract-backed local path, which bypasses
+  `migrate_tds_to_semantic_model` entirely. Synthesis is additive and fail-closed: a relation that is
+  not a real model table is dropped rather than guessed, a table that already exposes a whole-table
+  count reuses it, and an existing measure owning the `Count <Table>` name is never overwritten.
+  Verified at the render, not by metric — the reference workbook's matrix went from a single `Total`
+  row to all 8 measure columns populated, and a DAX query at Tableau's own Order ID grain reproduces
+  its `Count of Orders`, `Quantity` and `Sales` **exactly** (1/2/2/6 orders; 6/4/6/25 qty;
+  38/1108/586/3519 sales). **Known divergence, measured and deliberately not masked:** a count over a
+  relation that is a DIMENSION relative to the visual's grain (`Count People`, `Count Returns`)
+  returns the unfiltered table total, because Tableau's object model counts related rows
+  symmetrically while a correct one-directional Power BI star schema does not propagate fact
+  → dimension; forcing `CROSSFILTER(..., BOTH)` reproduces Tableau's numbers exactly, which is a
+  separate change with its own blast radius and is not bundled here. Corpus: 1607 files, 0 added,
+  0 removed, and the only 4 that differ are run manifests differing solely by timestamp — the
+  population carrying such a pill is **1 of 35 workbooks**, so the differential bounds the negative
+  half only; the render is the sole positive evidence. `test_estate_summary_rolls_up_unbound_implicit
+  _row_counts` was not weakened: its fixture counted `Sales`, a real model table, so the fix
+  correctly binds it and the fixture no longer created the "no model-side target" condition its own
+  comment describes — it now counts a relation the model does not have, with its assertions
+  untouched, and a companion test pins the newly-bound case.
+
 - **`tableau-migration` (skill `2.344.0` → `2.345.0`): a choropleth whose geo column stores POSTAL
   CODES renders its map instead of a blank rectangle.** An azureMap choropleth shades through a
   data-bound `referenceLayer`, and that layer joins the visual's Location values against the boundary

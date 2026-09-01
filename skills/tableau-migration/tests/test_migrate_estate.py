@@ -2306,6 +2306,51 @@ def test_scan_cli_writes_manifest_and_gates_on_missing(tmp_path):
 def test_estate_summary_rolls_up_unbound_implicit_row_counts(tmp_path):
     # An object-id COUNT(*) with no model-side COUNTROWS target (the cross-layer gap) is warned,
     # never silently dropped or dangling -- and the estate summary rolls up the volume additively.
+    #
+    # The counted relation is deliberately one the MODEL DOES NOT HAVE (the model's table is
+    # ``Sales``). Before implicit row-count synthesis existed, counting ``Sales`` also left the pill
+    # unbound and this fixture used it -- but a pill over a real model table now synthesises
+    # ``Count Sales`` and binds, which is the fix, so that fixture no longer created the condition
+    # this test describes. The caption must differ too: ``_oid_table`` prefers the object-id column's
+    # caption over the relation id, so a caption of ``Sales`` would resolve back to the model table.
+    oid = "__tableau_internal_object_id__"
+    hexv = "ECFCA1FB690A41FE803BC071773BA862"
+    ws = f"""
+    <worksheet name='Row Count'>
+      <table>
+        <view>
+          <datasources><datasource caption='Sales DS' name='federated.s1' /></datasources>
+          <datasource-dependencies datasource='federated.s1'>
+            <column caption='Category' datatype='string' name='[Category]' role='dimension' type='nominal' />
+            <column caption='Returns' datatype='integer' name='[{oid}].[Returns_{hexv}]' role='measure' type='quantitative' />
+            <column-instance column='[Category]' derivation='None' name='[none:Category:nk]' pivot='key' type='nominal' />
+            <column-instance column='[{oid}].[Returns_{hexv}]' derivation='Count' name='[cnt:Returns_{hexv}:qk]' pivot='key' type='quantitative' />
+          </datasource-dependencies>
+        </view>
+        <panes><pane><mark class='Bar' /></pane></panes>
+        <rows>[federated.s1].[{oid}].[cnt:Returns_{hexv}:qk]</rows>
+        <cols>[federated.s1].[none:Category:nk]</cols>
+      </table>
+    </worksheet>"""
+    twb = _viz_wb(_viz_ds("Sales DS", "federated.s1", "sqlserver.s1", "sqlserver", "Sales"), ws)
+    src = InMemoryTableauSource(workbooks={"Counts WB": twb})
+    report = migrate_estate(src, str(tmp_path / "b"))
+    wb = report["workbooks"][0]
+    assert wb["viz_implicit_row_count"] == 1
+    s = report["summary"]
+    assert s["implicit_row_count_unbound"] == 1
+    assert s["workbooks_implicit_row_count"] == 1
+    assert any("implicit row count" in (f.get("reason") or "")
+               for f in (wb["viz_fidelity"] or []))
+    # never a dangling object-id projection in the rebuilt report.
+    assert oid not in json.dumps(report)
+
+
+def test_estate_binds_implicit_row_counts_over_real_model_tables(tmp_path):
+    # The other side of the test above: a "Count of <Table>" pill over a relation the model DOES
+    # have synthesises ``Count <Table> = COALESCE(COUNTROWS('<Table>'), 0)`` and BINDS -- no warning,
+    # nothing rolled up as unbound. Before this, no COUNTROWS measure was ever synthesised for a
+    # plain shelf pill (only for a view-only quick table calc), so the column dropped.
     oid = "__tableau_internal_object_id__"
     hexv = "ECFCA1FB690A41FE803BC071773BA862"
     ws = f"""
@@ -2329,13 +2374,9 @@ def test_estate_summary_rolls_up_unbound_implicit_row_counts(tmp_path):
     src = InMemoryTableauSource(workbooks={"Counts WB": twb})
     report = migrate_estate(src, str(tmp_path / "b"))
     wb = report["workbooks"][0]
-    assert wb["viz_implicit_row_count"] == 1
-    s = report["summary"]
-    assert s["implicit_row_count_unbound"] == 1
-    assert s["workbooks_implicit_row_count"] == 1
-    assert any("implicit row count" in (f.get("reason") or "")
-               for f in (wb["viz_fidelity"] or []))
-    # never a dangling object-id projection in the rebuilt report.
+    assert report["summary"]["implicit_row_count_unbound"] == 0
+    assert not any("implicit row count" in (f.get("reason") or "")
+                   for f in (wb["viz_fidelity"] or []))
     assert oid not in json.dumps(report)
 
 

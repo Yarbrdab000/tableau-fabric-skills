@@ -943,9 +943,16 @@ def _classify_row_count(ds, field_id, base_id, deriv, base_cols, instances):
 
     Returns ``{"kind": "object_id"|"numrec", "table": <name|None>, "candidates": [<name>...]}``.
     ``object_id`` is recognised only when the worksheet actually carries a count-of-object-id
-    instance (so a bare object-id artifact is left to the silent-drop path). For ``object_id`` a
-    single distinct table is named; multiple distinct tables are left ambiguous (``table=None``,
-    ``candidates`` populated) so the binder never guesses which fact to count.
+    instance (so a bare object-id artifact is left to the silent-drop path).
+
+    An object-id pill NAMES ITS OWN RELATION in ``base_id``
+    (``[__tableau_internal_object_id__].[Orders_<32-hex>]``), so when that relation is one the
+    worksheet genuinely counts it is the answer -- there is nothing to guess. The worksheet-wide
+    sweep is the FALLBACK, for a pill that does not name a relation; before this it ran
+    unconditionally, so a sheet counting three relations (the Measure Values shape: Count of Orders
+    + Count of People + Count of Returns side by side) reported all three as candidates for EVERY
+    pill, `len(tables) != 1`, and all three dropped unbound. Requiring the pill's own relation to
+    appear in ``tables`` keeps that sweep's "is this a genuine count pill" gate intact.
     """
     cap = (base_cols.get((ds, base_id)) or {}).get("caption") or ""
     if base_id == _NUMBER_OF_RECORDS or field_id == _NUMBER_OF_RECORDS or cap == _NUMBER_OF_RECORDS:
@@ -954,6 +961,9 @@ def _classify_row_count(ds, field_id, base_id, deriv, base_cols, instances):
         tables = _row_count_tables(ds, instances, base_cols)
         if not tables:
             return None
+        own = _oid_table(ds, base_id, base_cols) if base_id else None
+        if own and own in tables:
+            return {"kind": "object_id", "table": own, "candidates": tables}
         return {"kind": "object_id",
                 "table": tables[0] if len(tables) == 1 else None,
                 "candidates": tables}

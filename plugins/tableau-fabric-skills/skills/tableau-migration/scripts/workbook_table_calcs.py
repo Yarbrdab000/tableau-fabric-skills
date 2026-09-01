@@ -452,6 +452,60 @@ def extract_table_calc_usages(xml_text: str) -> List[TableCalcUsage]:
     return usages
 
 
+# Tableau's object model gives every relation a hidden per-row identity column,
+# ``[__tableau_internal_object_id__].[<Relation>_<32-hex>]``. Dragging "Count of <Table>" onto a
+# shelf emits a COUNT over that internal rather than a calculated field, so the pill carries no
+# formula and no name of its own.
+_OBJECT_ID_INTERNAL = "__tableau_internal_object_id__"
+_OBJECT_ID_SUFFIX_RE = re.compile(r"^(.*)_[0-9A-Fa-f]{32}$")
+# Mirrors the viz layer's ``_COUNT_DERIVS``. ``Countd`` counts too: the object id is a ROW identity,
+# so its distinct count and its plain count are both the relation's row count.
+_ROW_COUNT_DERIVS = {"count", "countd", "cnt", "cntd"}
+
+
+def extract_implicit_count_tables(xml_text: str) -> List[dict]:
+    """Relations a workbook implicitly ROW-COUNTS via ``COUNT([__tableau_internal_object_id__])``.
+
+    Such a pill has no calculated field and no formula, so it reaches the model build through no
+    other channel -- ``extract_table_calc_usages`` sees it only when it also carries a
+    ``<table-calc>``, which a plain "Count of <Table>" column does not. Without this the model
+    synthesises no row-count measure and the report's pill binds to nothing.
+
+    Returns ``[{"table": <relation with the hash stripped>, "caption": <object-id column caption or
+    None>}]``, de-duplicated in first-seen order. The CALLER validates each name against the model's
+    real tables -- this module reports what the workbook says and never guesses. A bare ``.tds`` has
+    no worksheets, so it yields ``[]`` and the model build is byte-for-byte unchanged.
+    """
+    root = ET.fromstring(xml_text)
+    out: List[dict] = []
+    seen = set()
+
+    for ws in _findall_local(root, "worksheet"):
+        table = _first(ws, "table")
+        if table is None:
+            continue
+        v = _first(table, "view")
+        view = table if v is None else v
+        caps = _captions(view)
+        for pill in _instances(view).values():
+            col = pill.column or ""
+            if _OBJECT_ID_INTERNAL not in col:
+                continue
+            if (pill.derivation or "").strip().lower() not in _ROW_COUNT_DERIVS:
+                continue
+            tail = col.split("].[")[-1].strip("[]")
+            m = _OBJECT_ID_SUFFIX_RE.match(tail)
+            name = m.group(1) if m else tail
+            if not name or name in seen:
+                continue
+            seen.add(name)
+            # A Union (or any renamed relation) carries its friendly name as the object-id column's
+            # caption. Look it up under both shapes the dependency block uses -- the fully qualified
+            # ``<internal>].[<Relation>_<hash>`` and the bare relation token.
+            out.append({"table": name, "caption": caps.get(col) or caps.get(tail)})
+    return out
+
+
 def extract_from_file(path: str) -> List[TableCalcUsage]:
     """Convenience: :func:`load_workbook_xml` + :func:`extract_table_calc_usages`."""
     return extract_table_calc_usages(load_workbook_xml(path))

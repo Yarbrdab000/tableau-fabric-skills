@@ -78,7 +78,7 @@ try:  # package or scripts-on-path
         translate_unplaced_percent_diff,
         extract_percent_diff_base,
     )
-    from .workbook_table_calcs import extract_table_calc_usages
+    from .workbook_table_calcs import extract_table_calc_usages, extract_implicit_count_tables
     from .workbook_calc_usage import extract_calc_outer_aggs
     from .date_window_flag import build_date_window_flags
     from .openability_gate import check_model_openability
@@ -131,7 +131,7 @@ except ImportError:
         translate_unplaced_percent_diff,
         extract_percent_diff_base,
     )
-    from workbook_table_calcs import extract_table_calc_usages
+    from workbook_table_calcs import extract_table_calc_usages, extract_implicit_count_tables
     from workbook_calc_usage import extract_calc_outer_aggs
     from date_window_flag import build_date_window_flags
     from openability_gate import check_model_openability
@@ -1332,7 +1332,8 @@ def _measures_part(calcs, resolve, consumed=None, param_resolver=None, *,
                    known_tables=None, table_calc_usages=None, order_resolver=None,
                    flag_measures=None, resolve_for=None, inline_calcs=None,
                    related_tables=None, conformed_hubs=None, calc_outer_aggs=None,
-                   row_scalar_table=None, colour_palettes=None, semantic_colours=False):
+                   row_scalar_table=None, colour_palettes=None, semantic_colours=False,
+                   row_count_tables=None):
     """Translate ``calcs`` and render the ``_Measures`` table TMDL + a per-measure report.
 
     ``calcs`` is an iterable of ``{"name": str, "formula": str}``. Calcs whose name is in
@@ -1825,6 +1826,17 @@ def _measures_part(calcs, resolve, consumed=None, param_resolver=None, *,
             translated_by=br.get("translated_by") or "deterministic (visual-calculation base measure)",
             format_string=_fmt(br["measure"]))
         report.append(br)
+    # The same base measure, for the OTHER way a workbook implicitly row-counts: a plain "Count of
+    # <Table>" pill on a shelf. That pill is a COUNT over the relation's hidden object id -- it has
+    # no calculated field and no formula, so it arrives through no other channel and, before this,
+    # no COUNTROWS measure was ever synthesised for it. The report's pill then had nothing to bind
+    # to and dropped. Runs AFTER the loop above so a table counted both ways yields one measure.
+    for br in _implicit_count_base_measures(row_count_tables, known_tables, report):
+        br["measure"] = _gen_measure(
+            br["measure"], br["tableau_formula"], br["dax"],
+            translated_by=br.get("translated_by") or "deterministic (implicit row-count base measure)",
+            format_string=_fmt(br["measure"]))
+        report.append(br)
     # Row-aggregated companions for ROW-LEVEL SCALAR calcs (parameter/literal arithmetic, no column
     # reference). Tableau evaluates such a calc per row and aggregates it on the shelf, so its SUM is
     # n*k while a DAX measure returns k -- and because a Sum pill and an Avg pill over the same calc
@@ -2134,6 +2146,67 @@ def _visual_calc_base_measures(table_calc_usages, known_tables, existing_report)
             # and the emitted Visual Calculation references ``[Count <Table>]`` by name.
             "source": {
                 "kind": "visual_calc_base",
+                "model_table": "_Measures",
+                "field_caption": name,
+                "fact_table": table,
+                "intent": "count",
+            },
+        })
+    return rows
+
+
+def _implicit_count_base_measures(row_count_tables, known_tables, existing_report):
+    """Synthesize ``Count <Table> = COALESCE(COUNTROWS('<Table>'), 0)`` for each relation the
+    WORKBOOK implicitly row-counts via an object-id COUNT pill (Tableau's "Count of <Table>").
+
+    Sibling of :func:`_visual_calc_base_measures`, kept SEPARATE rather than merged: that one is
+    driven by a view-only quick table calc and answers "what base does this Visual Calculation
+    reference"; this one is driven by a plain shelf pill and answers "what measure does this column
+    bind to". They emit the same DAX because both mean a whole-table row count, and running this one
+    second (against the report the first has already appended to) makes a table counted BOTH ways
+    resolve to one measure rather than two.
+
+    ``row_count_tables`` is ``workbook_table_calcs.extract_implicit_count_tables``'s shape --
+    ``[{"table": ..., "caption": ...}]``; a bare string is accepted too. A relation is only taken
+    when it names a REAL model table (``known_tables``), preferring the caption so a Union's
+    friendly name wins over its internal relation id -- an unresolvable name is dropped, never
+    guessed.
+
+    Additive + fail-closed, matching its sibling: a table that already exposes a whole-table
+    row-count measure (per ``_row_count_targets``) is skipped -- its existing count is reused -- as
+    is a ``Count <Table>`` name another measure already owns. Returns ``[]`` when the workbook
+    carries no such pill, so every other workbook is byte-for-byte unchanged.
+    """
+    known = {str(t) for t in (known_tables or [])}
+    existing_names = {(r.get("measure") or "").strip().lower() for r in (existing_report or [])}
+    existing_rc = set((_row_count_targets(existing_report).get("measures") or {}).keys())
+    rows, seen = [], set()
+    for cand in row_count_tables or []:
+        if not isinstance(cand, dict):
+            cand = {"table": cand, "caption": None}
+        table = None
+        for nm in ((cand.get("caption") or "").strip(), (cand.get("table") or "").strip()):
+            if nm and nm in known:
+                table = nm
+                break
+        if not table or table in seen or table in existing_rc:
+            continue
+        name = f"Count {table}"
+        if name.strip().lower() in existing_names:
+            continue
+        seen.add(table)
+        rows.append({
+            "measure": name,
+            "status": "translated",
+            "reason": None,
+            "dax": f"COALESCE(COUNTROWS('{table}'), 0)",
+            "tableau_formula": f"COUNT([{table}])",
+            "translated_by": "deterministic (implicit row-count base measure)",
+            # Cross-layer source identity: this row flows into ``_row_count_targets``, which the
+            # estate turns into the viz layer's ``row_count_binding`` -- that is what lets the
+            # object-id COUNT pill bind instead of warning "needs a row-count (COUNTROWS) measure".
+            "source": {
+                "kind": "implicit_count_base",
                 "model_table": "_Measures",
                 "field_caption": name,
                 "fact_table": table,
@@ -4635,7 +4708,7 @@ def assemble_import_model(descriptor, *, model_name, calcs=None, dim_calcs=None,
                           parameters=None, table_calc_usages=None, calc_outer_aggs=None,
                           scatter_keys=None, storage_decision=None,
                           colour_palettes=None, semantic_colours=False, date_usage=None,
-                          date_usage_by_island=None):
+                          date_usage_by_island=None, row_count_tables=None):
     """Assemble the Import/DirectQuery semantic model definition for a parsed descriptor.
 
     Returns ``{"parts": {path: text}, "report": {...}}``. Raises ``ValueError`` if the
@@ -5147,6 +5220,7 @@ def assemble_import_model(descriptor, *, model_name, calcs=None, dim_calcs=None,
         calc_lookup=calc_lookup if calc_lookup is not None else _calc_lookup_from(calcs),
         approved_calc_dax=approved_calc_dax, synth_measures=fp.get("measures"),
         known_tables=set(table_names), table_calc_usages=table_calc_usages,
+        row_count_tables=row_count_tables,
         # Resolves the row set a ROW-LEVEL SCALAR calc's Tableau aggregation iterates, per the
         # calc's OWN datasource island -- a global anchor is the wrong table in a consolidated model.
         row_scalar_table=_row_scalar_table_resolver(tables, table_names),
@@ -5762,7 +5836,8 @@ def migrate_tds_to_semantic_model(tds_text, *, model_name, calcs=None, dim_calcs
                                   emit_linguistic=False, calc_outer_aggs=None,
                                   scatter_keys=None, storage_decision=None,
                                   colour_palettes=None, semantic_colours=False,
-                                  date_usage=None, date_usage_by_island=None):
+                                  date_usage=None, date_usage_by_island=None,
+                                  row_count_tables=None):
     """One-call convenience: parse ``.tds``/``.twb`` text and assemble the Import/DirectQuery model.
 
     ``calcs`` are the MEASURE-role calculated fields and ``dim_calcs`` the DIMENSION/row-level ones
@@ -5861,6 +5936,17 @@ def migrate_tds_to_semantic_model(tds_text, *, model_name, calcs=None, dim_calcs
             calc_outer_aggs = extract_calc_outer_aggs(tds_text)
         except Exception:
             calc_outer_aggs = {}
+    # Relations the workbook implicitly ROW-COUNTS via an object-id COUNT pill ("Count of Orders").
+    # Same auto-extract/override contract as ``table_calc_usages``: ``None`` -> auto-extract (``[]``
+    # for a bare ``.tds``, which has no worksheets -> byte-identical); a caller may pass a list
+    # explicitly, which is how the published-datasource rebuild would reach parity (the schema comes
+    # from the ``.tds``, the pills live in the ``.twb``). Guarded -- a parse hiccup never breaks the
+    # build, it only means no row-count measure is synthesised, exactly as before.
+    if row_count_tables is None:
+        try:
+            row_count_tables = extract_implicit_count_tables(tds_text)
+        except Exception:
+            row_count_tables = []
     result = assemble_import_model(descriptor, model_name=model_name,
                                    calcs=calcs, dim_calcs=dim_calcs, relationships=relationships,
                                    hierarchies=hierarchies, display_folders=display_folders,
@@ -5869,6 +5955,7 @@ def migrate_tds_to_semantic_model(tds_text, *, model_name, calcs=None, dim_calcs
                                    calc_lookup=calc_lookup, approved_calc_dax=approved_calc_dax,
                                    date_range=date_range, parameters=parameters,
                                    table_calc_usages=table_calc_usages,
+                                   row_count_tables=row_count_tables,
                                    calc_outer_aggs=calc_outer_aggs,
                                    scatter_keys=scatter_keys, storage_decision=storage_decision,
                                    colour_palettes=colour_palettes,
@@ -6874,6 +6961,15 @@ def migrate_datasource(source, *, model_name, write_to=None, as_pbip=False, data
         if "calc_outer_aggs" not in kwargs:
             try:
                 kwargs["calc_outer_aggs"] = extract_calc_outer_aggs(tds_text)
+            except Exception:
+                pass
+        # Same reasoning as ``table_calc_usages`` above: this branch bypasses
+        # ``migrate_tds_to_semantic_model``, so without this an EXTRACT-BACKED workbook -- the common
+        # shape -- would synthesise no row-count measure and its "Count of <Table>" columns would
+        # drop, even though the identical workbook on the non-extract path binds them.
+        if "row_count_tables" not in kwargs:
+            try:
+                kwargs["row_count_tables"] = extract_implicit_count_tables(tds_text)
             except Exception:
                 pass
         table_csv_paths = _resolve_local_csv_paths(
