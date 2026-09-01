@@ -180,3 +180,94 @@ def test_b_a_relation_counted_twice_yields_one_measure():
     rows = A._implicit_count_base_measures(
         [{"table": "Orders", "caption": None}, {"table": "Orders", "caption": None}], {"Orders"}, [])
     assert len(rows) == 1
+
+
+# --------------------------------------------------------------------------------------
+# C. the count respects the visual's filters (Tableau counts RELATED rows)
+# --------------------------------------------------------------------------------------
+# Power BI propagates a relationship one -> many only, from ``to_col``'s table (the dimension) to
+# ``from_col``'s (the fact), so a count of the DIMENSION never sees the fact's filters and returns
+# the whole table. ``CROSSFILTER(..., BOTH)`` supplies the missing direction for that measure alone.
+
+def _rel(ft, fc, tt, tc, active=True):
+    return {"from_table": ft, "from_col": fc, "to_table": tt, "to_col": tc, "is_active": active}
+
+
+STAR = [_rel("Orders", "Region", "People", "Region"),
+        _rel("Orders", "Order_ID", "Returns", "Order_ID")]
+
+
+def test_c_a_dimension_count_gets_the_missing_filter_direction():
+    got = A._row_count_crossfilter("People", STAR)
+    assert got == "CROSSFILTER('Orders'[Region], 'People'[Region], BOTH)"
+
+
+def test_c_a_fact_count_is_left_alone():
+    """Orders is never a ``to_table``, so its own row count already respects the filters -- which is
+    why it matched Tableau before this existed. Wrapping it would be a change with no cause."""
+    assert A._row_count_crossfilter("Orders", STAR) is None
+
+
+def test_c_no_relationship_means_no_crossfilter():
+    """``CROSSFILTER`` errors when the named columns are not part of a relationship -- and a count
+    across no relationship cannot reproduce Tableau's related-row semantics under any behaviour."""
+    assert A._row_count_crossfilter("Lonely", STAR) is None
+
+
+def test_c_two_relationships_to_the_same_table_stay_plain():
+    """The other documented error: "the arguments belong to different relationships"."""
+    rels = STAR + [_rel("Shipments", "Region", "People", "Region")]
+    assert A._row_count_crossfilter("People", rels) is None
+
+
+def test_c_an_inactive_relationship_is_not_a_filter_path():
+    rels = [_rel("Orders", "Region", "People", "Region", active=False)]
+    assert A._row_count_crossfilter("People", rels) is None
+
+
+def test_c_endpoints_are_read_off_the_matched_relationship_not_the_table_names():
+    """A role-playing date puts TWO relationships between one pair of tables (``Order_Date`` active,
+    ``Ship_Date`` inactive). Naming one relationship's column against the other's is an error even
+    though the active path is unambiguous, so the columns must come off the matched relationship."""
+    rels = [_rel("Orders", "Order_Date", "Date", "Date"),
+            _rel("Orders", "Ship_Date", "Date", "Date", active=False)]
+    got = A._row_count_crossfilter("Date", rels)
+    assert got == "CROSSFILTER('Orders'[Order_Date], 'Date'[Date], BOTH)"
+    assert "Ship_Date" not in got
+
+
+def test_c_the_synthesised_dimension_measure_carries_the_clause():
+    rows = A._implicit_count_base_measures(
+        [{"table": "People", "caption": None}], {"People"}, [], relationships=STAR)
+    assert rows[0]["dax"] == ("CALCULATE(COALESCE(COUNTROWS('People'), 0), "
+                             "CROSSFILTER('Orders'[Region], 'People'[Region], BOTH))")
+
+
+def test_c_without_relationships_the_measure_is_unchanged():
+    """Byte-for-byte identical to the pre-CROSSFILTER output when nothing can be proven."""
+    rows = A._implicit_count_base_measures([{"table": "People", "caption": None}], {"People"}, [])
+    assert rows[0]["dax"] == "COALESCE(COUNTROWS('People'), 0)"
+
+
+def test_c_the_wrapped_measure_is_still_recognised_as_a_row_count():
+    """The binding depends on it. Without this the measure is synthesised, the model is valid, and
+    the pill silently goes back to unbound with every other signal green."""
+    rows = A._implicit_count_base_measures(
+        [{"table": "People", "caption": None}], {"People"}, [], relationships=STAR)
+    assert A._row_count_targets(rows)["measures"].get("People") == "Count People"
+
+
+def test_c_a_calculate_carrying_a_value_filter_is_not_a_row_count():
+    """``CROSSFILTER`` changes propagation and never removes rows, so it preserves the proof. A
+    value filter does not, and must not be admitted by the widened recogniser."""
+    assert A._row_count_table_of(
+        "CALCULATE(COUNTROWS('People'), 'People'[Region] = \"West\")") is None
+    assert A._row_count_table_of(
+        "CALCULATE(COUNTROWS('People'), FILTER('People', 'People'[Region] = \"West\"), "
+        "CROSSFILTER('Orders'[Region], 'People'[Region], BOTH))") is None
+
+
+def test_c_the_bare_forms_are_still_recognised():
+    assert A._row_count_table_of("COUNTROWS('Orders')") == "Orders"
+    assert A._row_count_table_of("COALESCE(COUNTROWS('Orders'), 0)") == "Orders"
+    assert A._row_count_table_of("SUM(Orders[Sales])") is None

@@ -1333,7 +1333,7 @@ def _measures_part(calcs, resolve, consumed=None, param_resolver=None, *,
                    flag_measures=None, resolve_for=None, inline_calcs=None,
                    related_tables=None, conformed_hubs=None, calc_outer_aggs=None,
                    row_scalar_table=None, colour_palettes=None, semantic_colours=False,
-                   row_count_tables=None):
+                   row_count_tables=None, relationships=None):
     """Translate ``calcs`` and render the ``_Measures`` table TMDL + a per-measure report.
 
     ``calcs`` is an iterable of ``{"name": str, "formula": str}``. Calcs whose name is in
@@ -1831,7 +1831,8 @@ def _measures_part(calcs, resolve, consumed=None, param_resolver=None, *,
     # no calculated field and no formula, so it arrives through no other channel and, before this,
     # no COUNTROWS measure was ever synthesised for it. The report's pill then had nothing to bind
     # to and dropped. Runs AFTER the loop above so a table counted both ways yields one measure.
-    for br in _implicit_count_base_measures(row_count_tables, known_tables, report):
+    for br in _implicit_count_base_measures(row_count_tables, known_tables, report,
+                                            relationships=relationships):
         br["measure"] = _gen_measure(
             br["measure"], br["tableau_formula"], br["dax"],
             translated_by=br.get("translated_by") or "deterministic (implicit row-count base measure)",
@@ -2047,6 +2048,32 @@ _COUNTROWS_RE = re.compile(
     r"^COUNTROWS\('([^']+)'\)$"
     r"|^COALESCE\(\s*COUNTROWS\('([^']+)'\)\s*,\s*0\s*\)$")
 
+# A ``CALCULATE`` whose ONLY modifier is a ``CROSSFILTER`` is still *provably* a whole-table row
+# count: ``CROSSFILTER`` changes filter PROPAGATION DIRECTION, it never filters rows out. Anything
+# else in that argument position -- a value filter, a second modifier -- could change WHICH rows are
+# counted, so it must not qualify; this admits exactly one ``CROSSFILTER`` and nothing more.
+# Required because the implicit row-count measure for a DIMENSION carries that wrapper, and without
+# it ``_row_count_targets`` would not recognise its own synthesised measure, leaving the pill
+# unbound again with every other signal (measure present, model valid) still green.
+_ROW_COUNT_CROSSFILTER_RE = re.compile(
+    r"^CALCULATE\(\s*(?P<body>.+?)\s*,\s*"
+    r"CROSSFILTER\(\s*'[^']+'\[[^\]]+\]\s*,\s*'[^']+'\[[^\]]+\]\s*,\s*BOTH\s*\)\s*\)$")
+
+
+def _row_count_table_of(dax):
+    """The table ``dax`` provably counts every row of, or ``None``.
+
+    Accepts the bare forms and the ``CROSSFILTER``-wrapped one, and nothing else."""
+    m = _COUNTROWS_RE.match(dax)
+    if m:
+        return m.group(1) or m.group(2)
+    w = _ROW_COUNT_CROSSFILTER_RE.match(dax)
+    if w:
+        inner = _COUNTROWS_RE.match(w.group("body").strip())
+        if inner:
+            return inner.group(1) or inner.group(2)
+    return None
+
 
 def _row_count_targets(measure_report):
     """Map each data table to a measure whose DAX is *provably* its whole-table row count --
@@ -2059,9 +2086,8 @@ def _row_count_targets(measure_report):
         if row.get("status") not in ("translated", "assisted-approved"):
             continue
         dax = " ".join((row.get("dax") or "").split())
-        m = _COUNTROWS_RE.match(dax)
-        if m:
-            table = m.group(1) or m.group(2)
+        table = _row_count_table_of(dax)
+        if table:
             measures.setdefault(table, row.get("measure"))
     default = None
     if len(measures) == 1:
@@ -2155,7 +2181,46 @@ def _visual_calc_base_measures(table_calc_usages, known_tables, existing_report)
     return rows
 
 
-def _implicit_count_base_measures(row_count_tables, known_tables, existing_report):
+def _row_count_crossfilter(table, relationships):
+    """The ``CROSSFILTER`` clause that makes ``table``'s row count respect the visual's filters, or
+    ``None``.
+
+    Tableau's object model counts RELATED rows: sit on one order and "Count of People" counts the
+    People rows joined to that order. Power BI propagates a relationship ONE -> MANY only -- from
+    ``to_col``'s table (the dimension) to ``from_col``'s table (the fact) -- so a count of the
+    DIMENSION never sees the fact's filters and returns the whole table. The formula is a faithful
+    translation either way; only the propagation direction differs, and ``CROSSFILTER(..., BOTH)``
+    supplies the missing direction for this measure alone.
+
+    Applies ONLY when ``table`` is the ``to_table`` of **exactly one ACTIVE** relationship:
+
+    * a fact (never a ``to_table``) gets nothing -- its own row count already respects the filters,
+      which is why it matched Tableau before this existed;
+    * zero relationships -> nothing to flip, and ``CROSSFILTER`` errors when the named columns are
+      not part of a relationship. A count across no relationship cannot reproduce Tableau's
+      related-row semantics under any behaviour, so the guard is right on the semantics alone;
+    * more than one -> the columns could straddle two relationships, which is the other documented
+      ``CROSSFILTER`` error ("the arguments belong to different relationships"), so it stays plain
+      and the count remains the honest unfiltered total.
+
+    The endpoints are read OFF the matched relationship, never assembled from table names: a
+    role-playing date dimension (``Order_Date`` active, ``Ship_Date`` inactive) puts two
+    relationships between the same pair of tables, and naming one relationship's column against the
+    other's is an error even though the active path is unambiguous.
+    """
+    hits = [r for r in (relationships or [])
+            if (r.get("to_table") == table
+                and r.get("is_active", True)
+                and r.get("from_table") and r.get("from_col") and r.get("to_col"))]
+    if len(hits) != 1:
+        return None
+    r = hits[0]
+    return (f"CROSSFILTER('{r['from_table']}'[{r['from_col']}], "
+            f"'{r['to_table']}'[{r['to_col']}], BOTH)")
+
+
+def _implicit_count_base_measures(row_count_tables, known_tables, existing_report,
+                                  relationships=None):
     """Synthesize ``Count <Table> = COALESCE(COUNTROWS('<Table>'), 0)`` for each relation the
     WORKBOOK implicitly row-counts via an object-id COUNT pill (Tableau's "Count of <Table>").
 
@@ -2195,11 +2260,13 @@ def _implicit_count_base_measures(row_count_tables, known_tables, existing_repor
         if name.strip().lower() in existing_names:
             continue
         seen.add(table)
+        xf = _row_count_crossfilter(table, relationships)
+        body = f"COALESCE(COUNTROWS('{table}'), 0)"
         rows.append({
             "measure": name,
             "status": "translated",
             "reason": None,
-            "dax": f"COALESCE(COUNTROWS('{table}'), 0)",
+            "dax": f"CALCULATE({body}, {xf})" if xf else body,
             "tableau_formula": f"COUNT([{table}])",
             "translated_by": "deterministic (implicit row-count base measure)",
             # Cross-layer source identity: this row flows into ``_row_count_targets``, which the
@@ -5220,7 +5287,7 @@ def assemble_import_model(descriptor, *, model_name, calcs=None, dim_calcs=None,
         calc_lookup=calc_lookup if calc_lookup is not None else _calc_lookup_from(calcs),
         approved_calc_dax=approved_calc_dax, synth_measures=fp.get("measures"),
         known_tables=set(table_names), table_calc_usages=table_calc_usages,
-        row_count_tables=row_count_tables,
+        row_count_tables=row_count_tables, relationships=relationships,
         # Resolves the row set a ROW-LEVEL SCALAR calc's Tableau aggregation iterates, per the
         # calc's OWN datasource island -- a global anchor is the wrong table in a consolidated model.
         row_scalar_table=_row_scalar_table_resolver(tables, table_names),

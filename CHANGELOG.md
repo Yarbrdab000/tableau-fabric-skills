@@ -14,6 +14,48 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ### Fixed
 
+- **`tableau-migration` (skill `2.346.0` → `2.347.0`): an implicit row count of a DIMENSION
+  respects the visual's filters, instead of returning the whole table.** `2.346.0` made
+  "Count of People" bind and render; this makes it *right*. The translation was never the problem —
+  `COUNT([__tableau_internal_object_id__].[People_<hash>])` → `COUNTROWS('People')` is exact. What
+  differs is **filter propagation**: Tableau's object model counts RELATED rows, so sitting on one
+  order counts the People rows joined to that order, while Power BI propagates a relationship
+  one→many only — from `to_col`'s table (the dimension) to `from_col`'s (the fact) — so a count of
+  the dimension never sees the fact's filters. Measured before the fix: `Count Returns` read
+  `296 / 296 / 296` across three segments (the entire table, three times); after, `154 / 93 / 49`,
+  totalling 296. The synthesised measure now carries `CROSSFILTER(<fact col>, <dim col>, BOTH)`,
+  which supplies the missing direction **for that measure alone** and changes no relationship in the
+  model. Applied only when the counted table is the `to_table` of **exactly one ACTIVE**
+  relationship, which makes the scope a consequence rather than a special case: a fact is never a
+  `to_table`, so it gets nothing — and that is precisely why `Count Orders` already matched Tableau.
+  Zero relationships stays plain (`CROSSFILTER` errors when the named columns are not part of one,
+  and a count across no relationship cannot reproduce related-row semantics under any behaviour, so
+  the guard is right on the semantics alone); more than one stays plain (the second documented
+  `CROSSFILTER` error is *"the arguments belong to different relationships"*). Endpoints are read
+  **off the matched relationship**, never assembled from table names — a role-playing date dimension
+  puts two relationships between one pair of tables (`Order_Date` active, `Ship_Date` inactive), and
+  naming one relationship's column against the other's is an error even where the active path is
+  unambiguous; measured across the corpus, **all 16 multi-relationship table pairs are role-playing
+  dates**, and every emitted model has exactly one active filter path between any two tables
+  (positive control: the detector returns 2 on a synthetic cycle, 1 on a star, and 1 when the cycle
+  edge is inactive). **A third defect was found and fixed on the way, which would have silently
+  un-fixed `2.346.0`:** `_COUNTROWS_RE` is anchored `^…$` and matches only the two bare forms, so the
+  new `CALCULATE(…, CROSSFILTER(…))` shape would not have been recognised — the measure would be
+  synthesised, the model would be valid, `_row_count_targets` would return an honest empty, and the
+  pills would go straight back to unbound with every signal green. The recogniser is widened
+  narrowly: a `CALCULATE` whose **only** modifier is a `CROSSFILTER` still provably counts every row,
+  because `CROSSFILTER` changes propagation and never removes rows; a value filter does not qualify,
+  and `CALCULATE(COUNTROWS(…), FILTER(…), CROSSFILTER(…))` is asserted to be rejected. Verified over
+  the **whole population**, not a sample — all **5,111** Order IDs at Tableau's own grain, **0
+  differing cells of 15,333 comparisons**, with the expectation computed from the JOIN KEYS
+  (`'People'[Region] IN VALUES(Orders[Region])`) rather than from the relationships so the verifier
+  cannot agree with the measure by construction, and a positive control (expectation + 1) going red
+  on 5,111 of 5,111 to prove the comparison can see a difference. Render-verified on a page carrying
+  both new measures: renders, no query-time ambiguity error. This resolves the divergence disclosed
+  in the `2.346.0` entry above, which is left as written — it is an accurate account of that release.
+  Corpus: 34/34, 1607 files, 0 added, 0 removed, and the only 4 that differ are run manifests
+  checked line-by-line to carry **0 non-timestamp differences**.
+
 - **`tableau-migration` (skill `2.345.0` → `2.346.0`): an implicit `COUNT(*)` column on a shelf
   becomes a real measure instead of dropping.** Tableau's object model gives every relation a hidden
   per-row identity, so dragging "Count of Orders" onto a shelf emits
