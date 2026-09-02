@@ -14,6 +14,45 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ### Fixed
 
+- **`tableau-migration` (skill `2.351.0` → `2.352.0`): `pbir_lint`'s visual-type validity set is now
+  DERIVED from the harvested catalog, so it can never again call a real Power BI visual "unknown"
+  (#179).**
+
+  R4 reports *"unknown visualType … not a valid PBIR built-in visual type (Power BI renders it as a
+  missing custom visual)"*. Its set was a **hand-written literal**, while the two role tables beside
+  it — `_REQUIRED_ROLES` (R9) and `MEASURE_ROLES` (R10) — are **harvested from
+  `powerbi-report-author catalog describe`**. The literal drifted narrower than the catalog:
+
+  ```
+  known to the harvested tables, absent from the literal, R4 called each INVALID:
+      cardVisual   filterSlicer   hundredPercentStackedAreaChart   matrix   table
+  ```
+
+  **`matrix` and `table` are core Power BI visuals.** Our own emitter produces none of the five,
+  which is exactly why it went unnoticed here and exactly why it still mattered: `pbir_lint` ships
+  as a tool consumers run over **their own** reports, and the estate that reported this hand-authors
+  140 `cardVisual` visuals in shipped deliverables.
+
+  **The fix is the union, not five more literals.** `VALID_VISUAL_TYPES` is now
+  `_CURATED_VISUAL_TYPES | set(_REQUIRED_ROLES) | set(MEASURE_ROLES)` — a hand-maintained set can
+  drift again; a union with the harvested tables **cannot be narrower than them by construction**.
+  The curated literal still earns its place: role-*less* types (`textbox`, `image`, `actionButton`,
+  `basicShape`, and the AI visuals) have no required roles and appear in neither harvested table.
+
+  The specific hazard of fixing it this way — that the union might readmit the invalid look-alikes
+  the emitter must never produce (`stackedColumnChart` / `stackedBarChart`, which Power BI spells as
+  the unqualified `columnChart` / `barChart`) — is pinned at **every** input set, not just the
+  result. R4 still fires on genuinely unknown types; corpus R4 findings unchanged at **0 across 68
+  reports**, since we emit none of the five.
+
+  **One control could not go red, and that is recorded rather than papered over.** Deleting the
+  `set(MEASURE_ROLES)` arm leaves every test green — because `MEASURE_ROLES` is currently a *subset*
+  of `_REQUIRED_ROLES`, so that arm contributes zero members and the assertion over it is satisfied
+  vacuously through the others. An assertion that cannot fail is not a check, so a test now states
+  the redundancy as a **data fact** and fails the day a harvest adds a measure-only type that is not
+  also in `_REQUIRED_ROLES` — at which point the arm becomes load-bearing and the deletion control
+  can finally fire. Verified by injection: it goes red.
+
 - **`tableau-migration` (skill `2.350.0` → `2.351.0`): an Automatic mark over a DISCRETE date now
   rebuilds as a LINE, not a stacked column that SUMS the series (#184).**
 

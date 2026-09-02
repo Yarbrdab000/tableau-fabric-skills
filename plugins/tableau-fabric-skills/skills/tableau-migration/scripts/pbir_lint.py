@@ -40,13 +40,18 @@ from __future__ import annotations
 
 import json
 
-# The closed built-in PBIR ``visualType`` catalog. Every value here was ground-truthed KNOWN against
-# the Microsoft ``powerbi-report-author validate`` CLI (v0.1.4); this is a strict SUPERSET of what
-# ``twb_to_pbir`` emits, so a valid built-in never trips the linter. The invalid look-alikes the
-# emitter must NEVER produce are deliberately ABSENT: "stackedColumnChart", "stackedBarChart" (Power
-# BI spells those as the unqualified "columnChart" / "barChart"). Keep this in sync with the emitter's
-# vocabulary; the emitter-clean pytest guard enforces that they never diverge.
-VALID_VISUAL_TYPES = frozenset({
+# The hand-curated part of the built-in ``visualType`` catalog: types that carry NO required data
+# roles (text, shapes, buttons, images, AI visuals) and therefore never appear in the harvested
+# role tables below. Every value here was ground-truthed KNOWN against the Microsoft
+# ``powerbi-report-author validate`` CLI (v0.1.4). The invalid look-alikes the emitter must NEVER
+# produce are deliberately ABSENT: "stackedColumnChart", "stackedBarChart" (Power BI spells those as
+# the unqualified "columnChart" / "barChart").
+#
+# THIS IS NOT THE VALIDITY SET. ``VALID_VISUAL_TYPES`` is derived from this UNION the harvested
+# tables -- see its definition below and #179 for why: a hand-maintained validity set drifted
+# narrower than the catalog and reported five real Power BI visuals as "unknown visualType", among
+# them ``matrix`` and ``table``.
+_CURATED_VISUAL_TYPES = frozenset({
     # column / bar family (unqualified column/bar ARE the stacked variants)
     "columnChart", "barChart", "clusteredColumnChart", "clusteredBarChart",
     "hundredPercentStackedColumnChart", "hundredPercentStackedBarChart",
@@ -754,6 +759,27 @@ MEASURE_ROLES = {
     "treemap": ("Tooltips", "Values"),
     "waterfallChart": ("Tooltips", "Y"),
 }
+
+
+# The built-in PBIR ``visualType`` validity set, DERIVED so it can never again be narrower than the
+# catalog the role tables were harvested from (#179).
+#
+# It was a hand-maintained literal, and it drifted: ``_REQUIRED_ROLES`` and ``MEASURE_ROLES`` are
+# harvested from ``powerbi-report-author catalog describe``, and both knew FIVE types the literal
+# did not -- ``cardVisual``, ``filterSlicer``, ``hundredPercentStackedAreaChart``, ``matrix`` and
+# ``table``. Every one of them made R4 report a *false* "unknown visualType ... Power BI renders it
+# as a missing custom visual", and two of them (``matrix``, ``table``) are core Power BI visuals.
+# Our own emitter produced none of them, which is exactly why it went unnoticed here: the linter
+# ships as a tool consumers run over THEIR reports, and the estate that reported this hand-authors
+# 140 ``cardVisual`` visuals.
+#
+# The union is the point. A literal can drift; a union with the harvested tables cannot be narrower
+# than them by construction, so adding a type to the catalog can never again make a valid report
+# look invalid. ``_CURATED_VISUAL_TYPES`` still carries its own weight: role-LESS types (textbox,
+# image, actionButton, basicShape, and the AI visuals) have no required roles and so appear in
+# neither harvested table.
+VALID_VISUAL_TYPES = frozenset(
+    _CURATED_VISUAL_TYPES | set(_REQUIRED_ROLES) | set(MEASURE_ROLES))
 
 
 def _lint_measure_role_kind(parts):
