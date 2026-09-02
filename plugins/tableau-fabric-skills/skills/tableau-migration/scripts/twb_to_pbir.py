@@ -2472,11 +2472,55 @@ def _has_continuous_date(fields):
 
     A continuous date is a date *truncation* -- Tableau serialises it with a ``*-Trunc`` derivation
     (e.g. ``Day-Trunc`` / ``Month-Trunc``, pill prefixes ``tdy:`` / ``tmn:``). Truncation is a
-    date-only operation, so the ``-Trunc`` suffix unambiguously marks a continuous date axis; a
-    discrete date PART (Year / Month, derivation in ``_DATE_PARTS``) is NOT continuous. Under an
-    Automatic mark Tableau renders a continuous date + a measure as a LINE (a discrete date -> bars).
+    date-only operation, so the ``-Trunc`` suffix unambiguously marks a continuous date axis.
+
+    Kept as its own reader because CONTINUITY is a real distinction elsewhere. It is deliberately
+    NOT what the Automatic-mark branch asks -- see :func:`_has_date_dimension`.
     """
     return any(str(f.get("derivation") or "").endswith("-Trunc") for f in fields)
+
+
+def _has_date_dimension(fields):
+    """True when an axis carries a Tableau DATE dimension -- discrete or continuous (#184).
+
+    Tableau's Automatic mark picks Line on **date-ness**, not on continuity. From *Change the Type
+    of Marks in the View* (help.tableau.com, viewparts_marks_marktypes.htm), stated twice and
+    qualified on neither discrete nor continuous:
+
+        "The Line mark type is selected when there is **a date field** and a measure as the inner
+        fields on the Rows and Columns shelves."
+
+        "[Bar] ... **If the dimension is a date dimension, the Line mark is used instead.**"
+
+    The previous predicate asked ``_has_continuous_date``, so a DISCRETE date (a part such as
+    ``Year``, or an exact-date value such as ``MDY``) fell through to bars. With a colour dimension
+    also present the emitted ``columnChart`` is Power BI's **stacked** column, so the rebuild does
+    not merely pick the wrong glyph -- it SUMS the series. Reported upstream on five airlines at
+    95/92/88/97/90 % availability stacked into one ~462 % bar.
+
+    Three families count, and the third is why this reads the datatype rather than only the
+    derivation:
+
+    * ``*-Trunc`` -- the continuous case, unchanged.
+    * ``_DATE_PARTS`` / ``_DATE_EXACT_DERIVATIONS`` -- discrete parts and exact-date values. The
+      engine's own comment on ``MDY`` already calls it "an ORDINARY date column -- the same
+      underlying date as a continuous exact-date pill, only rendered as discrete members".
+    * a pill with **no derivation at all** on a date/datetime column -- a raw date dimension.
+      Measured on the 34-workbook corpus, 14 date-typed dimension pills carry ``derivation=None``,
+      so a derivation-only predicate would still miss the plainest date dimension there is.
+
+    An explicit ``bar`` mark is unaffected: Tableau stacks bars by default, so that rebuild is
+    faithful and only the *automatic* case was ever wrong.
+    """
+    for f in fields:
+        deriv = str(f.get("derivation") or "").strip()
+        if deriv.endswith("-Trunc") or deriv.startswith("Trunc"):
+            return True
+        if deriv in _DATE_PARTS or deriv in _DATE_EXACT_DERIVATIONS:
+            return True
+        if not deriv and str(f.get("datatype") or "").strip().lower() in _DATE_TYPES:
+            return True
+    return False
 
 
 def _visual_type(mark, dims_rows, dims_cols, meas_rows, meas_cols,
@@ -2602,14 +2646,16 @@ def _visual_type(mark, dims_rows, dims_cols, meas_rows, meas_cols,
         return VT_UNSUPPORTED
 
     if m in ("bar", "automatic", ""):
-        # An Automatic mark over a CONTINUOUS (green) date axis is Tableau's default LINE chart: a
-        # continuous date + a measure renders as a line (a discrete date PART -> bars). An explicit
-        # ``bar`` mark always stays bars. The field bindings are identical to a line over the same
-        # shelves -- only the chart TYPE differs -- so this is squarely Tier-1 "right chart type".
+        # An Automatic mark over a DATE dimension is Tableau's default LINE chart -- discrete or
+        # continuous, because Tableau's documented rule gates on date-ness and not on continuity
+        # (#184; see _has_date_dimension for the citation). An explicit ``bar`` mark always stays
+        # bars: Tableau stacks bars by default, so that rebuild is faithful and only the automatic
+        # case was ever wrong. The field bindings are identical to a line over the same shelves --
+        # only the chart TYPE differs -- so this is squarely Tier-1 "right chart type".
         # Dual-axis / combo splitting still runs downstream on the VT_LINE result, so a
         # column+line combo over a date is unaffected.
         if m in ("automatic", "") and axis_meas and (
-                _has_continuous_date(dims_cols) or _has_continuous_date(dims_rows)):
+                _has_date_dimension(dims_cols) or _has_date_dimension(dims_rows)):
             return VT_LINE
         # vertical bars: category on cols (x), measure on rows (y)
         if dims_cols and meas_rows and not meas_cols:

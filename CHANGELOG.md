@@ -14,6 +14,51 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ### Fixed
 
+- **`tableau-migration` (skill `2.350.0` → `2.351.0`): an Automatic mark over a DISCRETE date now
+  rebuilds as a LINE, not a stacked column that SUMS the series (#184).**
+
+  The predicate gated on **continuity**; Tableau's documented rule gates on **date-ness**. From
+  *Change the Type of Marks in the View*, stated twice and qualified on neither discrete nor
+  continuous:
+
+  > "The Line mark type is selected when there is **a date field** and a measure as the inner fields
+  > on the Rows and Columns shelves."
+  >
+  > "[Bar] … **If the dimension is a date dimension, the Line mark is used instead.**"
+
+  So `_has_continuous_date` (a `*-Trunc` derivation) answered the wrong question and a discrete date
+  PART fell through to bars. **That is worse than a wrong glyph:** with a colour dimension also
+  present the emitted `columnChart` is Power BI's *stacked* column, so the rebuild sums the series —
+  reported upstream as five airlines at 95/92/88/97/90 % availability stacked into one ~462 % bar.
+  And it was **silent**: a stacked column is structurally valid PBIR, so `tier='rebuilt'`,
+  `reason=''`, `remediation_worklist.items: 0` and nothing downstream could catch it.
+
+  New `_has_date_dimension` accepts three families, and the third is why it reads the datatype and
+  not only the derivation: `*-Trunc` (continuous, unchanged); `_DATE_PARTS` / `_DATE_EXACT_DERIVATIONS`
+  (discrete parts and exact-date values — the engine's own comment already calls `MDY` "an ORDINARY
+  date column … only rendered as discrete members"); and **a pill with no derivation at all on a
+  date/datetime column**, of which the corpus carries 14, so a derivation-only predicate would still
+  have missed the plainest date dimension there is. An aggregate over a date (`Min`/`Max`) is
+  correctly *not* a date axis.
+
+  **An explicit `bar` mark is untouched** — Tableau stacks bars by default, so that rebuild is
+  faithful and only the automatic case was ever wrong. Pinned by its own test.
+
+  Corpus: **6 worksheets carry the shape; 3 flip and 3 correctly do not.** The three that do not are
+  all `0073`, which route to `table` / `matrix` / `unsupported` before this branch is reached. The
+  three that flip are `0066_bump_chart` (`columnChart` → `lineChart` — this is the colour-dimension
+  case, i.e. the one that was summing, and a bump chart is drawn with lines in Tableau anyway) and
+  two `0077` worksheets (`clusteredColumnChart` → `lineChart`). Real Microsoft validator unchanged
+  at 31 passed / 3 failed, and `ribbonChart` emission unchanged at 0.
+
+  **Two existing tests asserted the old behaviour and were corrected rather than deleted.**
+  `test_automatic_mark_with_discrete_date_part_stays_column` pinned the defect itself — its premise
+  ("a discrete date PART is Tableau's default BARS") is what the product documentation contradicts —
+  and is now `..._is_a_line`, with the citation in the test and a new sibling pinning the explicit-`bar`
+  carve-out. `test_chart_without_rank_calc_is_not_a_ribbon` only used a date fixture incidentally;
+  its `== "column"` was replaced with `!= "ribbon"` **and** the new expected type, which keeps its
+  original guarantee and adds one rather than relaxing it.
+
 - **`tableau-migration` (skill `2.349.0` → `2.350.0`): a text table with a MULTI-LEVEL row shelf
   rebuilds FLAT, instead of as a collapsed matrix nobody can read.** Tableau's text table gives every
   row-shelf field its own column and shows every row; a Power BI matrix renders a multi-level row

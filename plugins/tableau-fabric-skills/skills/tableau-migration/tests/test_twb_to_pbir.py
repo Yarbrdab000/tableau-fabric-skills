@@ -323,10 +323,32 @@ def test_automatic_mark_with_continuous_date_axis_is_a_line_not_column():
             ["Column"]["Property"]) == "Sales_Amount"
 
 
-def test_automatic_mark_with_discrete_date_part_stays_column():
-    # a DISCRETE date PART (derivation 'Month', the `mn:` pill in _INST) is Tableau's default BARS,
-    # not a line -- only a continuous (-Trunc) date routes to a line.
+def test_automatic_mark_with_discrete_date_part_is_a_line():
+    # CORRECTED at 2.351.0 (#184). This test previously asserted `column`, on the premise that "a
+    # discrete date PART is Tableau's default BARS, not a line". That premise is contradicted by
+    # Tableau's own product documentation, which gates the Automatic mark on DATE-NESS and not on
+    # continuity -- *Change the Type of Marks in the View*, stated twice:
+    #     "The Line mark type is selected when there is A DATE FIELD and a measure as the inner
+    #      fields on the Rows and Columns shelves."
+    #     "[Bar] ... IF THE DIMENSION IS A DATE DIMENSION, THE LINE MARK IS USED INSTEAD."
+    # The old behaviour emitted a columnChart; with a colour dimension also present that is Power
+    # BI's STACKED column, so the rebuild SUMMED the series rather than merely picking the wrong
+    # glyph. An EXPLICIT `bar` mark still stays a column -- see the test below.
     ws = _worksheet("Sales by Month", "Automatic",
+                    rows="[federated.abc].[sum:Sales:qk]",
+                    cols="[federated.abc].[mn:Order Date:ok]",
+                    deps_extra=_INST)
+    assert parse_twb(_workbook(ws))["worksheets"][0]["visual_type"] == "line"
+
+
+def test_explicit_bar_mark_with_discrete_date_part_stays_column():
+    """The carve-out that keeps the correction narrow (#184).
+
+    Tableau stacks bars by default, so an EXPLICIT ``bar`` mark over a date really is a column
+    chart and that rebuild is faithful. Only the *automatic* mark was ever wrong. Without this the
+    correction above would silently turn every authored bar-over-date into a line.
+    """
+    ws = _worksheet("Sales by Month", "Bar",
                     rows="[federated.abc].[sum:Sales:qk]",
                     cols="[federated.abc].[mn:Order Date:ok]",
                     deps_extra=_INST)
@@ -3110,7 +3132,13 @@ def test_chart_without_rank_calc_is_not_a_ribbon():
                     cols="[federated.abc].[mn:Order Date:ok]",
                     deps_extra=_INST, encodings=_RIBBON_ENC)
     w = parse_twb(_workbook(ws))["worksheets"][0]
-    assert w["visual_type"] == "column"
+    # The PURPOSE of this test is the ribbon gate, so assert that directly rather than via a
+    # specific chart type. The old `== "column"` was incidental to that purpose and became wrong at
+    # 2.351.0 (#184), when an Automatic mark over a discrete date started routing to a line -- this
+    # fixture uses `mn:Order Date:ok`, a discrete Month part. Asserting `!= ribbon` AND the new
+    # expected type keeps the original guarantee and adds one, rather than relaxing it.
+    assert w["visual_type"] != "ribbon"
+    assert w["visual_type"] == "line"
 
 
 # -- date-table rebinding (consume the model build's date facts) ---------------
