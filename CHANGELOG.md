@@ -12,7 +12,55 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ## [Unreleased]
 
-### Fixed
+### Added
+
+- **`tableau-migration` (skill `2.352.0` → `2.353.0`): `report.json` now discloses that the report
+  it *describes* is not the report a user *opens*, and names every visual where the two differ
+  (#173).**
+
+  The engine writes each report **twice**, and they are not the same artifact:
+
+  ```
+  reports/<WB>.Report        the first, model-UNBOUND pass -- what viz_fidelity, the
+                             remediation worklist and the visual-calc rollups describe
+  pbip/<WB>/<WB>.Report      a model-BOUND re-run inside the openable project -- what a user opens
+  ```
+
+  The second pass knows things the first cannot — a calc that became a real measure, a row count
+  that resolved — so a visual can legitimately be routed differently. **That is by design and this
+  is not reported as a defect.** What was missing is that nobody could *see* it: measured at
+  `2.352.0`, `report.json` contained **zero** occurrences of "pre-rebind", "unbound",
+  "tree_divergence" or any equivalent, so a reader comparing a fidelity tier against the report they
+  opened was comparing two different objects with nothing saying so. That is the population-mismatch
+  failure this project treats as the expensive class — *the status describes one artifact and the
+  user opens another*.
+
+  New additive `shipped_tree_divergence` per workbook: the two tree paths, how many visuals were
+  compared, the counts present in only one tree, and for each divergence **both shapes** — described
+  and shipped `visualType` plus `queryState` roles. Measured on the corpus:
+
+  ```
+  0075_customers_above_average   tableEx[Values]                 -> clusteredBarChart[Category, Y]
+  0079_active_or_open_items      tableEx[Values]                 -> clusteredColumnChart[Category, Y]
+  0088_salesforce_nonprofit      clusteredBarChart[Category, Y]  -> barChart[Category, Series, Y]
+  ```
+
+  **Both shapes rather than a verdict, deliberately.** Upstream #173 reached this same mechanism
+  from the opposite direction — a scatter whose shipped copy *lost* a grouping role while the
+  described copy kept it, i.e. `rebuilt` in a tree nobody opens. Ours *gain* roles. A single
+  "shipped is strictly worse" model fits neither, so the block reports what changed and lets the
+  reader judge.
+
+  Three details are load-bearing and each has its own test and control: the comparison covers
+  `visualType` **and** roles (a type-only check misses a dropped grouping role — precisely the
+  upstream shape); role **order** is not a divergence, since PBIR ordering is not meaningful and
+  reporting it would drown the signal; and the block is **present-and-empty** on a clean workbook,
+  so "no divergence" stays distinguishable from "not evaluated". Files present in only one tree are
+  counted explicitly, because a visual with no counterpart cannot disagree with anything and a bare
+  `differing: 0` would read as agreement.
+
+  Purely additive and best-effort — emitted only when both trees are readable, never fails a build.
+  Verified: one workbook key added, **none removed or renamed**.
 
 - **`tableau-migration` (skill `2.351.0` → `2.352.0`): `pbir_lint`'s visual-type validity set is now
   DERIVED from the harvested catalog, so it can never again call a real Power BI visual "unknown"

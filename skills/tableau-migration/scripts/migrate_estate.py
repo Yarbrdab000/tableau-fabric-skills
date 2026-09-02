@@ -4674,7 +4674,100 @@ def _migrate_one_workbook(source, wb_id, viz, reports_dir, used_folders, pbip_di
                           storage_decisions=storage_decisions,
                           semantic_colours=semantic_colours,
                               ds_catalog=ds_catalog, approved_calc_dax=approved_calc_dax, wb_id=wb_id)
+        _attach_shipped_tree_divergence(detail, write_root=os.path.dirname(reports_dir))
     return detail
+
+
+def _visual_shape(path):
+    """``(visualType, sorted queryState roles)`` for one emitted ``visual.json``; ``None`` if
+    unreadable. Roles are compared as a set because ordering is not meaningful in PBIR."""
+    try:
+        with open(path, encoding="utf-8-sig") as fh:
+            doc = json.load(fh)
+    except Exception:
+        return None
+    vis = doc.get("visual")
+    if not isinstance(vis, dict):
+        return None
+    query = vis.get("query")
+    state = (query.get("queryState") if isinstance(query, dict) else None) or {}
+    roles = tuple(sorted(state)) if isinstance(state, dict) else ()
+    return (vis.get("visualType"), roles)
+
+
+def _attach_shipped_tree_divergence(detail, write_root):
+    """Name the visuals whose SHIPPED copy differs from the one ``viz_fidelity`` describes (#173).
+
+    The engine writes each report TWICE and the two are not the same artifact:
+
+    * ``reports/<WB>.Report`` -- the first, **model-UNBOUND** pass. ``viz_fidelity``,
+      ``remediation_worklist`` and the visual-calc rollups are all computed from *this* result;
+      the note at the ``_visual_calc_rollup`` call site already says so ("the pre-rebind detail
+      path ... NOT what ships").
+    * ``pbip/<WB>/<WB>.Report`` -- a **model-BOUND** re-run inside the openable project, which is
+      what a user actually opens.
+
+    The second pass knows things the first cannot -- a calc that became a real measure, a row count
+    that resolved -- so a visual can legitimately be routed differently. That is by design and this
+    check does not treat it as a defect. **What was missing is that nobody could SEE it**: measured
+    at 2.352.0, ``report.json`` contained zero occurrences of "pre-rebind", "unbound",
+    "tree_divergence" or any equivalent, so a reader comparing a fidelity tier against the report
+    they opened was comparing two different objects with nothing to say so.
+
+    That is the population-mismatch failure this project treats as the expensive class: the status
+    describes one artifact and the user opens another. Upstream #173 reached it from the opposite
+    direction -- a scatter whose shipped copy *lost* a grouping role while the described copy kept
+    it, i.e. ``rebuilt`` in a tree nobody opens. Ours *gain* roles. Both are the same mechanism, and
+    a single "shipped is strictly worse" model fits neither.
+
+    Additive and best-effort: emitted only when both trees are readable, and never fails a build.
+    """
+    out = detail.get("output_folder")
+    pbip = detail.get("pbip_folder")
+    if not out or not pbip:
+        return
+    reports_root = os.path.join(write_root, *out.split("/"))
+    # ``pbip_folder`` names the ``.pbip`` FILE; the report folder sits beside it.
+    pbip_report = os.path.join(os.path.dirname(os.path.join(write_root, *pbip.split("/"))),
+                               os.path.basename(reports_root))
+    if not (os.path.isdir(reports_root) and os.path.isdir(pbip_report)):
+        return
+
+    def index(root):
+        found = {}
+        for dirpath, _dirnames, filenames in os.walk(root):
+            if "visual.json" in filenames:
+                full = os.path.join(dirpath, "visual.json")
+                found[os.path.relpath(full, root).replace("\\", "/")] = full
+        return found
+
+    described, shipped = index(reports_root), index(pbip_report)
+    differing = []
+    for rel in sorted(set(described) & set(shipped)):
+        a, b = _visual_shape(described[rel]), _visual_shape(shipped[rel])
+        if a is None or b is None or a == b:
+            continue
+        differing.append({
+            "part": rel,
+            "described_visual_type": a[0], "shipped_visual_type": b[0],
+            "described_roles": list(a[1]), "shipped_roles": list(b[1]),
+        })
+    block = {
+        "described_tree": out,
+        "shipped_tree": pbip,
+        "compared": len(set(described) & set(shipped)),
+        # Present-and-zero rather than absent, so "no divergence" is distinguishable from
+        # "not evaluated" -- the same contract as reference_case_mismatches.
+        "differing": differing,
+        "shipped_only": len(set(shipped) - set(described)),
+        "described_only": len(set(described) - set(shipped)),
+        "note": ("viz_fidelity and the remediation worklist describe the model-UNBOUND "
+                 "reports/ pass; the openable pbip/ project is a model-BOUND re-run and is what a "
+                 "user opens. A difference here is usually the second pass routing better, not a "
+                 "defect -- but the two are different artifacts and a fidelity tier read against "
+                 "the wrong one is a wrong answer."),
+    }
+    detail["shipped_tree_divergence"] = block
 
 
 def _looks_like_path(source):
