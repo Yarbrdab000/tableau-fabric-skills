@@ -6037,6 +6037,12 @@ def migrate_tds_to_semantic_model(tds_text, *, model_name, calcs=None, dim_calcs
             _path = f"definition/tables/{_disp}.tmdl"
             if _path in harvest_parts:
                 harvest_parts[_path] = T.enrich_table_tmdl(harvest_parts[_path], calc_columns=_block)
+        # Re-stabilize: ``enrich_table_tmdl`` mints FRESH uuid4 lineageTags, and it runs AFTER the
+        # ``stabilize_lineage_tags`` pass inside the build above -- so a Group/Bin harvest gave its
+        # host table a different identity GUID on every build of identical input (#187: 24 of 268
+        # corpus model files). Re-derives from the object identity path, so it is deterministic and
+        # idempotent; measured per-model over the corpus, pass 2 differs from pass 1 on 0 of 268.
+        T.stabilize_lineage_tags(harvest_parts)
     # Q&A linguistic synonyms (OPT-IN, default off): field captions -> a cultureInfo part + a
     # ``ref cultureInfo`` on model.tmdl. Fully additive and byte-identical when off or when no
     # caption differs from its model column. Fail-closed -- a hiccup here must never break the build.

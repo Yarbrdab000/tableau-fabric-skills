@@ -12,6 +12,55 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ## [Unreleased]
 
+### Fixed
+
+- **`tableau-migration` (skill `2.360.0` → `2.361.0`): identity `lineageTag` GUIDs no longer churn
+  between two builds of identical input (#187).**
+
+  `stabilize_lineage_tags` re-derives every `lineageTag` from its object identity path, and
+  `assemble_model` runs it at the end of a model build. **Two later paths then splice in new TMDL
+  carrying fresh `uuid4` tags, after that pass has already run** — and `migrate_estate` never called
+  the stabilizer at all:
+
+  ```
+  assemble_model   Group/Bin harvest -> enrich_table_tmdl       24 of 268 corpus model files
+  migrate_estate   row-predicate "(filtered)" wrapper measures   2 of 268  (_Measures.tmdl)
+  ```
+
+  Measured across two fresh builds of the same corpus at the same revision:
+
+  ```
+  before   1605 files, 30 changed = 26 GUID churn + 4 timestamps
+  after    1605 files,  4 changed = 4 timestamps, 0 GUID churn, 0 unexplained
+  ```
+
+  **What this does NOT do is answer #187's actual question, and the measurement says so.** The issue
+  asks whether a matrix present in one workbook and absent from a sibling is non-determinism. It is
+  not: **all 583 `visual.json` are byte-identical across two independent builds — before this fix
+  and after.** A visual cannot appear or vanish between runs of identical code, so the reported
+  absence has another cause. This removes the noise that made cross-run diffs unreadable; it does
+  not explain the absence.
+
+  That noise was not hypothetical — it cost real time in this repo the same day, producing a
+  differential that reported **85 changed model files** for a change that touched only a pill
+  binding.
+
+  A second pass is safe because the function re-derives rather than mints, so it is idempotent:
+  measured per-model over 34 models / 268 files / 1809 rewritten tags, pass 2 differs from pass 1 on
+  **0** files.
+
+  **A probe error worth recording**, because it inflated the population 4×: a first attempt loaded
+  all 34 workbooks into one parts dict and reported 104 unstable files. That was the instrument —
+  the collision-suffix `taken` set is shared within a call, so merging 34 models manufactures
+  collisions that never occur in a real build, where each model is stabilized alone. Per-model it is
+  26, which matches an independent two-build measurement exactly.
+
+  **And the fix's own first version was correct code that did nothing.** It called
+  `T.stabilize_lineage_tags` in `migrate_estate`, which has no module alias `T`, inside a bare
+  `except Exception` — so it raised `NameError` on every build, the guard swallowed it, and nothing
+  happened while every signal stayed green. The except is now narrow and the test pins the module
+  alias actually imported there (`_tg`), not merely that some call is present.
+
 ### Added
 
 - **`tableau-migration` (skill `2.359.0` → `2.360.0`): the set of internal visual-type enums that

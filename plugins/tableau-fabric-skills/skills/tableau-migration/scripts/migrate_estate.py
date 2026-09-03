@@ -2185,6 +2185,20 @@ def _apply_row_predicate_wrapped_measures(report_parts, model_parts, result, res
         return report_parts, model_parts, []
     out_model["definition/tables/_Measures.tmdl"] = _append_measure_blocks_to_measures_table(
         measures_tmdl, measure_blocks)
+    # Re-stabilize: the wrapper blocks just appended carry FRESH uuid4 lineageTags, and this module
+    # never calls ``stabilize_lineage_tags`` at all -- ``assemble_model`` ran it before these
+    # measures existed. Left alone, ``_Measures.tmdl`` gets a different identity GUID on every
+    # build of identical input (#187: 2 of 268 corpus model files, the other 24 being the Group/Bin
+    # splice in ``assemble_model``). The function re-derives every tag from its object identity
+    # path, so it is deterministic AND idempotent -- measured per-model over the corpus, pass 2
+    # differs from pass 1 on 0 of 268 files -- which is what makes a second pass safe here.
+    #
+    # ``AttributeError`` only, NOT a bare ``except``. The first version of this called ``T.`` --
+    # a name that does not exist in this module -- inside ``except Exception``, so it raised
+    # NameError, was swallowed, and did nothing on every build while every signal stayed green.
+    # A narrow except is what makes that failure loud instead of invisible.
+    if hasattr(_tg, "stabilize_lineage_tags"):
+        _tg.stabilize_lineage_tags(out_model)
     return out_report, out_model, wrapped
 
 
