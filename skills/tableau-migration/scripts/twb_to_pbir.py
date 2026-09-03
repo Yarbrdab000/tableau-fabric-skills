@@ -6705,6 +6705,26 @@ def _warn(scope, name, reason):
             "reason": "manual attention required: " + reason}
 
 
+def _warn_no_page(scope, name, reason):
+    """A warning whose candidate produced NO PAGE -- the emit loop ``continue``s right after it (#188).
+
+    ``viz_fidelity[].tier`` is derived from ``visual_type`` alone. That is a statement about the
+    VISUAL, and it coincides with page emission at only ONE of the three drop sites: a worksheet
+    classified ``VT_UNSUPPORTED`` tiers ``empty``, but a dashboard with no supported visuals carries
+    the *dashboard* scope and an incomplete query state carries a REAL visual type (``line``,
+    ``scatter``), so both tier ``degraded`` -- which asserts "a rendered visual", the opposite of
+    what happened. Measured on the 34-workbook corpus: of 5 candidates that emitted no page, 4 were
+    reported ``degraded``.
+
+    Reason text does distinguish them, but prose is not a contract and changes without notice. This
+    flag is set AT THE DROP SITE, immediately before the ``continue``, so it cannot drift away from
+    the branch it describes the way a downstream reason-matcher can.
+    """
+    w = _warn(scope, name, reason)
+    w["page_emitted"] = False
+    return w
+
+
 def _norm_param_key(key):
     """Normalize a parameter id so the model<->viz seam joins regardless of bracket spelling.
 
@@ -14611,7 +14631,7 @@ def emit_pbir(ir, *, dataset_name="Model", report_name="Report", region_binding=
                 zone = _band_zone.get(ws["name"], zone)
             state = _build_query_state(ws, model_table, field_map, warnings)
             if not _query_state_complete(ws["visual_type"], state):
-                warnings.append(_warn(
+                warnings.append(_warn_no_page(
                     "worksheet", ws["name"],
                     f"{ws['visual_type']} visual has no usable field bindings (skipped)"))
                 continue
@@ -14870,8 +14890,8 @@ def emit_pbir(ir, *, dataset_name="Model", report_name="Report", region_binding=
                     "(image placed faithfully; interactivity deferred)"
                     % _resource_basename(iz.get("image"))))
         if not visuals:
-            warnings.append(_warn("dashboard", db["name"],
-                                  "no supported visuals on this dashboard"))
+            warnings.append(_warn_no_page("dashboard", db["name"],
+                                          "no supported visuals on this dashboard"))
             continue
         # Fail-closed layering backstop: demote any image that would fully cover a rebuilt visual
         # beneath the content. ``_image_z`` reads Tableau's document paint order, which is correct
@@ -14903,7 +14923,7 @@ def emit_pbir(ir, *, dataset_name="Model", report_name="Report", region_binding=
         page_name = _sanitize("page-ws-" + ws["name"])
         state = _build_query_state(ws, model_table, field_map, warnings)
         if not _query_state_complete(ws["visual_type"], state):
-            warnings.append(_warn(
+            warnings.append(_warn_no_page(
                 "worksheet", ws["name"],
                 f"{ws['visual_type']} visual has no usable field bindings (skipped)"))
             continue

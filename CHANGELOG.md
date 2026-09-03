@@ -14,6 +14,45 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ### Added
 
+- **`tableau-migration` (skill `2.353.0` → `2.354.0`): `viz_fidelity[]` rows carry
+  `page_emitted: false` when the candidate produced **no page**, so a consumer no longer has to
+  match reason prose to answer *"did this become a page?"* (#188).**
+
+  `tier` is derived from `visual_type` alone. That is a statement about the **visual**, and it
+  coincides with page emission at only **one** of the three drop sites:
+
+  ```
+  drop site                             row that reaches viz_fidelity   tier        says "no page"?
+  worksheet classified VT_UNSUPPORTED   visual_type "unsupported"       empty       yes
+  dashboard with no supported visuals   visual_type = the warning SCOPE degraded    NO
+  query state incomplete (x2 loops)     visual_type is REAL ("line")    degraded    NO
+  ```
+
+  At the last two, `degraded` asserts *"a rendered visual"* — the opposite of what happened.
+  `status` is `warned` for both outcomes so it cannot discriminate; reason text can, but prose is
+  not a contract.
+
+  A new `_warn_no_page` stamps the flag **at the drop site, immediately before the `continue`**, so
+  it cannot drift from the branch it describes the way a downstream reason-matcher can. `_viz_fidelity`
+  surfaces it on both the worksheet rows and the dashboard-scope rows.
+
+  **Deliberately one-sided:** the engine knows for certain when it *dropped* a page, and does not
+  separately prove emission everywhere else, so `page_emitted: true` is never claimed — absent means
+  "not declared dropped", not "emitted". A control that flips the helper to `True` goes red.
+
+  **Scope, measured rather than assumed.** Our 34-workbook corpus exercises **exactly one** of the
+  three sites (`0075_customers_above_average`, a `column` visual with no usable field bindings); the
+  dashboard site and the second worksheet loop have fixture coverage only, so the call sites are
+  pinned against the source as well as the behaviour. Verified both directions on the corpus: every
+  flagged row genuinely has no page, and **no** page-less candidate is unflagged.
+
+  A **fourth** drop path exists that the issue did not name — a structurally *empty* worksheet — and
+  it correctly needs no flag: it is classified `unsupported` in the parser, so `tier` and page
+  emission already agree there. That is the issue's option 1, already true at that site.
+
+  Purely additive: one fidelity key added, **none removed or renamed**, and a warning that is not a
+  page drop is byte-identical to before.
+
 - **`tableau-migration` (skill `2.352.0` → `2.353.0`): `report.json` now discloses that the report
   it *describes* is not the report a user *opens*, and names every visual where the two differ
   (#173).**

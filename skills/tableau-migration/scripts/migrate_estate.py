@@ -1172,7 +1172,13 @@ def _viz_fidelity(result):
     # consumer is unchanged, and the remainder are exposed under a new `additional_reasons` key that
     # is present only when there IS more to say.
     warned_ws, warned_more, extra = {}, {}, []
+    # Candidates the viz stage dropped WITHOUT emitting a page (#188). The flag is stamped at the
+    # drop site itself (``twb_to_pbir._warn_no_page``), so this is a structural fact rather than a
+    # reason-text match -- prose is not a contract.
+    no_page = set()
     for w in warnings:
+        if w.get("page_emitted") is False and w.get("name"):
+            no_page.add(w.get("name"))
         if w.get("scope") == "worksheet" and w.get("name") in ws_names:
             nm = w.get("name")
             if nm not in warned_ws:
@@ -1189,6 +1195,8 @@ def _viz_fidelity(result):
             _row = {"worksheet": nm, "visual_type": vt,
                     "status": "warned", "reason": warned_ws[nm],
                     "tier": _fidelity_tier("warned", vt, warned_ws[nm])}
+            if nm in no_page:
+                _row["page_emitted"] = False
             if warned_more.get(nm):
                 _row["additional_reasons"] = list(warned_more[nm])
             fidelity.append(_row)
@@ -1202,9 +1210,12 @@ def _viz_fidelity(result):
                              "status": "rebuilt", "reason": _note,
                              "tier": _fidelity_tier("rebuilt", vt, _note)})
     for w in extra:
-        fidelity.append({"worksheet": w.get("name"), "visual_type": w.get("scope"),
-                         "status": "warned", "reason": w.get("reason"),
-                         "tier": _fidelity_tier("warned", w.get("scope"), w.get("reason"))})
+        _row = {"worksheet": w.get("name"), "visual_type": w.get("scope"),
+                "status": "warned", "reason": w.get("reason"),
+                "tier": _fidelity_tier("warned", w.get("scope"), w.get("reason"))}
+        if w.get("page_emitted") is False:
+            _row["page_emitted"] = False
+        fidelity.append(_row)
     return fidelity
 
 
