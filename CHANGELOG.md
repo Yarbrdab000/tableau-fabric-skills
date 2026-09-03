@@ -14,6 +14,45 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ### Fixed
 
+- **`tableau-migration` (skill `2.356.0` → `2.357.0`): two relations joining the SAME physical
+  table keep their own columns, instead of one silently deleting the other's.** Tableau joins a table
+  twice by giving the second relation a distinct name — `Contact` and `Contact1`, both
+  `table='[Contact]'` — and `<metadata-record><parent-name>` groups each relation's columns under
+  that RELATION name, so a correct per-relation list already existed. `_classify_relation` looked the
+  columns up by the PHYSICAL table first, so **both relations received the same list OBJECT** (proved
+  by `id()`, not by comparing contents). That matters because the hidden-column prune mutates these
+  lists **in place**: `Name` is hidden on `Contact` and NOT on `Contact1`, so pruning `Contact`
+  deleted `Name` out from under `Contact1`. The consequences were entirely downstream and entirely
+  silent — no `Contact1[Name]` column in the model manifest, so `_field_map_from_model` could build no
+  `Service Delivery||Contact1||*` key for it, so all three `_apply_override` lookups missed and the
+  pill fell through to the `model_table` fallback: a chart captioned **"By Service Provider" listed
+  ENGAGEMENT RECORDS instead of people**, with **zero overlap** between the two columns' 1,131 and
+  2,638 values, rendering plausibly because the axis truncates the labels
+  (`Adeline…`, `Adriena…`). The fix prefers the relation's own name when it is a `cols_by_parent`
+  key and falls back to the physical table otherwise, so an ordinary relation — whose name IS the
+  table name, or which has no name-keyed columns — resolves exactly as before. **The `model_table`
+  fallback at the far end of that chain is NOT the defect and is unchanged**: it performs 76 correct
+  per-datasource suffix disambiguations on this workbook alone (`pmdm__Program__c` →
+  `pmdm__Program__c (Assessments)`), and only misfired because the lookup ahead of it had nothing to
+  find. Population: **4 of 36 relations** in the Salesforce workbook, **0** in every other corpus
+  workbook. Corpus differential against a baseline rebuilt at the SAME head: 1605 files, **0 added,
+  0 removed, 19 changed** — 13 in the Salesforce workbook, 4 run manifests, and **2 in
+  `0068_market_basket`, which was unpredicted and is a SECOND instance of the same defect**: its
+  market-basket self-join declares `name='Orders$1' table='[Orders$]'`, the worksheet's row pill is
+  `[none:Product Sub-Category (Orders$1):nk]`, and the row axis bound `Orders$` before and `Orders$1`
+  after — verified against the source, a correction. That one was invisible by a different route than
+  the first: the two axes bound DIFFERENT tables either way, so the cross-tab rendered a full,
+  plausible matrix with one axis silently attributed to the wrong relation. Verified at the render —
+  "By Service Provider" now lists five distinct people — and against the LIVE model with
+  `INFO.COLUMNS`/`INFO.MEASURES` (196/196 projections resolve, 0 dangling, positive control passes);
+  an earlier TMDL-regex probe reporting 23 dangling references was **wrong** and is retracted, the
+  regex being unable to see calculated columns. Nine tests, two of which assert **object identity**
+  rather than equality — two lists that merely compare equal today would still alias tomorrow — and
+  one that reproduces the mechanism directly by pruning a column from `Contact` and asserting
+  `Contact1` still has it. Both positive controls fire with the restore hash-verified: reverting the
+  lookup order rebinds all three charts to `pmdm__ProgramEngagement__c` **and** turns the identity
+  tests red.
+
 - **`tableau-migration` (skill `2.355.0` → `2.356.0`): asset downloads stream to disk, accept a
   caller `timeout`, and share the bounded retry that already existed in the same file (#190).**
 

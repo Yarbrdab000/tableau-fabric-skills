@@ -1763,7 +1763,23 @@ def _classify_relation(rel, cols_by_parent, nc_map=None):
         catalog, schema, item = _parse_table_name(rel.get("table"))
         if item is None:
             return {"kind": "unknown", "name": name, "raw_table": rel.get("table")}
-        cols = cols_by_parent.get(item) or cols_by_parent.get(_strip_brackets(name) if name else "", [])
+        # Prefer the relation's OWN name over the physical table it points at. Tableau joins the same
+        # physical table twice by giving the second relation a distinct name (``Contact`` +
+        # ``Contact1``, both ``table='[Contact]'``), and ``<metadata-record><parent-name>`` groups
+        # columns under that RELATION name -- so ``cols_by_parent`` already holds a separate, correct
+        # list for each. Looking up by ``item`` first handed BOTH relations the first one's list, and
+        # because the hidden-column prune mutates these lists IN PLACE, a column hidden on ``Contact``
+        # (``Name``) was deleted out from under ``Contact1``, which does NOT hide it. Its pill then had
+        # no model column to bind to, missed every ``field_map`` key, and fell back to the fact table:
+        # a chart captioned "By Service Provider" listed engagement records instead of people, with
+        # zero overlap between the two columns' values, and rendered plausibly because the axis
+        # truncates. Falls back to ``item`` so an ordinary relation -- whose name IS the table name, or
+        # which has no name-keyed columns -- resolves exactly as before.
+        cols = None
+        if name:
+            cols = cols_by_parent.get(_strip_brackets(name))
+        if cols is None:
+            cols = cols_by_parent.get(item, [])
         entry = {
             "kind": "table",
             "name": name,
