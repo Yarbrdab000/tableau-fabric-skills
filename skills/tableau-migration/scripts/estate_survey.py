@@ -79,6 +79,31 @@ def _text(value):
     return (value or "").strip() if isinstance(value, str) else ""
 
 
+def _size_mb(item):
+    """Tableau's ``size`` attribute (MEGABYTES) as a number, or ``None`` when absent/unparseable.
+
+    Returned by ``GET /sites/{site}/workbooks`` as a STRING, so it needs coercing. ``None`` rather
+    than ``0`` on a miss: a zero reads as "empty workbook" and would let a caller budget a download
+    it then cannot explain, which is a worse answer than "unknown" (#190).
+    """
+    if not isinstance(item, dict):
+        return None
+    raw = item.get("size")
+    if raw is None:
+        return None
+    # ``float(str(raw))`` and not ``float(raw)``: the value arrives as a STRING from the REST API,
+    # and going through ``str`` also means a bool cannot slip through as 1.0/0.0 -- ``float(True)``
+    # is 1.0 but ``float("True")`` raises. That is why there is no separate bool guard here; a
+    # control that removed one could never go red, because the coercion already rejects it.
+    try:
+        val = float(str(raw).strip())
+    except (TypeError, ValueError):
+        return None
+    if val != val or val < 0:          # NaN or nonsense
+        return None
+    return int(val) if val.is_integer() else val
+
+
 def connection_type(conn):
     """Connection type, from either the nested (``type``) or documented (``connectionType``) key."""
     if not isinstance(conn, dict):
@@ -242,6 +267,12 @@ def build_survey(workbooks, connections_by_workbook, datasources, unknown_workbo
             "name": _text(wb.get("name")),
             "luid": luid,
             "project": project_name(wb),
+            # Tableau returns a `size` attribute (MB) on GET /sites/{site}/workbooks. Carrying it
+            # lets a caller BUDGET a download before starting it -- which is the difference between
+            # "this asset is large, raise the timeout" and discovering it by timing out (#190).
+            # Additive and best-effort: absent or unparseable stays absent rather than becoming 0,
+            # because a zero would read as "empty workbook" and is a worse answer than "unknown".
+            **({"size_mb": _size_mb(wb)} if _size_mb(wb) is not None else {}),
             "published_dependencies": resolved_deps,
             # A workbook whose connections could not be read has UNKNOWN dependencies, not none.
             "dependencies_unknown": luid in unknown,

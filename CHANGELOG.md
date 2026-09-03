@@ -14,6 +14,53 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ### Fixed
 
+- **`tableau-migration` (skill `2.355.0` → `2.356.0`): asset downloads stream to disk, accept a
+  caller `timeout`, and share the bounded retry that already existed in the same file (#190).**
+
+  Three defects in `fetch_tds.py`, reported together against a live 47-asset estate (Tableau Server
+  2025.3.3, REST 3.27) where they combined to make a large-but-healthy workbook **permanently
+  unharvestable**:
+
+  1. **The whole asset was buffered in RAM.** `_http` ends in one unbounded `resp.read()`, so a
+     multi-GB `.twbx` with `--include-extract` was held entirely in memory before a byte reached
+     disk — and the output file stayed at **zero bytes until completion**, so no caller could tell
+     *"large and downloading fine"* from *"the socket is dead"*. Now streamed in 1 MiB chunks, which
+     bounds memory **and** makes the growing file the progress signal.
+  2. **`timeout=300` was hard-coded** and not exposed. Both download functions now take a `timeout`.
+     It is a per-socket-**read** timeout, not a total-transfer budget — a slow-but-steady download
+     satisfies every individual read and never trips it, while a stalled connection dies at
+     `timeout`. That semantic was right and simply invisible; it is now a parameter and the
+     docstring says which it is.
+  3. **Downloads bypassed the retry machinery in the same file.** `_http_json` gets the shared
+     bounded retry; the download path called `_http` directly and got none — though
+     `TRANSIENT_STATUSES` and `classify_http_failure` sit immediately below `_http` and already
+     encode the right policy, including the synthetic `0` for a network fault. On that estate one
+     workbook **failed and then succeeded on a manual retry**: a textbook transient the file already
+     knew how to classify and never applied here.
+
+  A retry **truncates the destination first** — ranged resume is not attempted, because a partial
+  file that silently keeps bytes from a failed attempt is a worse outcome than a re-download.
+
+  **The `(cd, bytes)` contract is unchanged.** With no `dest`, the bytes still come back, so every
+  existing caller and all 52 existing `fetch_tds` tests are untouched — but the transfer streams to
+  a temp file underneath either way, so the memory ceiling improves even on the compatible path.
+  Passing `dest` streams straight to that path and returns no bytes.
+
+  Also carries Tableau's **`size`** attribute (MB, from `GET /sites/{site}/workbooks`) into
+  `estate_survey` as `size_mb`, so a caller can *budget* a download instead of discovering its size
+  by timing out. Omitted entirely when absent or unparseable rather than emitted as `0`: a zero
+  reads as "empty workbook" and is a worse answer than "unknown".
+
+  **A guard was removed rather than kept, because a control proved it unreachable.** An
+  `isinstance(raw, bool)` check could never fire — `float(True)` is `1.0`, but the coercion is
+  `float(str(raw).strip())` and `float("True")` raises. The control that deleted it stayed green,
+  which is the tell; the guard is gone and the reasoning is now a test.
+
+  **Scope: these are network paths, so the new tests drive a fake `urlopen`.** That proves the retry
+  *policy* and the streaming *shape*, not behaviour against a real Tableau server — the reporter
+  offered to test a branch against the same estate, which is the only instrument that can close
+  that gap.
+
 - **`tableau-migration` (skill `2.354.0` → `2.355.0`): a visual whose every binding was dropped
   renders BLANK, and is now classified `blocking` instead of falling through to
   `('other', 'medium')` (#189).**

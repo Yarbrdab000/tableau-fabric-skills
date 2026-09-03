@@ -71,6 +71,7 @@ import io
 import json
 import os
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.parse
@@ -401,14 +402,103 @@ def resolve_datasource_luid(server, rest_version, site_id, token, name):
     return pick_datasource(datasources, name)
 
 
-def download_datasource(server, rest_version, site_id, token, datasource_id, include_extract=False):
-    """Return ``(filename, body_bytes, content_disposition)`` for the downloaded datasource."""
+def _http_download(url, token, dest, timeout=300, *, max_attempts=4, sleep=None,
+                   reauth=None, chunk=1 << 20):
+    """GET a binary asset STRAIGHT TO ``dest``, with the same bounded retry ``_http_json`` uses.
+
+    Three defects this replaces, all reported together against a live 47-asset estate (#190):
+
+    1. **The whole asset was buffered in RAM.** ``_http`` ends in one unbounded ``resp.read()``, so a
+       multi-GB ``.twbx`` with ``--include-extract`` was held entirely in memory before a byte
+       reached disk, and the output file stayed at ZERO bytes until completion -- no caller could
+       tell "large and downloading fine" from "the socket is dead". Streaming in ``chunk``-sized
+       pieces bounds memory AND makes the growing file the progress signal.
+    2. **``timeout=300`` was hard-coded** and not exposed, so a caller could not raise the ceiling for
+       a genuinely large asset. It is a per-socket-READ timeout, not a total-transfer budget -- a
+       slow-but-steady download satisfies every individual read and never trips it, while a stalled
+       connection dies at ``timeout``. That semantic is right and was simply invisible; it is now a
+       parameter and this docstring is where it is stated.
+    3. **Downloads bypassed the retry machinery in this very file.** ``_http_json`` gets the shared
+       bounded retry; these called ``_http`` directly and got none -- even though
+       ``TRANSIENT_STATUSES`` and ``classify_http_failure`` sit immediately below ``_http`` and
+       already encode the right policy, including the synthetic ``0`` for a network fault. Measured
+       on that estate: one workbook failed and then succeeded on a MANUAL retry, i.e. a textbook
+       transient the file already knew how to classify and never applied here.
+
+    A retry restarts the transfer from zero and truncates ``dest`` first -- ranged resume is not
+    attempted, because a partial file that silently keeps bytes from a failed attempt is a worse
+    outcome than a re-download.
+
+    Returns ``(content_disposition, bytes_written)``. Raises ``RuntimeError`` with the same
+    classification text ``_http_json`` produces, so a caller's error handling is unchanged.
+    """
+    sleeper = sleep if sleep is not None else time.sleep
+    attempt, delay, last = 0, 1.0, ""
+    while True:
+        attempt += 1
+        req = urllib.request.Request(
+            url, headers={"X-Tableau-Auth": token} if token else {}, method="GET")
+        status, resp_headers, err_text, written, cd = 0, {}, "", 0, None
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                status = resp.status
+                resp_headers = dict(resp.headers)
+                cd = resp_headers.get("Content-Disposition") or \
+                    resp_headers.get("content-disposition")
+                if status == 200:
+                    # Truncate first: a retry must never leave bytes from a previous attempt.
+                    with open(dest, "wb") as fh:
+                        while True:
+                            block = resp.read(chunk)
+                            if not block:
+                                break
+                            fh.write(block)
+                            written += len(block)
+                    return cd, written
+                err_text = resp.read().decode("utf-8", "replace")
+        except urllib.error.HTTPError as exc:
+            status = exc.code
+            resp_headers = dict(exc.headers or {})
+            try:
+                err_text = exc.read().decode("utf-8", "replace")
+            except Exception:
+                err_text = ""
+        except (OSError, http.client.HTTPException) as exc:
+            # Same synthetic status 0 contract as ``_http``: a network fault has no HTTP status,
+            # and 0 is classified transient so the shared policy retries it.
+            status, err_text = 0, f"{type(exc).__name__}: {exc}"
+
+        kind = classify_http_failure(status, err_text)
+        last = f"GET {url} failed ({status}, {kind}): {err_text[:500]}"
+        if attempt >= max_attempts or kind in ("fatal", "credential"):
+            if kind == "credential":
+                raise RuntimeError(
+                    last + " -- Tableau itself cannot query this source (its stored credential or "
+                    "OAuth refresh token has expired). Re-authorise the DATASOURCE in Tableau; no "
+                    "retry can fix this.")
+            raise RuntimeError(last)
+        if kind == "session_loss":
+            if reauth is None:
+                raise RuntimeError(
+                    last + " -- the Tableau session expired mid-run and no re-authentication hook "
+                    "was supplied, so this call cannot be recovered.")
+            token = reauth()
+            continue
+        sleeper(_retry_after_seconds(resp_headers, delay))
+        delay = min(delay * 2, 30.0)
+
+
+def download_datasource(server, rest_version, site_id, token, datasource_id, include_extract=False,
+                        timeout=300, *, dest=None, reauth=None):
+    """Return ``(content_disposition, body_bytes)`` for the downloaded datasource.
+
+    ``dest`` streams the asset straight to that path and returns ``(cd, None)`` instead of the
+    bytes -- the memory-bounded path for a large ``.tdsx`` (#190). Without it the bytes are still
+    returned, so every existing caller is unchanged; the download is streamed to a temporary file
+    underneath either way, so memory is bounded during transfer even on the compatible path.
+    """
     url = download_content_url(server, rest_version, site_id, datasource_id, include_extract)
-    status, headers, raw = _http("GET", url, headers={"X-Tableau-Auth": token}, timeout=300)
-    if status != 200:
-        raise RuntimeError(f"download datasource failed ({status}): {raw[:300]!r}")
-    cd = headers.get("Content-Disposition") or headers.get("content-disposition")
-    return cd, raw
+    return _download_to(url, token, dest, timeout, reauth, "datasource")
 
 
 def resolve_workbook_luid(server, rest_version, site_id, token, name):
@@ -417,14 +507,38 @@ def resolve_workbook_luid(server, rest_version, site_id, token, name):
     return pick_workbook(workbooks, name)
 
 
-def download_workbook(server, rest_version, site_id, token, workbook_id, include_extract=False):
-    """Return ``(content_disposition, body_bytes)`` for the downloaded workbook (.twb or .twbx)."""
+def download_workbook(server, rest_version, site_id, token, workbook_id, include_extract=False,
+                      timeout=300, *, dest=None, reauth=None):
+    """Return ``(content_disposition, body_bytes)`` for the downloaded workbook (.twb or .twbx).
+
+    See :func:`download_datasource` for ``dest`` / ``timeout`` (#190).
+    """
     url = download_workbook_url(server, rest_version, site_id, workbook_id, include_extract)
-    status, headers, raw = _http("GET", url, headers={"X-Tableau-Auth": token}, timeout=300)
-    if status != 200:
-        raise RuntimeError(f"download workbook failed ({status}): {raw[:300]!r}")
-    cd = headers.get("Content-Disposition") or headers.get("content-disposition")
-    return cd, raw
+    return _download_to(url, token, dest, timeout, reauth, "workbook")
+
+
+def _download_to(url, token, dest, timeout, reauth, kind):
+    """Shared body for the two download entry points.
+
+    When the caller gave no ``dest`` we still stream -- to a temp file -- and read the bytes back.
+    That keeps the ``(cd, bytes)`` contract every current caller depends on while removing the
+    unbounded ``resp.read()`` from the transfer itself, so the memory ceiling improves even for
+    callers that never pass ``dest``.
+    """
+    if dest is not None:
+        cd, _n = _http_download(url, token, dest, timeout=timeout, reauth=reauth)
+        return cd, None
+    fd, tmp = tempfile.mkstemp(prefix="tabfetch-", suffix=".bin")
+    os.close(fd)
+    try:
+        cd, _n = _http_download(url, token, tmp, timeout=timeout, reauth=reauth)
+        with open(tmp, "rb") as fh:
+            return cd, fh.read()
+    finally:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
 
 
 def save_outputs(raw, out_path, name, kind="datasource"):
