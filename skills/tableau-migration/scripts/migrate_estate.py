@@ -1715,7 +1715,19 @@ def _crosscheck_report_refs(report_parts, model_parts, swap_specs=None):
                 _strip_objects_for_refs(vis, dropped_refs)
             report_parts[path] = json.dumps(j, indent=2)
             if dropped:
-                drops.append({"visual": j.get("name"), "dropped": dropped, "emptied": emptied})
+                # An EMPTIED visual renders BLANK in Power BI while the report still passes
+                # ``powerbi-report-author validate`` cleanly -- there is no structural signal
+                # anywhere downstream, so it is visible only by opening the report or by reading
+                # this field (#189). Carry the severity ON THE ENTRY, so a consumer reading only
+                # ``pbip_ref_drops`` can triage without cross-referencing the worklist, and so the
+                # judgement does not depend on matching the warning prose.
+                #
+                # ``high`` for a PARTIAL drop is the module's own band -- "a data / binding gap that
+                # changes what is shown" -- and is deliberately NOT blocking: the visual still
+                # renders, with fewer fields. Conflating the two would make the blocking set
+                # unusable for exactly the triage this severity exists for.
+                drops.append({"visual": j.get("name"), "dropped": dropped, "emptied": emptied,
+                              "severity": "blocking" if emptied else "high"})
             if rebound:
                 rebinds.append({"visual": j.get("name"), "rebound": rebound})
     return report_parts, drops, rebinds

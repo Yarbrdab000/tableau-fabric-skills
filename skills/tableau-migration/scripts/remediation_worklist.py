@@ -56,6 +56,17 @@ _WARNING_RULES = (
     (("no visual emitted", "zone left empty", "no visual was emitted"), "unsupported_visual", "blocking"),
     (("nothing to rebuild", "empty worksheet"), "empty_worksheet", "blocking"),
     (("no usable field bindings",), "no_field_bindings", "blocking"),
+    # A visual that lost EVERY binding renders BLANK, and the report still passes
+    # `powerbi-report-author validate` cleanly -- so nothing structural downstream says so (#189).
+    # `no_field_bindings` above already blocks on the same end state reached a different way, which
+    # is what made this an omission rather than a policy.
+    #
+    # The needle is the "(visual emptied)" tail, NOT the word "dropped": a PARTIAL reference drop
+    # emits the same warning without that tail and must stay non-blocking, because the visual still
+    # renders with fewer fields. Blocking both would make the blocking set useless for the triage it
+    # exists for. The authoritative signal is `pbip_ref_drops[].severity`, which is set structurally
+    # at the drop site; this rule is how that fact reaches the worklist, whose only input is prose.
+    (("(visual emptied)",), "emptied_visual", "blocking"),
     # A DROPPED FILTER is its own category, deliberately separate from ``filter`` and from
     # ``field_binding`` (#185). Those describe a control that is missing or bound loosely; this one
     # describes a visual that RENDERS COMPLETE over more rows than the source. It is ``high`` rather
@@ -100,6 +111,10 @@ _REMEDIATION = {
                           "deterministic emitter's supported set.",
     "empty_worksheet": "No source fields on any shelf; confirm the worksheet is intentionally empty.",
     "no_field_bindings": "Provide field bindings so the table can be rebuilt with real columns.",
+    "emptied_visual": "This visual renders BLANK -- every field binding was dropped because the "
+                      "model did not emit those objects, and the report still validates clean, so "
+                      "nothing else will tell you. Translate the underlying calc(s) (or bind the "
+                      "fields to real model columns) and re-run, or delete the visual deliberately.",
     "field_binding": "Bind the field to the matching model table/column; verify the caption maps to "
                      "a real column name.",
     "parameter_control": "Rebuild the Tableau parameter as a single-select slicer once its target "

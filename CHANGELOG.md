@@ -12,6 +12,42 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ## [Unreleased]
 
+### Fixed
+
+- **`tableau-migration` (skill `2.354.0` → `2.355.0`): a visual whose every binding was dropped
+  renders BLANK, and is now classified `blocking` instead of falling through to
+  `('other', 'medium')` (#189).**
+
+  `_crosscheck_report_refs` drops a projection whose model object was never emitted. When every
+  binding goes, the visual is `emptied` — it renders **blank in Power BI while the report still
+  passes `powerbi-report-author validate` cleanly**, so there is no structural signal anywhere
+  downstream. Reported estate-wide at `2.353.0`: **23 emptied visuals, 0 at `severity: blocking`**
+  (54 high, 17 medium) while 77 other items *did* earn blocking. In one workbook, 15 blank visuals
+  sat inside a 152-item worklist while a consumer triaging by severity saw `blocking: 7` and worked
+  those first — all 15 outside that set. `no_field_bindings` already blocks on the same end state
+  reached a different way, which is what made this an omission rather than a policy.
+
+  **Two signals, and the order matters.** `pbip_ref_drops[].severity` is now set **structurally at
+  the drop site**, from the `emptied` boolean the engine already computed — that is the
+  authoritative one, and it lets a consumer reading only that list triage without cross-referencing
+  the worklist. The worklist rule keys on the `"(visual emptied)"` tail because the worklist's only
+  input *is* prose; it is how the structural fact reaches that surface, not the source of truth.
+
+  **A PARTIAL drop stays non-blocking** (`high` — the module's own "a data/binding gap that changes
+  what is shown"). The visual still renders, with fewer fields. Blocking both would make the
+  blocking set useless for exactly the triage the severity exists for, and a control that widens the
+  needle from `"(visual emptied)"` to `"dropped"` goes red.
+
+  Pinned alongside the #143 interaction, so the two rules cannot drift apart: a visual that loses a
+  *required* role is emptied deliberately (keeping it would ship PBIR that fails `validate` with
+  `PBIR_ROLE_REQUIRED_MISSING`), and since it is emptied it must also carry `blocking`.
+
+  **Scope, stated because it bounds the evidence: our 34-workbook corpus produces ZERO
+  `pbip_ref_drops` entries**, so this ships on the reporter's estate measurements with fixture
+  coverage only. Corpus worklist severities are byte-identical before and after
+  (`medium 256 / blocking 11 / high 67 / low 8`), which is the correct result for a change that
+  fires on a shape we do not emit. Additive: one key added to the drop entry, none removed.
+
 ### Added
 
 - **`tableau-migration` (skill `2.353.0` → `2.354.0`): `viz_fidelity[]` rows carry
