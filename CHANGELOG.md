@@ -14,6 +14,55 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ### Fixed
 
+- **`tableau-migration` (skill `2.357.0` → `2.358.0`): a disaggregated measure pill stays a bare
+  column in a visual that lists every underlying row, instead of being summed.**
+
+  A regression in `2.348.0`, reported by a parallel session from an isolated A/B against a rebuilt
+  corpus baseline. `2.348.0` fixed #142 — a `none:Sales:qk` pill (Tableau's *Analysis → Aggregate
+  Measures OFF*, one mark per underlying row) emitting a bare `Column` into a chart's measure-only
+  value role, which `powerbi-report-author validate` rejects with `PBIR_ROLE_KIND_MISMATCH`. The fix
+  was right; its **scope** was not. It rebuilt the pill as `Sum` for *every* visual type:
+
+  ```
+  workbook 0135_aggregation_types   worksheet "Disaggregated sales"   tableEx
+    Tableau   draws every underlying row (~10k)
+    2.348.0   Values: Aggregation "Sum of Sales"  -- one summed row per Sub-Category
+  ```
+
+  The rationale published with `2.348.0` — *"Power BI has no disaggregated value role"* — is true of
+  a **chart** and false of a **table**. `tableEx` has no entry in the harvested `MEASURE_ROLES` at
+  all, so a bare column in its `Values` is both valid and the faithful rebuild. The revert is now
+  scoped by that harvested catalog rather than applied unconditionally: `pivotTable` keeps the `Sum`
+  (its `Values` *is* measure-only — #142's sibling case), as does every chart, and only an
+  aggregation **we** synthesised is ever touched, so an authored `SUM([Sales])` is never altered.
+
+  Nothing static could have caught this. The model was valid, the report opened, the validator
+  reported zero errors, and the visual rendered a full, plausible table of wrong numbers — the same
+  shape as every defect in this area.
+
+  **Two fixes for it were correct code that did nothing, and both are pinned by tests**, because
+  each ran on every build, changed no artifact, and reported no failure:
+
+  1. The catalog was queried with the **internal enum** (`"table"`, `"bar"`) against a table keyed by
+     **PBIR names** (`tableEx`, `clusteredBarChart`). Every lookup missed, so every visual type read
+     as table-like and the revert fired on a `clusteredBarChart` — putting a bare `Column` back into
+     role `Y` and **reintroducing #142 while fixing its follow-up**. `_measure_only_roles` now
+     translates through `_VT_TO_PBIR` and distinguishes `None` (unknown — do not touch) from `()`
+     (known, no measure-only role — revert), so an unmapped visual type fails **closed**. Collapsing
+     those two falsy values is precisely the defect, and there is a control asserting it.
+  2. The revert then walked `rows` and `cols`. A Tableau text table carries its measure on the
+     **Text/Label** marks card, so the pill was never in either bucket. Found by dumping the IR for
+     that one worksheet, not by re-reading the function.
+
+  Verified at the artifact against a baseline **rebuilt at the same HEAD** — a two-day-old baseline
+  would have attributed six intervening releases to this change. With the build root and the
+  per-build random `lineageTag` GUIDs normalised (both normalisers asserted non-empty, so the clean
+  result cannot be vacuous), the corpus differential is **2 changed files of 1605, 0 added, 0
+  removed** — the same visual in both emitted trees — and **no model TMDL at all**. The real
+  Microsoft validator reports `result=succeeded`, 0 errors on both trees, and a negative control
+  confirms that same validator *does* report `PBIR_ROLE_KIND_MISMATCH` when the #142 shape is
+  injected into a chart, so the clean result is informative rather than merely quiet.
+
 - **`tableau-migration` (skill `2.356.0` → `2.357.0`): two relations joining the SAME physical
   table keep their own columns, instead of one silently deleting the other's.** Tableau joins a table
   twice by giving the second relation a distinct name — `Contact` and `Contact1`, both

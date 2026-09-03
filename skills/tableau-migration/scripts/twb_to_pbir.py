@@ -1608,12 +1608,19 @@ def _resolve_field(ds, field_id, base_cols, instances, index, ds_caption,
 
         if code == "qk":
             # CONTINUOUS (green) = Analysis -> Aggregate Measures OFF: one mark per underlying row.
-            # Power BI has no disaggregated mode for a value role, so this cannot be reproduced -- it
-            # is warned, not silently equated. ``Sum`` is chosen over dropping the pill for the same
-            # reason as the ATTR branch above (a missing value cannot be noticed by a reader), and
-            # over any other aggregate because it is what BOTH products do by default with this
-            # field: Tableau with Aggregate Measures back ON, and Power BI for a numeric column
-            # dropped in a value well.
+            # Power BI has no disaggregated mode for a CHART's value role, so on a chart this cannot
+            # be reproduced -- it is warned, not silently equated. ``Sum`` is chosen over dropping
+            # the pill for the same reason as the ATTR branch above (a missing value cannot be
+            # noticed by a reader), and over any other aggregate because it is what BOTH products do
+            # by default with this field: Tableau with Aggregate Measures back ON, and Power BI for
+            # a numeric column dropped in a value well.
+            #
+            # NOT unconditional. A TABLE can list every underlying row, which is exactly what
+            # Tableau draws here -- so ``synthesized_agg`` marks this aggregation as OURS rather
+            # than the author's, and ``_unsynthesize_table_aggregations`` reverts it for a visual
+            # type whose roles are not measure-only. 2.348.0 lacked that mark and summed
+            # 0135's ``Disaggregated sales`` text table, collapsing ~10k rows to one per
+            # Sub-Category (caught by a parallel session's isolated A/B, not by any gate here).
             if datatype in _NUMERIC_TYPES:
                 warnings.append(_warn(
                     "worksheet", worksheet,
@@ -1623,6 +1630,7 @@ def _resolve_field(ds, field_id, base_cols, instances, index, ds_caption,
                 field["aggregation"] = "Sum"
                 field["binding"] = "aggregation"
                 field["kind"] = "value"
+                field["synthesized_agg"] = True
                 return field
             # A non-numeric measure cannot be summed. It is still unaggregated, so it groups.
             field["binding"] = "column"
@@ -7907,9 +7915,81 @@ def _dedupe_native_query_refs(state):
     return state
 
 
+def _measure_only_roles(visual_type):
+    """The roles this visual type requires to be a measure, from the HARVESTED catalog.
+
+    ``visual_type`` is the INTERNAL enum (``"table"``, ``"bar"``), so it is translated through
+    ``_VT_TO_PBIR`` first -- the catalog is keyed by PBIR names (``tableEx``, ``clusteredBarChart``).
+    Skipping that translation was a live defect for one build: every lookup missed, every type
+    looked table-like, and the caller reverted the aggregation on a ``clusteredBarChart``, putting a
+    bare ``Column`` back into role ``Y`` -- i.e. reintroducing #142 while fixing its follow-up.
+
+    Imported from ``pbir_lint.MEASURE_ROLES`` rather than restated here: that table comes from
+    ``powerbi-report-author catalog describe``, and 2.352.0 made it the derived source of truth
+    precisely because a hand-maintained second copy drifted.
+
+    Returns ``None`` when the type is unknown or the module is unavailable -- distinct from ``()``,
+    which means "known, and it has no measure-only role". The caller treats ``None`` as "do not
+    touch", so an unmapped visual type fails CLOSED.
+    """
+    pbir = _VT_TO_PBIR.get(visual_type)
+    if not pbir:
+        return None
+    try:
+        from .pbir_lint import MEASURE_ROLES as _mr
+    except ImportError:
+        try:
+            from pbir_lint import MEASURE_ROLES as _mr
+        except ImportError:
+            return None
+    return tuple(_mr.get(pbir) or ())
+
+
+def _unsynthesize_table_aggregations(ws):
+    """Undo a SYNTHESISED ``Sum`` when the visual can show every underlying row (#142 follow-up).
+
+    A disaggregated measure pill (``derivation='None'`` + a ``:qk`` role code -- Analysis ->
+    Aggregate Measures OFF) is rebuilt as ``Sum`` because a CHART's value role cannot hold a bare
+    column: ``powerbi-report-author validate`` reports PBIR_ROLE_KIND_MISMATCH and exits 1. That was
+    #142 and it is right for a chart.
+
+    It is WRONG for a table. ``tableEx`` has no entry in the harvested ``MEASURE_ROLES`` at all, so
+    a bare column in its ``Values`` is valid -- and listing every underlying row is exactly what
+    Tableau draws for this pill. 2.348.0 applied the aggregation unconditionally and turned 0135's
+    ``Disaggregated sales`` text table into one summed row per Sub-Category, collapsing ~10k rows.
+    Found by a parallel session's isolated A/B against a rebuilt baseline, not by any gate here.
+
+    Scoped as narrowly as the evidence supports: reverted ONLY for a visual type that is KNOWN and
+    has no measure-only role at all. ``pivotTable`` keeps the Sum (its ``Values`` IS measure-only --
+    #142's sibling case), as does every chart, and an unknown type is left alone. Only an
+    aggregation WE synthesised is touched: an authored ``SUM([Sales])`` carries no
+    ``synthesized_agg`` mark and is never altered, which is what keeps this from becoming a second
+    defect in the other direction.
+
+    Walks the ENCODINGS as well as the shelves, and that is the whole reason the first version of
+    this function did nothing. A Tableau text table puts its measure on the **Text/Label** marks
+    card, not on Rows or Columns, so ``ws["rows"]``/``ws["cols"]`` never contained the pill this was
+    written for -- the code was correct, ran on every build, and reverted nothing. Found by dumping
+    the IR for the one worksheet rather than by re-reading the function.
+    """
+    roles = _measure_only_roles(ws.get("visual_type"))
+    if roles is None or roles:
+        return
+    buckets = [ws.get("rows") or [], ws.get("cols") or []]
+    for v in (ws.get("encodings") or {}).values():
+        buckets.append(v if isinstance(v, list) else ([v] if isinstance(v, dict) else []))
+    for bucket in buckets:
+        for f in bucket:
+            if isinstance(f, dict) and f.get("synthesized_agg"):
+                f["aggregation"] = None
+                f["binding"] = "column"
+                f.pop("synthesized_agg", None)
+
+
 def _build_query_state(ws, model_table, field_map, warnings):
     """Map a worksheet IR to a PBIR ``queryState`` (role -> projections)."""
     vt = ws["visual_type"]
+    _unsynthesize_table_aggregations(ws)
     used_refs = set()
 
     rows, cols = ws["rows"], ws["cols"]
