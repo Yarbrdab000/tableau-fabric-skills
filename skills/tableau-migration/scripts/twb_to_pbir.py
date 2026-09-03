@@ -10636,10 +10636,39 @@ def _data_point_colors(ws, state, vtype, model_table, field_map, warnings):
             "selector": {"data": [{"scopeId": {"Comparison": {
                 "ComparisonKind": 0,
                 "Left": left,
-                "Right": {"Literal": {"Value": _semantic_string_literal(m["value"])}}}}}]},
+                "Right": {"Literal": {"Value": _scope_member_literal(m["value"], color)}}}}}]},
         })
     fact["status"] = "emitted"
     return data_point_objects, fact
+
+
+_BOOL_MEMBER_LITERALS = {"true": "true", "false": "false"}
+
+
+def _scope_member_literal(value, color_field):
+    """The PBIR literal encoding for a ``scopeId`` comparison member, keyed on the COLUMN's type.
+
+    In PBIR literal encoding ``'x'`` denotes a **string**, so comparing a boolean column against
+    ``"'true'"`` compares it to the *string* ``true``. The comparison never matches, and Power BI
+    does not complain: it silently drops the whole colour encoding and every series falls back to
+    the theme colour (#178, render-verified by the reporter -- it does NOT crash here, and
+    ``powerbi-report-author validate`` reports 0 errors before and after, so nothing static sees it).
+
+    The engine already encodes every neighbouring literal correctly in the same file -- a bare
+    ``false`` for ``showAxisTitle``, ``1D`` for a Double, ``'Scalar'`` for a genuine string. This one
+    path simply never consulted the column type.
+
+    KEYED ON ``datatype``, NEVER ON THE VALUE. A genuine string dimension may legitimately have
+    members named ``"true"``/``"false"``, and encoding those as bare booleans would break a
+    currently-correct comparison -- the same defect in the other direction. Both conditions must
+    hold, so anything else is returned byte-identically to the previous behaviour.
+    """
+    if isinstance(color_field, dict) and \
+            (color_field.get("datatype") or "").strip().lower() == "boolean":
+        bare = _BOOL_MEMBER_LITERALS.get(str(value).strip().lower())
+        if bare is not None:
+            return bare
+    return _semantic_string_literal(value)
 
 
 # Series colours by Measure Names: when a chart colours its marks by measure identity, EACH member

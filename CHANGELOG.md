@@ -14,6 +14,53 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ### Fixed
 
+- **`tableau-migration` (skill `2.358.0` → `2.359.0`): a `dataPoint` colour comparison against a
+  BOOLEAN column emits a bare boolean literal instead of a quoted string (#178).**
+
+  In PBIR literal encoding `'x'` denotes a **string**, so `{"Literal": {"Value": "'true'"}}` is the
+  string `true`, not the boolean. Compared against a boolean column the comparison never matches —
+  and Power BI does not complain. It **silently drops the entire colour encoding** and every series
+  falls back to the theme colour.
+
+  The reporter render-verified this and corrected their own initial framing in the process, which is
+  the part worth carrying:
+
+  ```
+  crashes Desktop   no
+  errors on open    no
+  validate          0 errors, 0 warnings -- BEFORE and AFTER
+  actual effect     the whole colour channel is silently dropped
+  ```
+
+  They also ruled out the obvious alternative explanation — this is not the familiar "per-point
+  colour over an unprojected field" fallback, because the colour driver *is* projected in the Series
+  role. Nothing static sees it on either side, which is why it reached a live Desktop session.
+
+  Reproduced here on the **public Superstore sample** at 2.358.0, at the same two visual ids they
+  cite: 4 quoted-boolean literals of 825 `Literal` values across 90 `visual.json`, in two
+  `stackedAreaChart` visuals on `page-Overview`. After the fix the same build emits 4 **bare**
+  booleans and the 3 genuine quoted strings on that page are unchanged.
+
+  **The engine already knew.** Sibling literals in the *same file* are all encoded correctly — bare
+  `false` for `showAxisTitle`, `1D` for a Double, `'Scalar'` and `'#4e79a7'` for real strings. This
+  was one path (`_data_point_colors`, the `scopeId` selector) that never consulted the column type,
+  not a missing encoder. `color["datatype"]` was already available three lines above the emission
+  site.
+
+  **Keyed on `datatype`, never on the value.** A genuine string dimension may legitimately have
+  members named `"true"`/`"false"`; encoding those bare would break a comparison that works today —
+  the same defect in the other direction. Both conditions must hold, and every other case returns
+  byte-identically to the previous behaviour, so the blast radius is exactly the bug. An
+  unrecognised member on a boolean column stays quoted rather than inventing a value.
+
+  **Corpus impact measured as zero, and isolated rather than assumed.** The corpus contains no
+  boolean colour dimension (0 quoted booleans in 5,188 `Literal` values), so the shape is absent
+  rather than the defect. The `q358 → q359` differential shows 19 changed files, but that baseline
+  predates `2.357.0` landing and the 19 are that release's known blast radius. Comparing the
+  population my change can actually affect — **all 70 `scopeId` literals across 583 `visual.json`,
+  in both trees — 0 differ**, with a positive control confirming the extractor does see the bare
+  booleans in the Superstore build.
+
 - **`tableau-migration` (skill `2.357.0` → `2.358.0`): a disaggregated measure pill stays a bare
   column in a visual that lists every underlying row, instead of being summed.**
 
