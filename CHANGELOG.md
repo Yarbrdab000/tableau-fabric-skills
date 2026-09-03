@@ -12,6 +12,46 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ## [Unreleased]
 
+### Added
+
+- **`tableau-migration` (skill `2.361.0` → `2.362.0`): `build_diff.py` — compare two migration
+  output trees and report what *substantively* changed.**
+
+  Re-running a migration and diffing the outputs is a normal thing to want: after an engine upgrade,
+  when reproducing a defect, or to check that a change did what it claimed. Done naively it is close
+  to useless, because a few terms differ between any two runs for reasons that carry no information
+  — the build root embedded in each model's M `Source = ...` line (in three spellings: plain
+  Windows, POSIX, and **JSON-escaped**), `lineageTag` identity GUIDs, and wall-clock timestamps.
+
+  **It classifies; it does not hide.** Every term is counted and reported separately, so
+  `0 GUID differences` is distinguishable from `GUIDs were masked`. A differ that silently masks a
+  term makes its own blind spot invisible, and that blind spot then survives every comparison anyone
+  runs with it — not hypothetical: one differ here masked the build root from the day it was
+  written, so its corpus comparisons were always clean and the blindness only surfaced when a fresh
+  probe was written without the mask.
+
+  **Why this ships as a function rather than staying a habit.** In a single day, five independent
+  probes — written by two people who had each explicitly told the other about these terms —
+  re-implemented this normalisation and got it wrong:
+
+  ```
+  missed lineageTag + root       reported 85 changed model files for a pill-binding change
+  missed the JSON-ESCAPED root   reported 1 "unexplained" residual that looked like a defect
+  missed the output root         reported 82 files of "non-determinism" that were two dir names
+  masked the root inside one     left every FRESH probe blind
+  ```
+
+  A normalisation that lives in one tool does not protect the next tool you write.
+
+  Validated against real trees, reproducing figures derived by hand beforehand: two builds at the
+  same revision give `80 root / 4 timestamp / 0 GUID / 0 substantive`; across the 2.358.0 fix it
+  gives `26 GUID files (63 tokens)` and **exactly the 2 genuinely-changed `visual.json`**.
+
+  Usable as a gate — exit `0` clean, `1` substantive differences, `2` instrument error, so a wrong
+  path can never read as a clean run. `--strict` promotes identity-GUID churn to a failure.
+  `compare()` raises rather than returning a clean result when either tree is empty, because a
+  comparison of nothing and a comparison that found nothing print identically.
+
 ### Fixed
 
 - **`tableau-migration` (skill `2.360.0` → `2.361.0`): identity `lineageTag` GUIDs no longer churn
