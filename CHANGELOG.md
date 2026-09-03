@@ -12,6 +12,41 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ## [Unreleased]
 
+### Fixed
+
+- **`tableau-migration` (skill `2.362.0` → `2.363.0`): `build_diff.py` no longer reports a
+  relocated build as hundreds of substantive changes.**
+
+  Reported by a parallel session against the shipped `2.362.0` tool, within minutes of adopting it.
+  A byte-identical **copy** of a build read as **82 substantive differences**:
+
+  ```
+  A vs B            (both built in place)          root 80   substantive  0
+  A vs COPY-OF-B    (identical bytes, relocated)   root  0   substantive 82
+  ```
+
+  A build names the root it was **built at** inside every model's M
+  `Source = Excel.Workbook(File.Contents("<root>\data\..."))`. Copying or moving the tree does not
+  rewrite that, and the normaliser keyed on the directory **argument** rather than on the root
+  embedded in the content — so archiving a baseline, which is exactly what people do to keep one,
+  turned a clean-run tool into an 82-false-positive one, and a reader would reasonably have
+  concluded the engine had changed.
+
+  The build root is now **inferred from the artifacts**, which name it in a regular, self-
+  identifying way (`File.Contents("<root>\data\` and `"model_folder": "<root>\\pbip\\`). No
+  ceremony is required from the caller, which matters because the caller would not know they needed
+  it. `--root-a` / `--root-b` remain for a tree whose model layer was stripped, leaving nothing to
+  infer from.
+
+  **The tell was already being printed and nothing consulted it.** The `2.362.0` report showed
+  `normalised in A: root=250` beside `normalised in B: root=0`, directly above the 82 phantom
+  differences. A one-sided root match is now surfaced as an explicit warning naming the fix, and
+  the report prints the build roots used for each tree — the same "correct fact, present,
+  unconsulted" shape this module's own docstring was written about, committed inside it.
+
+  Discriminating cases pinned by tests: a relocated tree carrying a **real** change still reads as
+  substantive, so the inference cannot become a blanket excuse.
+
 ### Added
 
 - **`tableau-migration` (skill `2.361.0` → `2.362.0`): `build_diff.py` — compare two migration

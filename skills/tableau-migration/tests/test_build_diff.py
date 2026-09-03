@@ -150,8 +150,75 @@ def test_added_and_removed_are_substantive(tmp_path):
     assert set(res["substantive"]) == {"new.tmdl", "gone.tmdl"}
 
 
-# ------------------------------------------------------------------------ refusing a vacuous answer
+# ------------------------------------------------- a RELOCATED tree (copied / archived / restored)
 
+def _built_at(base, root, extra=""):
+    """A tree whose content names ``root`` as its build root, wherever it physically lives."""
+    return _tree(base, {
+        "pbip/m.SemanticModel/definition/tables/T.tmdl":
+            'partition T = m\n\tsource =\n\t\tlet\n'
+            '\t\t\tSource = Excel.Workbook(File.Contents("%s\\data\\wb.xlsx"), null, true)\n'
+            '\t\tin Source\n%s' % (root, extra),
+        "report.json": '{"model_folder": "%s\\\\pbip\\\\wb.SemanticModel"}' % root.replace("\\", "\\\\"),
+    })
+
+
+def test_infer_roots_reads_the_build_root_out_of_the_content():
+    m = 'Source = Excel.Workbook(File.Contents("C:\\build\\one\\data\\wb.xlsx"), null, true)'
+    assert B.infer_roots(m) == {"C:\\build\\one"}
+    j = '{"model_folder": "C:\\\\build\\\\two\\\\pbip\\\\wb.SemanticModel"}'
+    assert B.infer_roots(j) == {"C:\\build\\two"}
+
+
+def test_a_relocated_byte_identical_tree_is_not_substantive(tmp_path):
+    """The defect this exists to prevent, found by another session against the shipped tool.
+
+    Archiving or copying a build is a normal way to keep a baseline. The root normaliser keyed on
+    the directory ARGUMENT, not on the root embedded in the content -- so a byte-identical copy
+    read as **82 substantive differences** on the real corpus, and a reader would reasonably have
+    concluded the engine had changed. The root is now inferred from the artifacts, which name it
+    in a regular, self-identifying way, so no ceremony is required from the caller -- who would not
+    know they needed it.
+    """
+    a = _built_at(str(tmp_path / "a"), "C:\\orig\\a")
+    moved = _built_at(str(tmp_path / "moved"), "C:\\orig\\b")   # content still names its build root
+    res = B.compare(a, moved)
+    assert res["substantive"] == [], res["substantive"]
+    assert res["by_reason"]["root"], "the difference should be attributed to the build root"
+
+
+def test_a_relocated_tree_with_a_real_change_is_still_substantive(tmp_path):
+    """Inference must not become a blanket excuse -- the discriminating case for the fix."""
+    a = _built_at(str(tmp_path / "a"), "C:\\orig\\a")
+    moved = _built_at(str(tmp_path / "moved"), "C:\\orig\\b", extra="\tannotation X = 1\n")
+    res = B.compare(a, moved)
+    assert res["by_reason"]["substantive"], "a genuine change was absorbed into the root bucket"
+
+
+def test_an_explicit_root_override_is_honoured(tmp_path):
+    """For a tree whose model layer was stripped, leaving nothing to infer from."""
+    a = _tree(str(tmp_path / "a"), {"x.txt": "path C:\\orig\\a\\thing\n"})
+    b = _tree(str(tmp_path / "b"), {"x.txt": "path C:\\orig\\b\\thing\n"})
+    assert B.compare(a, b)["substantive"] == ["x.txt"]
+    res = B.compare(a, b, root_a="C:\\orig\\a", root_b="C:\\orig\\b")
+    assert res["substantive"] == []
+
+
+def test_a_one_sided_root_match_is_warned_about(tmp_path):
+    """The tell that was PRINTED beside the 82 phantom differences and never consulted.
+
+    ``root=250`` in one tree and ``root=0`` in the other is a strong signal that a tree was
+    relocated and the inference could not resolve it. Surfaced as a warning rather than left in
+    the numbers for a reader to notice.
+    """
+    a = _tree(str(tmp_path / "a"), {"x.txt": "path %s\\thing\n" % str(tmp_path / "a")})
+    b = _tree(str(tmp_path / "b"), {"x.txt": "nothing resembling a root here\n"})
+    res = B.compare(a, b)
+    assert res["warnings"], "a one-sided root match must be surfaced"
+    assert "--root-a" in res["warnings"][0]
+
+
+# ------------------------------------------------------------------------ refusing a vacuous answer
 def test_an_empty_tree_raises_rather_than_reporting_a_clean_comparison(tmp_path):
     """A comparison of nothing and a comparison that found nothing print identically.
 

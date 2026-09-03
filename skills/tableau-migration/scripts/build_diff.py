@@ -60,6 +60,33 @@ ROOT_TOKEN = "<BUILD-ROOT>"
 GUID_TOKEN = "<GUID>"
 TIMESTAMP_TOKEN = "<TIMESTAMP>"
 
+# An emitted artifact names its own build root, and does so in a regular, self-identifying way:
+# a model's M partition writes ``File.Contents("<root>\data\...")`` and the run metadata writes
+# ``"model_folder": "<root>\\pbip\\..."``. That matters because the root embedded in the CONTENT is
+# the root the tree was BUILT at, which stops being the tree's current location the moment anyone
+# copies, archives or moves it -- which is exactly what people do to keep a baseline around.
+_EMBEDDED_ROOT_RES = (
+    re.compile(r'File\.Contents\("([^"]+?)[\\/]{1,2}data[\\/]'),
+    re.compile(r'"(?:model_folder|project_folder|report_folder|pbip)"\s*:\s*"([^"]+?)[\\/]{1,2}pbip[\\/]'),
+)
+
+
+def infer_roots(text):
+    """Build roots named by the artifact's own content.
+
+    Returns a set. A tree that was built in place yields its own path; a tree that was relocated
+    yields the path it was built at, which is the one actually written into every model file.
+    Without this, comparing against an archived baseline reports every model file as a substantive
+    change -- 82 of them on a byte-identical copy, measured.
+    """
+    found = set()
+    for rx in _EMBEDDED_ROOT_RES:
+        for m in rx.finditer(text):
+            raw = m.group(1).replace("\\\\", "\\").rstrip("\\/")
+            if raw:
+                found.add(raw)
+    return found
+
 
 def root_spellings(root):
     """Every spelling of a build root that appears in an emitted artifact.
@@ -68,19 +95,28 @@ def root_spellings(root):
     Missing that one spelling is what turned a clean comparison into a single "unexplained"
     residual that looked like a real defect. Longest first, so the escaped form is consumed before
     the plain form can match half of it.
+
+    Accepts a single root or an iterable of them; the returned list is ordered longest-first across
+    all of them together, which is what makes a mixed set safe to apply in sequence.
     """
-    r = str(root).rstrip("\\/")
-    alt = r.replace("/", "\\")
-    return sorted({alt.replace("\\", "\\\\"), alt, r.replace("\\", "/")}, key=len, reverse=True)
+    roots = [root] if isinstance(root, str) else list(root or [])
+    forms = set()
+    for r in roots:
+        r = str(r).rstrip("\\/")
+        if not r:
+            continue
+        alt = r.replace("/", "\\")
+        forms.update({alt.replace("\\", "\\\\"), alt, r.replace("\\", "/")})
+    return sorted(forms, key=len, reverse=True)
 
 
 def normalize(text, root):
     """Replace the three non-substantive terms. Returns ``(text, {term: hits})``.
 
-    The hit counts are returned rather than discarded so a caller can assert a normaliser actually
-    matched. A normaliser that matches nothing has told you about its own predicate, not about the
-    data -- and it fails silently, because the un-normalised text simply compares unequal and looks
-    like a real difference.
+    ``root`` may be one path or several. The hit counts are returned rather than discarded so a
+    caller can assert a normaliser actually matched. A normaliser that matches nothing has told you
+    about its own predicate, not about the data -- and it fails silently, because the un-normalised
+    text simply compares unequal and looks like a real difference.
     """
     hits = {"root": 0, "guid": 0, "timestamp": 0}
     for form in root_spellings(root):
@@ -108,7 +144,7 @@ def _scan(root):
     return out
 
 
-def _classify(raw_a, raw_b, root_a, root_b):
+def _classify(raw_a, raw_b, roots_a, roots_b):
     """Which terms explain the difference between two files?
 
     Applies the terms CUMULATIVELY and records the first point at which the two agree, so a file is
@@ -122,9 +158,9 @@ def _classify(raw_a, raw_b, root_a, root_b):
         return "binary", {}
 
     stats = {}
-    for form in root_spellings(root_a):
+    for form in root_spellings(roots_a):
         ta = ta.replace(form, ROOT_TOKEN)
-    for form in root_spellings(root_b):
+    for form in root_spellings(roots_b):
         tb = tb.replace(form, ROOT_TOKEN)
     if ta == tb:
         return "root", stats
@@ -141,19 +177,46 @@ def _classify(raw_a, raw_b, root_a, root_b):
     return "substantive", stats
 
 
-def compare(dir_a, dir_b):
+def _roots_for(tree_dir, files, override=None):
+    """The set of build roots to normalise for one tree.
+
+    The tree's own path AND every root its content names. They differ exactly when the tree has
+    been relocated -- copied to an archive, moved, restored from a backup -- and in that case the
+    embedded root is the one written into every model file, so keying only on the directory
+    argument reports the whole model layer as changed.
+    """
+    roots = {str(tree_dir).rstrip("\\/")}
+    if override:
+        roots.add(str(override).rstrip("\\/"))
+    for raw in files.values():
+        try:
+            text = raw.decode("utf-8-sig")
+        except UnicodeDecodeError:
+            continue
+        roots |= infer_roots(text)
+    return {r for r in roots if r}
+
+
+def compare(dir_a, dir_b, root_a=None, root_b=None):
     """Compare two migration output trees.
 
     Returns a dict with ``added`` / ``removed`` / ``changed`` path lists, a ``by_reason`` breakdown
-    of the changed files, and ``normalised`` hit counts per tree. Raises ``ValueError`` when either
-    tree is empty -- a comparison of nothing and a comparison that found nothing print identically,
-    and the first is the more likely outcome of a wrong path.
+    of the changed files, ``normalised`` hit counts per tree, and the ``roots`` actually used.
+    Raises ``ValueError`` when either tree is empty -- a comparison of nothing and a comparison that
+    found nothing print identically, and the first is the more likely outcome of a wrong path.
+
+    ``root_a`` / ``root_b`` are optional explicit overrides. They are rarely needed, because the
+    build root is inferred from the artifacts themselves; the override exists for a tree whose
+    model layer was stripped, where there is nothing left to infer from.
     """
     a, b = _scan(dir_a), _scan(dir_b)
     if not a:
         raise ValueError("tree A is empty: %s" % dir_a)
     if not b:
         raise ValueError("tree B is empty: %s" % dir_b)
+
+    roots_a = _roots_for(dir_a, a, root_a)
+    roots_b = _roots_for(dir_b, b, root_b)
 
     added = sorted(set(b) - set(a))
     removed = sorted(set(a) - set(b))
@@ -164,7 +227,7 @@ def compare(dir_a, dir_b):
     for path in common:
         if a[path] == b[path]:
             continue
-        reason, stats = _classify(a[path], b[path], dir_a, dir_b)
+        reason, stats = _classify(a[path], b[path], roots_a, roots_b)
         by_reason[reason].append(path)
         guid_tokens += stats.get("guid_tokens", 0)
 
@@ -176,14 +239,26 @@ def compare(dir_a, dir_b):
 
     norm_a = {"root": 0, "guid": 0, "timestamp": 0}
     norm_b = {"root": 0, "guid": 0, "timestamp": 0}
-    for src, tree, root, acc in ((a, "a", dir_a, norm_a), (b, "b", dir_b, norm_b)):
+    for src, roots, acc in ((a, roots_a, norm_a), (b, roots_b, norm_b)):
         for raw in src.values():
             try:
-                _t, hits = normalize(raw.decode("utf-8-sig"), root)
+                _t, hits = normalize(raw.decode("utf-8-sig"), roots)
             except UnicodeDecodeError:
                 continue
             for k in acc:
                 acc[k] += hits[k]
+
+    # A tree whose root normaliser matched NOTHING while the other matched plenty is the tell for a
+    # relocated tree the inference could not resolve. Surfaced rather than left in the numbers: the
+    # earlier version printed exactly this asymmetry (root=250 vs root=0) beside 82 phantom
+    # "substantive" differences, and nothing consulted it.
+    warnings = []
+    if bool(norm_a["root"]) != bool(norm_b["root"]):
+        warnings.append(
+            "one tree's build root matched nothing (A=%d, B=%d) while the other matched. If a tree "
+            "was copied or archived, pass --root-a/--root-b with the path it was BUILT at; "
+            "otherwise its model files will read as substantive changes."
+            % (norm_a["root"], norm_b["root"]))
 
     return {
         "files_a": len(a),
@@ -194,6 +269,8 @@ def compare(dir_a, dir_b):
         "by_reason": by_reason,
         "guid_tokens_differing": guid_tokens,
         "normalised": {"a": norm_a, "b": norm_b},
+        "roots": {"a": sorted(roots_a), "b": sorted(roots_b)},
+        "warnings": warnings,
         "substantive": by_reason["substantive"] + added + removed,
     }
 
@@ -204,6 +281,10 @@ def format_report(res, show=20):
     na, nb = res["normalised"]["a"], res["normalised"]["b"]
     lines.append("normalised in A: root=%d guid=%d timestamp=%d" % (na["root"], na["guid"], na["timestamp"]))
     lines.append("normalised in B: root=%d guid=%d timestamp=%d" % (nb["root"], nb["guid"], nb["timestamp"]))
+    lines.append("build roots A: %s" % ", ".join(res["roots"]["a"]))
+    lines.append("build roots B: %s" % ", ".join(res["roots"]["b"]))
+    for w in res.get("warnings") or []:
+        lines.append("WARNING: %s" % w)
     lines.append("")
     lines.append("added   %d" % len(res["added"]))
     lines.append("removed %d" % len(res["removed"]))
@@ -240,6 +321,9 @@ def main(argv=None):
     ap.add_argument("--show", type=int, default=20, help="how many substantive paths to list")
     ap.add_argument("--strict", action="store_true",
                     help="also treat identity-GUID differences as substantive")
+    ap.add_argument("--root-a", help="the path tree A was BUILT at, if it has since been moved "
+                                     "(rarely needed -- normally inferred from the artifacts)")
+    ap.add_argument("--root-b", help="the path tree B was BUILT at, if it has since been moved")
     args = ap.parse_args(argv)
 
     for d in (args.tree_a, args.tree_b):
@@ -247,7 +331,7 @@ def main(argv=None):
             sys.stderr.write("not a directory: %s\n" % d)
             return 2
     try:
-        res = compare(args.tree_a, args.tree_b)
+        res = compare(args.tree_a, args.tree_b, root_a=args.root_a, root_b=args.root_b)
     except ValueError as exc:
         sys.stderr.write("%s\n" % exc)
         return 2
