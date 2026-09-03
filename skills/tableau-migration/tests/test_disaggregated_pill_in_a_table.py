@@ -99,6 +99,40 @@ def test_measure_only_roles_agrees_with_the_harvested_catalog():
         assert T._measure_only_roles(vt) == expected, vt
 
 
+def test_the_enums_absent_from_the_pbir_map_are_exactly_the_two_that_need_no_translation():
+    """Some internal enum values ARE already PBIR names, so they are absent from ``_VT_TO_PBIR``.
+
+    That absence makes ``_measure_only_roles`` return ``None`` -- "unknown, do not touch" -- for a
+    type that is in fact perfectly well known. Here that lands on the right answer for both, but by
+    the fail-CLOSED default rather than by consulting the catalog, so it is pinned rather than left
+    to luck:
+
+        card         MEASURE_ROLES -> ('Values',)   measure-only, so NOT reverting is correct
+        unsupported  in neither catalog             nothing to reason about, so leave it alone
+
+    If a THIRD unmapped enum ever appears and its type has no measure-only role, it would silently
+    fail to revert -- the same never-emitted-object blindness this whole area keeps producing. This
+    test fails the day that set changes, which is the only cheap way to notice.
+    """
+    unmapped = sorted(v for n, v in vars(T).items()
+                      if n.startswith("VT_") and isinstance(v, str) and v not in T._VT_TO_PBIR)
+    assert unmapped == ["card", "unsupported"], (
+        "the set of internal enums absent from _VT_TO_PBIR changed to %r; a new entry that has no "
+        "measure-only role would silently never be reverted" % (unmapped,))
+
+
+def test_a_card_never_has_its_aggregation_reverted():
+    """``card``'s ``Values`` IS measure-only, so a bare column there would be the #142 defect.
+
+    Asserted directly on behaviour rather than inferred from the map, because the map is exactly
+    what does not contain it.
+    """
+    ws, pill = _ws(T.VT_CARD)
+    T._unsynthesize_table_aggregations(ws)
+    assert pill["binding"] == "aggregation"
+    assert pill["aggregation"] == "Sum"
+
+
 # --------------------------------------------------------------------------- the revert itself
 
 def test_reverts_a_synthesised_sum_on_a_table():

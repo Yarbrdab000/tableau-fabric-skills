@@ -12,6 +12,34 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ## [Unreleased]
 
+### Added
+
+- **`tableau-migration` (skill `2.359.0` → `2.360.0`): the set of internal visual-type enums that
+  carry no PBIR translation is pinned, closing a latent blind spot in the 2.358.0 guard.**
+
+  No behaviour change — this is a test that makes an accident checkable. `_measure_only_roles`
+  translates the internal enum through `_VT_TO_PBIR` and returns `None` (fail closed) for anything
+  unmapped. But **some internal enum values already *are* PBIR names**, so they are absent from that
+  map by design and read as "unknown" despite being perfectly well known. Enumerated across all 19
+  `VT_*` constants rather than reasoned about:
+
+  ```
+  unmapped: card, unsupported          -- exactly 2 of 19
+  card         MEASURE_ROLES -> ('Values',)   measure-only, so NOT reverting is CORRECT
+  unsupported  in neither catalog             nothing to reason about
+  ```
+
+  Both land on the right answer, and that is the problem: they get there from the **fail-closed
+  default**, not from consulting the catalog. A third unmapped enum whose type has *no* measure-only
+  role would silently never be reverted — the 2.358.0 defect returning by a different route, and
+  invisible for the usual reason, since a revert that does not happen leaves no artifact to inspect.
+
+  The pin fails the day that set changes, which is the only cheap way to notice. Verified it can go
+  red by dropping `VT_TABLE` from the map.
+
+  Also pins `card` by **behaviour** rather than by the map — asserted directly, because the map is
+  precisely what does not contain it.
+
 ### Fixed
 
 - **`tableau-migration` (skill `2.358.0` → `2.359.0`): a `dataPoint` colour comparison against a
