@@ -455,7 +455,7 @@ def _twin_addressing_usages(calcs, usages):
 
 
 def _table_calc_measures(usages, resolve, known_tables, consumed_lower, base_formula_lookup=None,
-                         order_resolver=None):
+                         order_resolver=None, param_resolver=None):
     """Translate workbook table-calc *usages* into named ``_Measures`` measure rows.
 
     A table calc carries the addressing (Compute-Using partition + order) the plain measure path
@@ -491,7 +491,8 @@ def _table_calc_measures(usages, resolve, known_tables, consumed_lower, base_for
             continue
         t = translate_table_calc_usage(usage, resolve, known_tables=known_tables,
                                        base_formula_lookup=base_formula_lookup,
-                                       order_resolver=order_resolver)
+                                       order_resolver=order_resolver,
+                                       param_resolver=param_resolver)
         if t.status != "translated":
             continue
         seen.add(key)
@@ -1501,7 +1502,8 @@ def _measures_part(calcs, resolve, consumed=None, param_resolver=None, *,
     tablecalc_rows, superseded = _table_calc_measures(
         list(table_calc_usages or []) + _twin_addressing_usages(calcs, table_calc_usages),
         resolve, known_tables, consumed_lower,
-        base_formula_lookup=base_formula_lookup, order_resolver=order_resolver)
+        base_formula_lookup=base_formula_lookup, order_resolver=order_resolver,
+        param_resolver=param_resolver)
     # Force-translate UNPLACED percent-difference calcs (referenced only inside a colour rule /
     # tooltip) by inheriting a window from their placed consumer. These are emitted alongside the
     # addressed table-calc measures and likewise SUPERSEDE their addressing-less plain stub. Inert

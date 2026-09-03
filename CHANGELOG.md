@@ -14,6 +14,51 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ### Fixed
 
+- **`tableau-migration` (skill `2.363.0` → `2.364.0`): a table calculation written over a Tableau
+  parameter now translates instead of stubbing to `BLANK()`.**
+
+  Two defects, one feature. Found while asking why four visuals on a customer's Staff Capacity
+  dashboard render blank, then measuring the whole estate rather than that page.
+
+  **1 — the seam was never given the resolver.** `parameters.py` fully models a value/what-if
+  parameter: a calculated table plus a `[<Param> Value]` `SELECTEDVALUE` picker measure, and it
+  returns a `param_resolver` that *every other* translation path in `assemble_model` already
+  receives. `table_calc_to_dax` imported neither, and its own comment said "the seam parses no
+  `[Parameters].` form" — so it reported a parameter as **unmodeled** while that parameter was
+  modelled a few files away in the same emitted model. On a live instrumented build of the
+  34-workbook corpus this was **23 of 54** table-calc handoffs, the single largest cause.
+
+  **2 — both inliners MANGLED the reference.** `_inline_scope_calcs` and `_inline_calc_formula`
+  substitute at bracket level (`re.sub(r"\[([^\[\]]+)\]", ...)`), which cannot tell the NAME half
+  of a qualified `[Parameters].[X]` from an ordinary `[calc]` reference. A Tableau parameter
+  column's *formula is its current value*, so the name half was replaced by that value and
+  `[Parameters].[Start Date]` became **`[Parameters].(#2020-01-01#)`** — a reference naming no
+  parameter, which could never resolve however good the resolver was. Corpus control: **34
+  occurrences of that malformed shape before, 0 after, and zero exist in any source workbook**, so
+  the engine produced every one of them.
+
+  Both inliners needed the same guard. Fixing only the outer one moved the mangling one level down
+  and looked fixed — the translated count did not move, which is what caught it.
+
+  `param_resolver=None` remains the default on every signature, so callers that do not pass one are
+  byte-identical.
+
+  Measured over the corpus: stubbed calculations **68 → 65**, table calcs translated **10 → 13**,
+  and a structural diff of the two builds shows **1605 files in both trees, 0 added, 0 removed, 0
+  GUID churn** and exactly one changed model file — `0074_control_chart`, where `Upper` / `Lower` /
+  `Outliers` go from `BLANK()` to real addressed DAX
+  (`AVERAGEX(WINDOW(1, ABS, -1, ABS, ORDERBY('Orders$'[Order_Date], ASC)), CALCULATE(SUM(…)))`
+  ± `STDEVX.S(…)`), i.e. a working control chart. `Outliers` is a `<` comparison, which the model
+  path handles — confirming the visual-calculation compiler's standing advice that boolean logic
+  "belongs on the model measure path" was correct; it simply could not get there.
+
+  Diagnostic note for readers of `model_translation_handoff`: the `category` field is a routing
+  bucket, **not** the reason. These calcs were filed under `missing_addressing_intent` while their
+  `fallback_reason` said `unsupported function WINDOW_MAX` — and the addressing engine was not
+  involved at all.
+
+### Fixed
+
 - **`tableau-migration` (skill `2.362.0` → `2.363.0`): `build_diff.py` no longer reports a
   relocated build as hundreds of substantive changes.**
 

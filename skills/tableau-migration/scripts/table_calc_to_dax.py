@@ -616,6 +616,14 @@ def _inline_calc_formula(key, base_formula_lookup, seen):
     seen = seen | {k}
 
     def _sub(m):
+        # Same qualified-reference guard as :func:`_inline_scope_calcs`: the NAME half of
+        # ``[Parameters].[X]`` is half of one token, not a calc reference. A Tableau parameter
+        # column's "formula" IS its current value, so without this the recursion rewrites
+        # ``[Parameters].[Start Date]`` into ``[Parameters].(#2020-01-01#)`` -- a reference that
+        # names no parameter and can never resolve. Both inliners must agree, or a mangling simply
+        # moves one level down and looks fixed.
+        if _PARAM_QUALIFIER_RE.search(formula[:m.start()]):
+            return m.group(0)
         inner = _inline_calc_formula(m.group(1), base_formula_lookup, seen)
         return f"({inner})" if inner is not None else m.group(0)
 
@@ -800,6 +808,43 @@ def _translate_composite_over_base(usage, intent, resolver, *, base_formula_look
 
 
 _PARAM_REF = re.compile(r"\[Parameters\]\s*\.")
+# The parameter NAME inside a qualified reference: ``[Parameters].[Top N?]`` -> ``Top N?``. The
+# measure path resolves exactly this token (``calc_to_dax._Parser._resolve_param(parts[1])``), so
+# matching its shape here keeps one definition of "which parameter is this".
+_PARAM_NAME_RE = re.compile(r"\[Parameters\]\s*\.\s*\[([^\[\]]*)\]")
+# A ``[Parameters].`` qualifier ending exactly where the next bracketed token begins. Used to tell
+# the NAME half of a qualified parameter reference from an ordinary ``[calc]`` reference, which
+# look identical to a bracket-level regex.
+_PARAM_QUALIFIER_RE = re.compile(r"\[Parameters\]\s*\.\s*\Z")
+
+
+def _unresolved_params(formula, param_resolver):
+    """Parameter names in ``formula`` that ``param_resolver`` cannot answer.
+
+    Returns every ``[Parameters].[X]`` the resolver declines, so the caller can proceed ONLY when
+    the whole formula is modellable. Partial resolution is deliberately not attempted: leaving one
+    ``[Parameters].`` behind hands the lexer a bare ``.`` and produces a stray-character complaint
+    about a syntax error that does not exist -- the exact misdiagnosis the handoff text at the two
+    call sites was written to avoid.
+
+    With no resolver every parameter is unresolved, so both guards behave exactly as before.
+    """
+    names = _PARAM_NAME_RE.findall(formula or "")
+    # A ``[Parameters].`` that is not a plain ``[Parameters].[Name]`` (an aggregate wrapper, a
+    # malformed reference) has no name to look up -- report it so the caller still declines rather
+    # than silently treating an unnamed reference as fully resolved.
+    if _PARAM_REF.search(formula or "") and not names:
+        return ["<unnamed>"]
+    if not param_resolver:
+        return list(names)
+    out = []
+    for n in names:
+        try:
+            if param_resolver(n) is None:
+                out.append(n)
+        except Exception:
+            out.append(n)
+    return out
 
 
 def _has_table_calc_head(formula):
@@ -808,7 +853,8 @@ def _has_table_calc_head(formula):
     return any(m.group(1).upper() in _TABLE_CALCS for m in _CALL.finditer(blind))
 
 
-def _inline_scope_calcs(formula, scope_formulas, scope_addressing=None, own_addressing=None):
+def _inline_scope_calcs(formula, scope_formulas, scope_addressing=None, own_addressing=None,
+                        param_resolver=None):
     """Inline references to OTHER calc fields on the same worksheet.
 
     A table calc is routinely written over a NAMED calc (``Total([New Inbound Referrals])``). The
@@ -850,6 +896,16 @@ def _inline_scope_calcs(formula, scope_formulas, scope_addressing=None, own_addr
         return nested is not None and own_addressing is not None and nested == own_addressing
 
     def _sub(m):
+        # The NAME half of a qualified ``[Parameters].[X]`` reference is not a scope calc to
+        # inline -- it is half of one token. A Tableau parameter column carries its CURRENT VALUE
+        # as its formula (``<calculation formula='#2020-01-01#'/>``), so inlining it here rewrote
+        # ``[Parameters].[Start Date]`` into ``[Parameters].(#2020-01-01#)``: a reference no longer
+        # naming any parameter, which then failed the parameter guard as "unmodeled" and, left to
+        # the lexer, would blame a stray ``.``. Measured on the corpus, this mangling accounted for
+        # every remaining declined parameter reference -- 34 occurrences, and ZERO of that shape
+        # exist in any source workbook, so the engine produced all of them.
+        if _PARAM_QUALIFIER_RE.search(formula[:m.start()]):
+            return m.group(0)
         inner = _inline_calc_formula(m.group(1), lookup, set())
         if inner is None:
             return m.group(0)           # a raw field / parameter -- leave verbatim
@@ -857,8 +913,12 @@ def _inline_scope_calcs(formula, scope_formulas, scope_addressing=None, own_addr
             stacked.append(m.group(1))
             return m.group(0)
         if _PARAM_REF.search(inner):
-            parameterised.append(m.group(1))
-            return m.group(0)
+            # Only decline when the parameter is genuinely unmodeled. With a ``param_resolver`` the
+            # inlined body resolves to the ``[<Param> Value]`` picker measure downstream, so the
+            # expansion is safe and the reference is not "unmodeled" at all.
+            if _unresolved_params(inner, param_resolver):
+                parameterised.append(m.group(1))
+                return m.group(0)
         # The NEWLINE before the closing paren is load-bearing. A Tableau formula may end with a
         # ``//`` line comment (authors routinely leave a commented-out branch at the end), and
         # splicing that inline would comment out whatever the CALLER wrote after the reference --
@@ -879,7 +939,8 @@ def _inline_scope_calcs(formula, scope_formulas, scope_addressing=None, own_addr
 
 
 def translate_table_calc_usage(usage, resolver, known_tables=None,
-                               base_formula_lookup=None, order_resolver=None) -> TableCalcTranslation:
+                               base_formula_lookup=None, order_resolver=None,
+                               param_resolver=None) -> TableCalcTranslation:
     """Map one :class:`TableCalcUsage` to faithful DAX or a structured Tier-1 handoff.
 
     ``resolver(caption) -> (table, column, type) | None`` is the same field resolver the rest of
@@ -892,6 +953,11 @@ def translate_table_calc_usage(usage, resolver, known_tables=None,
     date axis -> the marked-calendar key ``Date[Date]`` on a related Date dimension); it only
     affects the addressing sort, never the inner aggregate or partition, and defaults to None for
     byte-identical output.
+    ``param_resolver`` (``name -> "[Measure]" | (ref, dtype) | None``) is the SAME resolver the
+    measure path already receives (``emit_value_parameters``'s), threaded so a table calc over a
+    Tableau parameter resolves it to the ``[<Param> Value]`` picker measure emitted into this same
+    model. ``None`` (the default, and every caller that does not pass one) keeps both parameter
+    guards declining exactly as before, so output is byte-identical.
     """
     intent = _intent_for(usage)
 
@@ -938,14 +1004,22 @@ def translate_table_calc_usage(usage, resolver, known_tables=None,
         formula, reason = _inline_scope_calcs(
             formula, getattr(usage, "scope_formulas", None),
             scope_addressing=getattr(usage, "scope_addressing", None),
-            own_addressing=getattr(usage, "ordering_type", None))
+            own_addressing=getattr(usage, "ordering_type", None),
+            param_resolver=param_resolver)
         if formula is None:
             return _handoff(usage, intent, reason)
         # A parameter reference the table-calc seam cannot model: report it as the parameter
         # reference it is. The seam parses no ``[Parameters].`` form, so left alone the lexer trips
         # on the ``.`` and blames a stray character -- a reason that sends a reader hunting for a
         # syntax error that does not exist. Mirrors the identical guard on the INLINED path.
-        if _PARAM_REF.search(formula):
+        #
+        # With a ``param_resolver`` the seam CAN read it: the parameter resolves to the
+        # ``[<Param> Value]`` picker measure ``emit_value_parameters`` already emits into this same
+        # model, which is what the measure path has always done. Measured on the 34-workbook corpus,
+        # this reason was 23 of 54 table-calc handoffs -- the single largest cause -- for parameters
+        # that were modeled a few files away. Still declines when the resolver cannot answer, so an
+        # unmodeled parameter keeps its truthful reason instead of a stray-character complaint.
+        if _unresolved_params(formula, param_resolver):
             return _handoff(usage, intent,
                             "formula uses an unmodeled parameter reference ([Parameters]. ...): a "
                             "table calc's addressing seam cannot read a slicer selection")
@@ -960,7 +1034,8 @@ def translate_table_calc_usage(usage, resolver, known_tables=None,
     # 4) hand the synthesized formula + explicit addressing to the trusted window seam.
     dax, seam_reason, _tables = translate_tableau_table_calc_to_dax(
         formula, resolver, partition_by=partition_by, order_by=order_by,
-        known_tables=known_tables, order_resolver=order_resolver)
+        known_tables=known_tables, order_resolver=order_resolver,
+        param_resolver=param_resolver)
     if dax is None:
         return _handoff(usage, intent, f"window seam fallback: {seam_reason}")
     return TableCalcTranslation(
@@ -970,8 +1045,10 @@ def translate_table_calc_usage(usage, resolver, known_tables=None,
 
 
 def translate_table_calc_usages(usages, resolver, known_tables=None,
-                                base_formula_lookup=None, order_resolver=None) -> List[TableCalcTranslation]:
+                                base_formula_lookup=None, order_resolver=None,
+                                param_resolver=None) -> List[TableCalcTranslation]:
     """Batch :func:`translate_table_calc_usage` over an iterable of usages."""
     return [translate_table_calc_usage(u, resolver, known_tables=known_tables,
                                        base_formula_lookup=base_formula_lookup,
-                                       order_resolver=order_resolver) for u in usages]
+                                       order_resolver=order_resolver,
+                                       param_resolver=param_resolver) for u in usages]

@@ -3533,7 +3533,8 @@ def _emit_table_calc(name, p, spec):
 
 
 def translate_tableau_table_calc_to_dax(formula, resolver, partition_by=(), order_by=(),
-                                        known_tables=None, order_resolver=None):
+                                        known_tables=None, order_resolver=None,
+                                        param_resolver=None):
     """Translate a Tableau TABLE CALCULATION to a modern-DAX window-function measure.
 
     Same (dax|None, reason, tables_used) shape as the other entry points, plus the explicit
@@ -3541,6 +3542,12 @@ def translate_tableau_table_calc_to_dax(formula, resolver, partition_by=(), orde
     iterable of field captions (Tableau's Compute-Using partition) and ``order_by`` is an
     iterable of captions or ``(caption, "ASC"|"DESC")`` pairs (the addressing sort). An order
     spec is REQUIRED; without one the calc falls back.
+
+    ``param_resolver`` (name -> "[Measure]" | (ref, dtype) | None) | None: the SAME resolver the
+    measure path already receives, threaded here so a table calc written over a Tableau parameter
+    (``WINDOW_MAX([Parameters].[Top N?])``) resolves it to the ``[<Param> Value]`` picker measure
+    ``emit_value_parameters`` emits alongside. ``None`` (the historical default, and every caller
+    that does not pass one) leaves the parameter unmodeled and keeps output byte-identical.
 
     Supported (the inner expression is translated in measure context, so it must be an
     aggregation):
@@ -3619,6 +3626,7 @@ def translate_tableau_table_calc_to_dax(formula, resolver, partition_by=(), orde
             return _cache["rank"]
 
         p = _Parser(toks, resolver, tables_used, mode="measure", known_tables=known_tables,
+                    param_resolver=param_resolver,
                     tablecalc={"spec": _spec, "rank_refs": _rank_refs})
         result = p._expr()
         if p.pos != len(toks):
