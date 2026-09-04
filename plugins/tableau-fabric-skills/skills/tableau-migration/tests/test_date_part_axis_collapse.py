@@ -121,16 +121,22 @@ def test_the_fold_is_disclosed_to_the_reader():
 def test_the_disclosure_names_the_LABEL_change_too():
     """The numbers become right and the axis labels become DIFFERENT -- both are the reader's news.
 
-    Tableau draws a two-tier discrete header (``2013`` over ``Jan``); a scalar date column renders
-    one tier of formatted dates (``Jan 2013``). A reader comparing side by side sees that
-    immediately, so it belongs on the surface they are standing at rather than only in a commit
-    message they will never open.
+    Tableau draws a two-tier discrete header (``2013`` over ``January``); the folded axis renders
+    one tier (``Jan 2013``). A reader comparing side by side sees that immediately, so it belongs
+    on the surface they are standing at rather than only in a commit message.
+
+    The disclosure also names the MECHANISM, because the obvious inference is wrong: ``Month Start``
+    carries ``formatString: Short Date``, which predicts ``1/1/2013``. No ``axisType`` is emitted,
+    so Power BI defaults a dateTime Category to a CONTINUOUS date axis and labels it with its own
+    granularity instead. Verified at the render on all three visual types (clusteredColumnChart,
+    lineChart, clusteredBarChart) -- reading the TMDL alone would have predicted the wrong string.
     """
     warnings = []
     T._collapse_date_part_axis([_part("Year"), _part("Month")], warnings, "Challenge")
     text = str(warnings[0])
     assert "LABELS" in text
     assert "Jan 2013" in text
+    assert "Short Date" in text, "the misleading column format must be named, not just the outcome"
 
 
 # ------------------------------------------------------------------- it declines (the substance)

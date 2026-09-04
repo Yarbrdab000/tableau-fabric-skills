@@ -14,6 +14,47 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ### Fixed
 
+- **`tableau-migration` (skill `2.367.0` → `2.368.0`): the date-axis fold's label disclosure now names
+  the MECHANISM, because the obvious inference from the TMDL predicts the wrong string (#191).**
+
+  `2.367.0` disclosed that folding a Year/Month part pair onto `Date[Month Start]` changes the axis
+  labels, and said they render as `Jan 2013`. That was right, and it was **unfalsifiable from the
+  artifact a reader would reach for**: the shared `Month Start` column carries
+
+  ```
+  column 'Month Start' = DATE(YEAR('Date'[Date]), MONTH('Date'[Date]), 1)
+      dataType: dateTime
+      formatString: Short Date        <- 17 emitted Date.tmdl files carry this
+  ```
+
+  which predicts `1/1/2013`. A reviewer reading the TMDL derived exactly that and proposed correcting
+  the entry to say so. The render disagrees, on all three visual types the fold touches:
+
+  ```
+  0070 clusteredColumnChart   Jan 2010  Jul 2010  Jan 2011  Jul 2011 ...
+  0077 lineChart              Jan 2010  Jul 2010  Jan 2011  Jul 2011 ...
+  0134 clusteredBarChart      Jan 2023  Apr 2023  Jul 2023  Oct 2023
+  ```
+
+  **The mechanism, which is the part worth recording:** no `axisType` is emitted, so Power BI defaults
+  a `dateTime` Category to a **continuous date axis**, which labels by its own range- and width-aware
+  granularity and never consults the column's format string. So the rendered result already lands
+  close to the source (`Jan 2013` against Tableau's `2013 / January`) and needs no visual-level format
+  override — but it is a property of the **axis**, not of the column.
+
+  Both the CHANGELOG and the per-visual warning now say so explicitly, and the warning names
+  `Short Date` as the thing *not* in play. A reader who checks the column and a reader who checks the
+  render now reach the same answer instead of opposite ones.
+
+  **Emitted `visual.json` is byte-identical** — verified by rebuilding the three affected workbooks
+  and comparing all 15 against `2.367.0`'s output: 15 identical, 0 differing, 0 missing. Only the
+  warning text in `report.json` / `summary.md` moves. A positive control confirms the new assertion
+  fails on its own named test when the mechanism sentence is removed.
+
+  **Do not "fix" the underlying appearance by changing `Month Start`'s `formatString`** — 17 emitted
+  models carry that column and the continuous-truncation path binds it too, so it is a far wider blast
+  radius than either this release or `2.367.0` measured.
+
 - **`tableau-migration` (skill `2.366.0` → `2.367.0`): several date PARTS of one date sharing an
   axis no longer collapse to a drill hierarchy that sums across the level beneath (#191).**
 

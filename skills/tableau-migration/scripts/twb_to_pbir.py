@@ -570,8 +570,9 @@ def _collapse_date_part_axis(fields, warnings=None, worksheet=None):
             "HIERARCHY -- every top-level bar would SUM the levels beneath it. The parts are folded "
             "onto the calendar's %r column, which is in exact one-to-one correspondence with those "
             "combinations, so the mark grain and the chronological order are both preserved. The "
-            "axis LABELS do change: Tableau's two-tier discrete header (e.g. '2013' over 'Jan') "
-            "becomes one tier of formatted dates (e.g. 'Jan 2013')"
+            "axis LABELS do change: Tableau's two-tier discrete header (e.g. '2013' over "
+            "'January') becomes one tier of dates (e.g. 'Jan 2013'). That is Power BI's own "
+            "continuous date-axis formatting, NOT this column's Short Date format string"
             % (len(parts), ", ".join(p for p in _DATE_PART_AXIS_CHAIN if p in present),
                rep.get("caption") or rep.get("field_id") or "the date", column)))
     return [collapsed]
