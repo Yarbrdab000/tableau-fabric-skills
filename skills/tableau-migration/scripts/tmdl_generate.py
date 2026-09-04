@@ -1077,6 +1077,190 @@ def _parse_bin_object(col, calc):
     }
 
 
+# -- Tableau SETS --------------------------------------------------------------------------------
+#
+# A Tableau *set* is a named, reusable membership test over one dimension. It is serialised as a
+# ``<group name='[Set 1]'>`` holding a nested ``<groupfilter>`` tree -- NOT a ``<column>``, so
+# ``extract_calcs`` skips it (it has no ``formula``) and every reference to it fails field
+# resolution. Measured on the corpus, that is not theoretical: ``0078_top_n_and_other`` uses one
+# inside a calculation --
+#
+#     IF [Set 1] THEN [Customer Name] ELSE ... "Other" END
+#
+# -- and the whole column stubbed to ``BLANK()`` with ``unresolved/ambiguous field [Set 1]``, in the
+# workbook whose entire subject is that idiom.
+#
+# The fix is to give the set a home the rest of the pipeline already understands: emit it as a
+# BOOLEAN calculated column named after the set. Nothing in the calc translator needs to change --
+# ``[Set 1]`` then resolves like any other column, and ``IF [Set 1] THEN ...`` translates itself.
+#
+# Scope is deliberately narrow and fail-CLOSED. Only a Top-N set whose ordering expression is a
+# SIMPLE aggregate over a single field, and whose count resolves to an integer, is emitted. Anything
+# else returns a reason and is disclosed rather than guessed at -- a wrong membership test is worse
+# than an unresolved one, because it renders a plausible chart.
+_SET_AGG_RE = re.compile(
+    r"^\s*(SUM|AVG|MIN|MAX|COUNT|COUNTD)\s*\(\s*\[([^\]]+)\]\s*\)\s*$", re.I)
+
+_SET_AGG_DAX = {"SUM": "SUM", "AVG": "AVERAGE", "MIN": "MIN", "MAX": "MAX",
+                "COUNT": "COUNT", "COUNTD": "DISTINCTCOUNT"}
+
+
+def _parse_set_object(group):
+    """Parse a ``<group>`` set definition into a raw dict, or ``None`` when it is not a set.
+
+    Mirrors :func:`_parse_group_object`. ``auto`` marks Tableau's own dashboard machinery --
+    ``Action (...)`` / ``Tooltip (...)`` / ``Highlight (...)`` -- which is generated for dashboard
+    actions rather than authored, and is correctly NOT translated: those are Power BI's native
+    cross-filtering, not a model object. Measured: 33 of 65 groups in the corpus are these.
+    """
+    raw = (group.get("name") or "").strip()
+    name = raw.strip("[]")
+    if not name:
+        return None
+    gfs = list(_iter_local(group, "groupfilter"))
+    if not gfs:
+        return None
+    funcs = [gf.get("function") for gf in gfs]
+    kind = None
+    for fn, label in (("end", "top-n"), ("range", "range"),
+                      ("crossjoin", "crossjoin"), ("union", "member-list"),
+                      ("member", "member-list")):
+        if fn in funcs:
+            kind = label
+            break
+    detail = {}
+    level = None
+    for gf in gfs:
+        if gf.get("level") and level is None:
+            level = gf.get("level")
+        for attr in ("from", "to", "count", "units", "end", "direction", "expression"):
+            if gf.get(attr) is not None and attr not in detail:
+                detail[attr] = gf.get(attr)
+    return {
+        "name": name,
+        "caption": (group.get("caption") or "").strip() or name,
+        "kind": kind or "other",
+        "level": _field_token(level) if level else None,
+        "auto": bool(re.match(r"^(?:Action|Tooltip|Highlight)\s*\(", name)),
+        "detail": detail,
+    }
+
+
+def _set_count_value(raw, parameters):
+    """The integer N for a Top-N set, or ``(None, reason)``.
+
+    Tableau commonly drives N from a parameter (all 3 referenced Top-N sets in the corpus do). A
+    Power BI CALCULATED COLUMN is evaluated at refresh and **cannot** depend on a slicer selection,
+    so an interactive parameter cannot stay interactive here. The honest deterministic choice is the
+    parameter's CURRENT value, disclosed -- not a silent default, and not a refusal that loses the
+    whole calc.
+    """
+    s = str(raw or "").strip()
+    if not s:
+        return None, "the set has no count"
+    if s.lstrip("-").isdigit():
+        return int(s), None
+    m = re.match(r"^\[Parameters?\]\.\[([^\]]+)\]$", s)
+    if not m:
+        return None, "count is not a literal or a parameter reference: %s" % s
+    want = m.group(1).strip().lower()
+    for p in parameters or []:
+        if not isinstance(p, dict):
+            continue
+        names = {str(p.get(k) or "").strip().strip("[]").lower()
+                 for k in ("internal", "internal_name", "name", "caption")}
+        if want in names:
+            for k in ("current_value", "value", "default", "current"):
+                v = p.get(k)
+                if v is None:
+                    continue
+                try:
+                    return int(float(str(v).strip().strip('"'))), None
+                except (TypeError, ValueError):
+                    continue
+            return None, "parameter '%s' has no usable current value" % m.group(1)
+    return None, "parameter '%s' not found" % m.group(1)
+
+
+def resolve_set_object(s, resolve, parameters=None):
+    """Resolve a parsed set into ``(table, calc-column TMDL)`` or ``(None, {"name", "reason"})``.
+
+    Emits a BOOLEAN column: ``TRUE`` for members of the set, ``FALSE`` otherwise -- which is exactly
+    what ``IF [Set 1] THEN ...`` expects, so the existing calc translator needs no change.
+
+    The DAX uses ``RANKX`` with an explicit value argument rather than relying on the calculated
+    column's row context, and computes that value with ``ALLEXCEPT`` on the ranked column. Both are
+    deliberate: a bare ``RANKX(ALL(...), <expr>)`` in a calculated column ranks the wrong thing when
+    the table has repeated rows per member, which is the normal case for a fact table.
+    """
+    name = s.get("name")
+    if s.get("auto"):
+        return None, {"name": name, "reason": "dashboard action/tooltip machinery, not an authored set"}
+    if s.get("kind") != "top-n":
+        return None, {"name": name,
+                      "reason": "only Top-N sets are translated so far (this is '%s')" % s.get("kind")}
+    level = s.get("level")
+    if not level:
+        return None, {"name": name, "reason": "the set names no dimension"}
+    placed = resolve(level)
+    if not placed:
+        return None, {"name": name, "reason": "could not resolve the set's dimension '%s'" % level}
+    table, column = placed[0], placed[1]
+
+    d = s.get("detail") or {}
+    m = _SET_AGG_RE.match(str(d.get("expression") or ""))
+    if not m:
+        return None, {"name": name,
+                      "reason": "ordering expression is not a simple aggregate: %s"
+                                % (d.get("expression") or "(none)")}
+    agg_dax = _SET_AGG_DAX[m.group(1).upper()]
+    measure_field = m.group(2).strip()
+    placed_measure = resolve(measure_field)
+    if not placed_measure:
+        return None, {"name": name,
+                      "reason": "could not resolve the ordering field '%s'" % measure_field}
+    if placed_measure[0] != table:
+        return None, {"name": name,
+                      "reason": "the set's dimension and ordering field are on different tables "
+                                "(%s vs %s)" % (table, placed_measure[0])}
+    n, why = _set_count_value(d.get("count"), parameters)
+    if n is None:
+        return None, {"name": name, "reason": why}
+    if n <= 0:
+        return None, {"name": name, "reason": "count is not positive: %s" % n}
+
+    end = (d.get("end") or "top").strip().lower()
+    direction = (d.get("direction") or "DESC").strip().upper()
+    if direction not in ("ASC", "DESC"):
+        direction = "DESC"
+    # "bottom N" is the same rank test with the order flipped.
+    if end == "bottom":
+        direction = "ASC" if direction == "DESC" else "DESC"
+
+    t, c, mcol = q(table), q(column), q(placed_measure[1])
+    agg = "%s(%s[%s])" % (agg_dax, t, mcol)
+    dax = (
+        "\n\t\t\tVAR __self = CALCULATE(%s, ALLEXCEPT(%s, %s[%s]))"
+        "\n\t\t\tVAR __rank = RANKX(ALL(%s[%s]), CALCULATE(%s), __self, %s)"
+        "\n\t\t\tRETURN __rank <= %d" % (agg, t, t, c, t, c, agg, direction, n)
+    )
+    block = (
+        "\tcolumn %s = %s\n"
+        "\t\tdataType: boolean\n"
+        "\t\tlineageTag: %s\n"
+        "\t\tsummarizeBy: none\n"
+        "\t\tannotation TableauSet = %s\n"
+        "\t\tannotation TranslatedBy = deterministic\n"
+        % (q(name), dax, uuid.uuid4(),
+           " ".join(("%s %s %d by %s %s" % (end, d.get("units") or "records", n,
+                                            direction, d.get("expression"))).split()))
+    )
+    return (table, block), {"name": name, "table": table, "column": column,
+                            "n": n, "end": end, "direction": direction,
+                            "count_source": ("literal" if str(d.get("count") or "").strip().lstrip("-").isdigit()
+                                             else "parameter current value (%s)" % d.get("count"))}
+
+
 def parse_model_objects(tds_text):
     """Parse hierarchies, display folders, and user filters out of a Tableau ``.tds``.
 
@@ -1096,7 +1280,7 @@ def parse_model_objects(tds_text):
     ``<filter>`` references it (an enforced row filter) and ``unwired`` otherwise.
     """
     empty = {"hierarchies": [], "display_folders": {}, "field_index": {},
-             "user_filters": {"wired": [], "unwired": []}, "groups": [], "bins": []}
+             "user_filters": {"wired": [], "unwired": []}, "groups": [], "bins": [], "sets": []}
     try:
         root = ET.fromstring(tds_text)
     except ET.ParseError:
@@ -1151,10 +1335,26 @@ def parse_model_objects(tds_text):
     wired = [c for c in user_calcs if c["internal"] in wired_cols]
     unwired = [c for c in user_calcs if c["internal"] not in wired_cols]
 
+    # Sets are <group> elements at datasource level, not <column>s, so they are collected here
+    # rather than in the column loop above. Only sets REFERENCED somewhere are worth emitting -- a
+    # workbook can define many and use none (measured: 25 of 28 authored Top-N sets in the corpus
+    # are never referenced), and emitting an unused boolean column per set would add noise to every
+    # model for no fidelity gain.
+    sets = []
+    for group in _iter_local(root, "group"):
+        s = _parse_set_object(group)
+        if not s or s["auto"]:
+            continue
+        token = "[%s]" % s["name"]
+        # The definition itself contains the name once; anything beyond that is a real usage.
+        if tds_text.count(token) <= 1:
+            continue
+        sets.append(s)
+
     return {"hierarchies": hierarchies, "display_folders": folders,
             "field_index": field_index,
             "user_filters": {"wired": wired, "unwired": unwired},
-            "groups": groups, "bins": bins}
+            "groups": groups, "bins": bins, "sets": sets}
 
 
 # -- RLS DAX translation -------------------------------------------------------
@@ -1568,6 +1768,35 @@ def resolve_model_objects(parsed, resolve_field, *, calcs=None, data_tables=None
         else:
             bins_report["skipped"].append({"name": entry["name"], "reason": entry["reason"]})
 
+    sets_report = {"emitted": [], "skipped": [], "notes": []}
+    for s in (parsed.get("sets") or []):
+        placement, entry = resolve_set_object(s, resolve_field, parameters)
+        if placement is not None:
+            _key = (placement[0], (entry.get("name") or "").casefold())
+            if _key in seen_calc_cols:
+                sets_report["notes"].append(
+                    {"name": entry.get("name"),
+                     "note": "duplicate column name collapsed (already emitted on this table)"})
+                continue
+            seen_calc_cols.add(_key)
+            calc_columns.setdefault(placement[0], []).append(placement[1])
+            # The count source is disclosed, never assumed: a Power BI calculated column is
+            # evaluated at REFRESH, so a Tableau parameter driving N cannot stay interactive. The
+            # emitted set is fixed at that parameter's current value, and a reader has to be told.
+            sets_report["emitted"].append(
+                {"name": entry["name"], "table": entry["table"], "on": entry["column"],
+                 "n": entry["n"], "end": entry["end"], "direction": entry["direction"],
+                 "count_source": entry["count_source"]})
+            if entry["count_source"].startswith("parameter"):
+                sets_report["notes"].append(
+                    {"name": entry["name"],
+                     "note": "N is fixed at the parameter's CURRENT value (%d). A Power BI "
+                             "calculated column is evaluated at refresh, so it cannot follow an "
+                             "interactive parameter; changing the parameter in the report will not "
+                             "re-rank this set." % entry["n"]})
+        else:
+            sets_report["skipped"].append({"name": entry["name"], "reason": entry["reason"]})
+
     return {
         "display_folders": resolved_folders,
         "hierarchies": resolved_hier,
@@ -1577,7 +1806,8 @@ def resolve_model_objects(parsed, resolve_field, *, calcs=None, data_tables=None
                    "hierarchies": hier_report,
                    "rls": rls_report,
                    "groups": groups_report,
-                   "bins": bins_report},
+                   "bins": bins_report,
+                   "sets": sets_report},
     }
 
 

@@ -12,6 +12,68 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ## [Unreleased]
 
+### Added
+
+- **`tableau-migration` (skill `2.364.0` → `2.365.0`): a Tableau SET is rebuilt as a boolean model
+  column instead of being an unresolvable reference.**
+
+  A set is a named, reusable membership test over one dimension, serialised as a `<group>` holding a
+  nested `<groupfilter>` tree. It is **not** a `<column>` and carries no `formula`, so
+  `extract_calcs` skips it by design and every reference to it fails field resolution. Measured, in
+  the workbook whose entire subject is the idiom:
+
+  ```
+  0078_top_n_and_other   column Names = BLANK()
+    annotation TableauFormula = IF [Set 1] THEN [Customer Name] ELSE ... "Other" END
+    fallback_reason        unresolved/ambiguous field [Set 1]
+  ```
+
+  A Top-N set now emits as a boolean calculated column, which makes it a usable Power BI model
+  object — sliceable, filterable, referenceable in DAX:
+
+  ```
+  column 'Set 1' =
+      VAR __self = CALCULATE(AVERAGE('Orders$'[Sales]), ALLEXCEPT('Orders$','Orders$'[Customer_Name]))
+      VAR __rank = RANKX(ALL('Orders$'[Customer_Name]), CALCULATE(AVERAGE('Orders$'[Sales])), __self, DESC)
+      RETURN __rank <= 10
+    dataType: boolean
+    annotation TableauSet = top records 10 by DESC AVG([Sales])
+  ```
+
+  `RANKX` takes an **explicit value argument** and computes it with `ALLEXCEPT`. Both are
+  load-bearing on a fact table, which has many rows per member: a bare `RANKX(ALL(T[Col]), <expr>)`
+  in a calculated column ranks the row's own context rather than the member's aggregate, and would
+  produce a silently wrong membership test — worse than not translating, because it renders a
+  plausible chart.
+
+  **What this does NOT do, stated because the headline case is still open.** It does not make the
+  calc translator resolve `[Set 1]`, so `Names` above still stubs. That resolver is built from the
+  descriptor's physical columns, and registering a synthetic column there also feeds the M query
+  that selects from the source — a real risk of trading a `BLANK()` column for a broken partition.
+  Tracked as a separate issue rather than claimed here.
+
+  **Scope is fail-closed.** Only a Top-N set whose ordering expression is a simple aggregate over a
+  single field and whose count resolves to an integer is emitted; a complex expression, an
+  unresolvable dimension, a cross-table pair, or an unknown parameter each return a reason and are
+  disclosed rather than guessed at.
+
+  **Two population facts drive the gating**, both measured across the 34-workbook corpus:
+
+  ```
+  65 groups   33 are Tableau's own dashboard Action/Tooltip/Highlight machinery
+                 -- correctly NOT translated; that is Power BI's native cross-filtering,
+                    not a model object
+  32 authored 28 Top-N, and only 3 are REFERENCED anywhere at all
+  ```
+
+  So emission is gated on the set being referenced beyond its own definition — otherwise every
+  model would gain a boolean column per unused set for no fidelity gain.
+
+  **The count source is disclosed, never assumed.** All 3 referenced Top-N sets drive N from a
+  Tableau parameter. A Power BI calculated column is evaluated at **refresh**, so it cannot follow
+  an interactive parameter; the set is fixed at that parameter's current value and the report says
+  so explicitly, rather than leaving a reader to discover that changing the parameter does nothing.
+
 ### Fixed
 
 - **`tableau-migration` (skill `2.363.0` → `2.364.0`): a table calculation written over a Tableau
