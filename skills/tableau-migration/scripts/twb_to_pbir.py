@@ -482,6 +482,100 @@ _DATE_TRUNC_SCALAR_COLUMNS = {
     "Day": None,
 }
 
+# Tableau draws ONE MARK PER COMBINATION when several date PARTS of the same date share an axis:
+# ``cols=([yr:Order Date:ok] / [mn:Order Date:ok])`` is a nested Year/Month axis with one bar per
+# month-in-year. Power BI renders a multi-field Category role as a DRILL HIERARCHY showing only its
+# TOP level, so each Year bar silently SUMS its twelve months -- 48 marks collapse to 4 and every
+# number on the chart is wrong (issue #191). Nothing is mis-resolved: both projections are valid and
+# correctly bound, the visual validates clean and renders a full plausible chart. That is precisely
+# why no static gate sees it -- what is wrong is how many marks Power BI CHOOSES TO DRAW, which is a
+# rendering-time behaviour of the hierarchy rather than a property of the file.
+#
+# The repair reuses the binding the CONTINUOUS-truncation path already emits, rather than inventing
+# one. A (Year, Month) part PAIR and ``Date[Month Start]`` are in EXACT BIJECTION -- the distinct
+# (YEAR(d), MONTH(d)) pairs and the distinct DATE(YEAR(d), MONTH(d), 1) values are the same set --
+# so a single scalar grain column carries the IDENTICAL mark grain in ONE projection, which has no
+# hierarchy left to collapse. It also SORTS: ``Month Start`` is a real date, where ``Date[Month]`` is
+# the text "Jan" ordered by a sortByColumn that a drill level does not carry onto the axis.
+#
+# Deliberately narrow, and the narrowness is the whole point. It fires only for a part chain ROOTED
+# AT YEAR, because only then does the combination determine a period:
+#
+#   * ``{Quarter, Month}`` with NO Year pools every January across all years. That renders as a
+#     perfectly plausible SEASONAL chart -- a WORSE wrong number than the rollup it would replace,
+#     because a reader cannot see it -- so it declines and keeps today's behaviour.
+#   * ``{Year, Day}`` is (year, day-of-month); it names no period at all. Declines.
+#   * Two DIFFERENT source dates (``YEAR(Order Date)`` x ``MONTH(Ship Date)``) is a genuine
+#     two-dimension cross-product axis, where the bijection does not hold. Declines.
+#
+# This does NOT address the other shape in #191 -- a nested TAXONOMY (Product_Category /
+# Product_Sub-Category, Region / Order_ID). Those have no period grain to fold onto, so they need a
+# different remedy and are deliberately left untouched here.
+_DATE_PART_AXIS_CHAIN = ("Year", "Quarter", "Month", "Day")
+_DATE_PART_AXIS_GRAIN = {
+    ("Year", "Quarter"): "Quarter",
+    ("Year", "Month"): "Month",
+    ("Year", "Quarter", "Month"): "Month",
+    ("Year", "Month", "Day"): "Day",
+    ("Year", "Quarter", "Month", "Day"): "Day",
+}
+
+
+def _collapse_date_part_axis(fields, warnings=None, worksheet=None):
+    """Several date PARTS of ONE date sharing an axis -> the single scalar grain column.
+
+    Returns ``fields`` UNCHANGED unless every member of the list is a rebound date part of the same
+    source date field and the part set names a period grain (see ``_DATE_PART_AXIS_GRAIN``).
+    Fail-closed by construction: every early return preserves today's behaviour byte-for-byte, so a
+    shape this cannot prove equivalent is never rewritten on a guess.
+
+    Requires ``date_part`` -- stamped only where the pill was actually rebound onto the model's
+    marked Date table. An UNBOUND date part still names the fact's own raw column, where no grain
+    column exists to fold onto, so the model-unbound first pass declines here and is unaffected.
+    """
+    if len(fields) < 2:
+        return fields
+    # EVERY field must be a date part: a Year/Month pair sharing the axis with, say, Region is a
+    # genuine three-dimension axis and folding only the dates would change the mark grain.
+    parts = [f for f in fields if f.get("date_part")]
+    if len(parts) < 2 or len(parts) != len(fields):
+        return fields
+    if len({(f.get("datasource"), f.get("field_id")) for f in parts}) != 1:
+        return fields
+    if len({f.get("entity") for f in parts}) != 1:
+        return fields
+    present = {f["date_part"] for f in parts}
+    if not present.issubset(set(_DATE_PART_AXIS_CHAIN)):
+        return fields
+    grain = _DATE_PART_AXIS_GRAIN.get(
+        tuple(p for p in _DATE_PART_AXIS_CHAIN if p in present))
+    if grain is None:
+        return fields
+    finest = next(f for f in reversed(_DATE_PART_AXIS_CHAIN) if f in present)
+    rep = next(f for f in parts if f["date_part"] == finest)
+    # Day grain IS the marked key column -- ``_DATE_TRUNC_SCALAR_COLUMNS["Day"]`` is None, exactly
+    # as on the truncation path, and the caller-stamped key column substitutes.
+    column = (_DATE_TRUNC_SCALAR_COLUMNS.get(grain)
+              or rep.get("date_key_column") or "Date")
+    collapsed = dict(rep)
+    collapsed["property"] = column
+    collapsed["derivation"] = f"{grain}-Trunc"
+    collapsed["date_part"] = None
+    collapsed["date_part_axis_collapsed"] = True
+    if warnings is not None:
+        warnings.append(_warn(
+            "worksheet", worksheet,
+            "date axis grain: Tableau draws one mark per combination of %d date parts (%s) of %r, "
+            "but a Power BI Category role holding several fields renders as a collapsed DRILL "
+            "HIERARCHY -- every top-level bar would SUM the levels beneath it. The parts are folded "
+            "onto the calendar's %r column, which is in exact one-to-one correspondence with those "
+            "combinations, so the mark grain and the chronological order are both preserved. The "
+            "axis LABELS do change: Tableau's two-tier discrete header (e.g. '2013' over 'Jan') "
+            "becomes one tier of formatted dates (e.g. 'Jan 2013')"
+            % (len(parts), ", ".join(p for p in _DATE_PART_AXIS_CHAIN if p in present),
+               rep.get("caption") or rep.get("field_id") or "the date", column)))
+    return [collapsed]
+
 
 def _is_continuous_pill(field):
     """True when a Tableau shelf pill is CONTINUOUS (green), read from Tableau's own encoding.
@@ -1539,6 +1633,14 @@ def _resolve_field(ds, field_id, base_cols, instances, index, ds_caption,
         field["binding"] = "column"
         field["kind"] = "category"
         field["date_rebound"] = True
+        # Which date PART this pill was, and the calendar's key column -- both recorded HERE because
+        # the rebind overwrites ``property`` with the calendar column name, destroying the only other
+        # evidence of it. ``_collapse_date_part_axis`` needs the part to decide whether several of
+        # them sharing one axis name a period grain (issue #191); nothing else reads them, and a
+        # non-part rebind leaves ``date_part`` absent so the collapse declines.
+        if deriv in _DATE_PARTS:
+            field["date_part"] = deriv
+            field["date_key_column"] = date_binding.get("key_column") or "Date"
         return field
 
     if deriv in _DATE_PARTS or deriv.startswith("Trunc") or deriv.endswith("-Trunc"):
@@ -8140,6 +8242,10 @@ def _build_query_state(ws, model_table, field_map, warnings):
         val = _dedupe(values(rows) + values(cols))
         series = [color] if (_model_bound_category(color, field_map)) else []
         cat = [f for f in cat if f not in series]
+        # Several date PARTS of one date on the bar/column axis fold onto the calendar's scalar
+        # grain column; a Power BI Category role holding both renders them as a COLLAPSED drill
+        # hierarchy that sums across the lower level (#191). Declines on every other shape.
+        cat = _collapse_date_part_axis(cat, warnings, ws["name"])
         if cat:
             state["Category"] = {"projections": _role_projections(
                 cat, model_table, field_map, used_refs)}
@@ -8170,6 +8276,9 @@ def _build_query_state(ws, model_table, field_map, warnings):
             series = color_series
         small = [f for f in small if f not in cat]
         series = [f for f in series if f not in cat and f not in small]
+        # Same #191 fold as the bar/column branch: a Year/Month pair on a line chart's x-axis is a
+        # collapsed drill hierarchy that plots one point per YEAR, each summing its months.
+        cat = _collapse_date_part_axis(cat, warnings, ws["name"])
         if cat:
             state["Category"] = {"projections": _role_projections(
                 cat, model_table, field_map, used_refs)}

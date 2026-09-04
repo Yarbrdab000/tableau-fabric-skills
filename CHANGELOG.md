@@ -14,6 +14,88 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ### Fixed
 
+- **`tableau-migration` (skill `2.366.0` → `2.367.0`): several date PARTS of one date sharing an
+  axis no longer collapse to a drill hierarchy that sums across the level beneath (#191).**
+
+  Tableau draws **one mark per combination** when two dimensions share an axis, so
+  `cols=([yr:Order Date:ok] / [mn:Order Date:ok])` is a nested Year/Month axis. Power BI renders a
+  multi-field `Category` role as a **collapsed drill hierarchy showing only its top level**, so every
+  Year bar silently summed its twelve months. Measured on `0070_new_max` at the live model:
+
+  ```
+  collapsed Date[Year]           4 marks    <- what shipped
+  Tableau (Year x Month pairs)  48 marks    <- the authored grain
+  Date[Month Start]             48 marks    <- what this binds
+  leaf-only Date[Month]         12 marks    <- pools 4 years into each bar
+  ```
+
+  and the rollup: the 2013 bar read **2,852,359.83** where Tableau draws twelve bars summing to
+  exactly that. **Arithmetic, not geometry** — nothing was mis-resolved. Both projections were valid,
+  correctly bound, validated clean and rendered a full plausible chart, which is why no static gate
+  saw it: what was wrong is how many marks Power BI *chooses to draw*.
+
+  The repair reuses the binding the continuous-truncation path already emits rather than inventing
+  one. A (Year, Month) pair and `Date[Month Start]` are in **exact bijection** — the distinct
+  `(YEAR(d), MONTH(d))` pairs and the distinct `DATE(YEAR(d), MONTH(d), 1)` values are the same set —
+  so one scalar column carries the identical grain in a single projection with no hierarchy left to
+  collapse. It also **sorts**, where `Date[Month]` is the text `"Jan"`.
+
+  **The axis LABELS change, and that is a real fidelity delta.** Tableau draws a two-tier discrete
+  header (`2013` over `Jan`); a scalar date column renders one tier of formatted dates (`Jan 2013`).
+  The numbers become right and the labels become *different*, which a reader comparing side by side
+  will notice — so it is stated here rather than left to be discovered.
+
+  **The bijection is a claim about the RENDER, so it was checked there.** The generated calendar
+  spans `CALENDAR(DATE(YEAR(MIN(fact)), 1, 1), DATE(YEAR(MAX(fact)), 12, 31))` — **full years** — so
+  its `Month Start` domain can be strictly larger than the months the fact actually has, which would
+  add empty categories Tableau never drew (the same defect in the opposite direction). Measured on
+  `0134_parameter_filters`, where the two genuinely differ:
+
+  ```
+  calendar Month Start domain   60 months
+  fact distinct months          48 months
+  what the visual DRAWS         48        <- blank categories excluded by default
+  ```
+
+  Verified at the render, not only in DAX: the folded visual draws twelve bars for the selected year
+  (`Jan 2023` … `Oct 2023`) with no phantom months. Note that `0070` could not have shown this — its
+  calendar and fact domains are both 48, so the comparison there is incapable of failing.
+
+  **Deliberately narrow, and the narrowness is the point.** It fires only for a part chain rooted at
+  Year, because only then does the combination determine a period. `{Quarter, Month}` with no Year
+  would pool every January across all years — a *worse* wrong number than the rollup it replaced,
+  because it renders as a perfectly plausible seasonal chart — so it declines, as do `{Year, Day}`
+  (no period) and two different source dates (a genuine cross-product).
+
+  **Scope, stated rather than implied.** #191 is 15 visuals; this fixes the **6** date-part ones
+  (`0070` ×3, `0077` ×2, `0134` ×1) and leaves the **9** nested-taxonomy ones untouched
+  (`Product_Category`/`Product_Sub-Category`, `Region`/`Order_ID`, …). Those have no period grain to
+  fold onto and need a different remedy; `Region`/`Order_ID` alone rules out a leaf-only rule, whose
+  near-unique leaf would emit 5,111 bars.
+
+  Render-verified on all three shapes in Power BI Desktop, before and after: the date-part case
+  (`0070` bar and `0077` line) now draws 48 chronological monthly marks with January appearing as
+  four separate members rather than one pooled bar; the nested taxonomy (`0060`) and the
+  high-cardinality leaf (`0065`) render **unchanged**, which is the outcome their decline predicts.
+
+  **Corpus impact: 6 substantive files of 1,605**, all of them the target visuals, with **0 model /
+  TMDL changes** — this is report-side only. Verified with `scripts/build_diff.py` against a baseline
+  rebuilt at the pre-change commit: `root 80 / guid 0 / timestamp 2 / substantive 8` (the 6 visuals
+  plus `report.json` and `summary.md`). `definition_of_done` is byte-identical either side
+  (34 bound / 3 failed / 26 warned), and the counter move is conserved:
+  `visuals_rebuilt 65 → 64`, `visuals_warned 117 → 118` — five of the six were already warned, one
+  was not. The fold is disclosed on both reader surfaces it has (`remediation_worklist` and
+  `viz_fidelity`), 6 visuals × 2 = the 12 occurrences in `report.json`.
+
+  **6 files for 6 visuals means each is in ONE tree only**, which is worth stating because the corpus
+  emits two (`pbip/` and `reports/`) and a visual present in both would have given 12 files for 6
+  visuals. All six changed paths are under `pbip/`. That independently confirms, from the emitter
+  side, the sweep finding on #191 that *every* `Year`/`Month` visual in the corpus is `pbip`-only —
+  and it identifies the mechanism rather than a rate: the fold keys on a `date_part` stamp set only
+  when a pill is rebound onto the marked Date table, and the model-unbound first pass has no calendar,
+  so both parts degrade to the fact's own raw date column and `_dedupe` merges them into one. Nothing
+  is lost by declining there; there is no grain column in that tree to fold onto. Relevant to #173.
+
 - **`tableau-migration` (skill `2.365.0` → `2.366.0`): a calc referencing a synthetic model column
   (Set / Group / Bin) resolves instead of stubbing on a dead-end reason (#192).**
 
