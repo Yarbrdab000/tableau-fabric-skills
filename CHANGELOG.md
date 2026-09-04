@@ -12,6 +12,52 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ## [Unreleased]
 
+### Fixed
+
+- **`tableau-migration` (skill `2.365.0` → `2.366.0`): a calc referencing a synthetic model column
+  (Set / Group / Bin) resolves instead of stubbing on a dead-end reason (#192).**
+
+  Groups, Bins and Sets are spliced onto their home table **after** the model is assembled, via
+  `calc_columns` → `enrich_table_tmdl`. They are therefore absent from the datasource-metadata
+  resolver, so any calc referencing one stubbed with `unresolved/ambiguous field`. Measured: **no
+  synthetic column resolved in a calc at all** — this was never set-specific, and the corpus could
+  not show it because **0 calcs reference a Group or Bin**, so the code had to answer it:
+  `calc_columns` was read once and used only by the splice, registered with no resolver.
+
+  `_build_column_refs` already exists for exactly this condition, in its own words — *"the sibling
+  is being CREATED and so is absent from the datasource-metadata resolver"*. A synthetic column is
+  simply a ref that is **known up front** rather than derived by that fix-point, so it is now
+  **seeded** into the same map with the same `(home_table, caption, tmdl_type)` shape.
+
+  **Seeded rather than registered with the resolver, deliberately.** The resolver is built from the
+  descriptor, and the descriptor also feeds the M query — a synthetic column leaking into a
+  partition would ask the source for a column it does not have, trading a `BLANK()` column for a
+  model that fails to refresh. The seed touches nothing the M generator reads.
+
+  The type is read from the emitted block's own `dataType:` line rather than assumed per kind, and a
+  block declaring no `dataType` is **skipped rather than defaulted**: guessing `string` for a
+  boolean set would let `IF [Set 1] THEN …` translate with the wrong type, which is a silently wrong
+  result rather than an honest stub.
+
+  **What changed, stated exactly.** On `0078_top_n_and_other`'s `Names` — the motivating case — the
+  build's own report moved:
+
+  ```
+  before   unresolved/ambiguous field [Set 1]
+  after    parameter reference [Parameters].[Parameter 5] (unmodeled)
+  ```
+
+  `[Set 1]` resolves. **That calc still stubs**, because it *also* references a parameter, which the
+  column path treats as unmodeled — a separate, already-tracked class. Calling it fixed would be
+  false; what changed is that the reported reason is now the real remaining obstacle instead of a
+  dead end, which is what a reader triages on. A set reference with nothing else in the way does
+  translate, and that is the case pinned by test.
+
+  **Corpus impact is 0 model files**, and that is the expected result rather than a disappointment:
+  the only estate calc referencing a set has that second blocker, so the TMDL is unchanged and only
+  `report.json` / `repair-queue.json` move. Verified with `scripts/build_diff.py` —
+  `root 80 / guid 0 / timestamp 2 / substantive 2`, both of them report metadata.
+
 ### Added
 
 - **`tableau-migration` (skill `2.364.0` → `2.365.0`): a Tableau SET is rebuilt as a boolean model

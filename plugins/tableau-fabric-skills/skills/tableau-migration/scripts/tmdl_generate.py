@@ -1261,6 +1261,49 @@ def resolve_set_object(s, resolve, parameters=None):
                                              else "parameter current value (%s)" % d.get("count"))}
 
 
+_CALC_COL_NAME_RE = re.compile(r"^\tcolumn\s+('(?:[^']|'')*'|[^\s=]+)\s*=", re.M)
+_CALC_COL_DTYPE_RE = re.compile(r"^\t\tdataType:\s*(\S+)\s*$", re.M)
+
+
+def synthetic_column_refs(calc_columns):
+    """``{name_lower: (table, name, tmdl_type)}`` for every SYNTHETIC calc column being emitted.
+
+    Groups, Bins and Sets are all spliced onto their home table AFTER the model is assembled, via
+    ``calc_columns`` -> ``enrich_table_tmdl``. They are therefore absent from the datasource-metadata
+    resolver, so a calc referencing one stubs with ``unresolved/ambiguous field`` -- measured on
+    ``0078_top_n_and_other``, whose ``Names`` column stubbed to ``BLANK()`` on ``[Set 1]`` in the
+    workbook whose entire subject is that idiom.
+
+    This is exactly the problem ``assemble_model._build_column_refs`` already solves for SIBLING
+    calcs ("the sibling is being CREATED and so is absent from the datasource-metadata resolver"),
+    so the fix is to seed that map rather than to add a resolver. Nothing here touches the
+    descriptor, which is what feeds the M query -- so a synthetic column can never leak into the
+    partition and ask the source for a column it does not have.
+
+    The type is read from the emitted block's OWN ``dataType:`` line rather than assumed per kind.
+    That is authoritative (it is what the model will declare), and it keeps Groups, Bins and Sets on
+    one code path. A block that declares no ``dataType`` is skipped rather than defaulted: guessing
+    ``string`` for a boolean set would let ``IF [Set 1] THEN ...`` translate with the wrong type,
+    which is a silently wrong result rather than an honest stub.
+    """
+    out = {}
+    for table, blocks in (calc_columns or {}).items():
+        for block in (blocks if isinstance(blocks, (list, tuple)) else [blocks]):
+            if not isinstance(block, str):
+                continue
+            m = _CALC_COL_NAME_RE.search(block)
+            if not m:
+                continue
+            name = m.group(1)
+            if name.startswith("'") and name.endswith("'"):
+                name = name[1:-1].replace("''", "'")
+            d = _CALC_COL_DTYPE_RE.search(block)
+            if not d:
+                continue
+            out[name.strip().lower()] = (table, name, d.group(1).strip())
+    return out
+
+
 def parse_model_objects(tds_text):
     """Parse hierarchies, display folders, and user filters out of a Tableau ``.tds``.
 
@@ -1802,6 +1845,7 @@ def resolve_model_objects(parsed, resolve_field, *, calcs=None, data_tables=None
         "hierarchies": resolved_hier,
         "roles": roles,
         "calc_columns": calc_columns,
+        "synthetic_column_refs": synthetic_column_refs(calc_columns),
         "report": {"display_folders": folder_report,
                    "hierarchies": hier_report,
                    "rls": rls_report,

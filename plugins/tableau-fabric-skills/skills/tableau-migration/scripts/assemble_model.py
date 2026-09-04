@@ -3953,7 +3953,7 @@ def _param_constant_literal(value, dtype):
 
 
 def _build_column_refs(calcs, rc, known_tables, *, consumed_lower=None, relationships=None,
-                       param_resolver=None):
+                       param_resolver=None, seed=None):
     """Fix-point map ``{ref_key: (home_table, caption, tmdl_type)}`` of the deterministically
     translatable, single-home, typed calc COLUMNS among ``calcs``.
 
@@ -3976,7 +3976,14 @@ def _build_column_refs(calcs, rc, known_tables, *, consumed_lower=None, relation
     (``_reroute_row_level_measure_calcs``) shares the EXACT same sibling-resolution semantics.
     """
     consumed_lower = consumed_lower or set()
-    column_refs = {}
+    # ``seed`` pre-registers refs that are KNOWN rather than derived -- the synthetic calc columns
+    # (Tableau Groups, Bins and Sets) that are spliced onto their home table after assembly and are
+    # therefore absent from the datasource-metadata resolver. Exactly the condition this fix-point
+    # already exists for, so they enter through the same door with the same shape
+    # ``(home_table, caption, tmdl_type)``. Seeding rather than adding a resolver keeps the
+    # DESCRIPTOR untouched, which matters because the descriptor also feeds the M query: a synthetic
+    # column that leaked into it would ask the source for a column that does not exist.
+    column_refs = dict(seed or {})
     pending = [c for c in (calcs or [])
                if (c.get("name") or "").lower() not in consumed_lower]
     changed = True
@@ -4023,7 +4030,7 @@ def _build_column_refs(calcs, rc, known_tables, *, consumed_lower=None, relation
 def _calc_columns_part(dim_calcs, resolve, anchor_table, *,
                        date_table=None, active_date_cols=None, consumed=None,
                        approved_calc_dax=None, known_tables=None, resolve_for=None,
-                       relationships=None, param_resolver=None):
+                       relationships=None, param_resolver=None, synthetic_refs=None):
     """Translate row-level (dimension) ``dim_calcs`` via column mode and group the rendered
     calculated-column TMDL by target table, plus a per-column report.
 
@@ -4119,7 +4126,8 @@ def _calc_columns_part(dim_calcs, resolve, anchor_table, *,
     # ``_build_column_refs`` so the row-level reroute pre-router uses the EXACT same semantics. Empty
     # when no calc references a sibling -> the main loop is byte-identical to the prior single pass.
     column_refs = _build_column_refs(dim_calcs, _arc, known_tables, consumed_lower=consumed_lower,
-                                     relationships=relationships, param_resolver=param_resolver)
+                                     relationships=relationships, param_resolver=param_resolver,
+                                     seed=synthetic_refs)
     for calc in dim_calcs or []:
         name, formula = calc["name"], calc.get("formula", "")
         if name.lower() in consumed_lower:
@@ -4777,7 +4785,8 @@ def assemble_import_model(descriptor, *, model_name, calcs=None, dim_calcs=None,
                           parameters=None, table_calc_usages=None, calc_outer_aggs=None,
                           scatter_keys=None, storage_decision=None,
                           colour_palettes=None, semantic_colours=False, date_usage=None,
-                          date_usage_by_island=None, row_count_tables=None):
+                          date_usage_by_island=None, row_count_tables=None,
+                          synthetic_refs=None):
     """Assemble the Import/DirectQuery semantic model definition for a parsed descriptor.
 
     Returns ``{"parts": {path: text}, "report": {...}}``. Raises ``ValueError`` if the
@@ -5165,6 +5174,7 @@ def assemble_import_model(descriptor, *, model_name, calcs=None, dim_calcs=None,
         approved_calc_dax=approved_calc_dax, known_tables=set(table_names),
         resolve_for=_raw_scoped_resolver, relationships=all_rels,
         param_resolver=build_parameter_constant_resolver(parameters),
+        synthetic_refs=synthetic_refs,
         consumed=(set(consumed) | flag_source_names) if flag_source_names else consumed)
     # FIX C -- keep the INLINE-sentinel foundation entries OUT of the measure-side resolver. A
     # row-invariant foundation calc (``_INLINE_REF_SENTINEL`` first slot) is meaningful only to the
@@ -5966,6 +5976,7 @@ def migrate_tds_to_semantic_model(tds_text, *, model_name, calcs=None, dim_calcs
         calc_lookup = _calc_lookup_from(calcs)
     enrichment_report = None
     harvest_calc_columns = {}
+    harvest_synthetic_refs = {}
     if hierarchies is None and display_folders is None and rls_roles is None:
         parsed = T.parse_model_objects(tds_text)
         resolve = build_m_field_resolver(descriptor)
@@ -5979,6 +5990,11 @@ def migrate_tds_to_semantic_model(tds_text, *, model_name, calcs=None, dim_calcs
         display_folders = resolved["display_folders"]
         rls_roles = resolved["roles"]
         harvest_calc_columns = resolved.get("calc_columns") or {}
+        # The synthetic columns (Groups, Bins, Sets) are spliced onto their home table AFTER
+        # assembly, so a calc that references one stubs with ``unresolved/ambiguous field``. Hand
+        # them to the assembler as a SEED for the sibling-calc fix-point, which already exists for
+        # exactly this condition. Nothing here reaches the descriptor, so the M query is untouched.
+        harvest_synthetic_refs = resolved.get("synthetic_column_refs") or {}
         enrichment_report = resolved["report"]
     # Workbook table calcs (quick table calcs + addressing-bearing field calcs) are recovered from
     # the document text so the model build can emit them as faithful measures. A bare ``.tds`` has no
@@ -6018,6 +6034,7 @@ def migrate_tds_to_semantic_model(tds_text, *, model_name, calcs=None, dim_calcs
             row_count_tables = []
     result = assemble_import_model(descriptor, model_name=model_name,
                                    calcs=calcs, dim_calcs=dim_calcs, relationships=relationships,
+                                   synthetic_refs=harvest_synthetic_refs,
                                    hierarchies=hierarchies, display_folders=display_folders,
                                    rls_roles=rls_roles, date_table=date_table,
                                    mark_as_date=mark_as_date, flatfile_path=flatfile_path,
