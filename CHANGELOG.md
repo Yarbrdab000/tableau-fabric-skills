@@ -14,6 +14,57 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ### Fixed
 
+- **`tableau-migration` (skill `2.368.0` → `2.369.0`): the `layout_polish` pending gate now points at
+  a runbook that actually documents it, and a test enforces that for every gate (#193).**
+
+  `report.json.pending_gates[]` emits a `layout_polish` gate carrying `runbook:
+  resources/dashboard-audit.md`. That document contained **zero** mentions of `polish_layout`,
+  `layout_polish`, or *formatting touch-up*. So the artifact presented a required user decision and
+  named a procedure that could not explain the command, its inputs, the dry-run mode, which files may
+  change, the acceptance condition, or the geometry-only boundary. A user who answered `GO` had
+  nothing to follow.
+
+  **Why it stayed invisible:** the gate's inline `offer` already carries a runnable command, which is
+  sufficient for a user who **declines**. Only someone who accepts discovers the pointer is empty —
+  and the corpus never accepts, because the gate is user-gated by design.
+
+  `dashboard-audit.md` gains a bounded section covering exactly what a `GO` needs: what it fixes
+  (worst-first, because band overlap *hides* content), both invocations, that the path may be a
+  `.Report` directory or the `.pbip` folder, the importable API, what may change on disk (**only
+  `position` rects** — no field, filter, measure, visual type, or number), the per-page monotonic
+  acceptance condition, and how to read the result. It is filed as a **sibling** of the audit rather
+  than a step within it, matching the offer text, which already says the two are independent and the
+  user may take either, both, or neither.
+
+  **The test is the durable half**, and the issue is explicit that path-existence alone is
+  insufficient — the broken pointer was to a file that exists, is 21 KB, and is the correct document
+  for the sibling gate offered in the same breath. So every check reads the target's **content**:
+  each gate's runbook must exist, must mention the gate, and must name any `.py` its offer tells the
+  user to run.
+
+  Proven able to fail, on the right named tests:
+
+  ```
+  remove the whole section     4 failed -- incl. ..MENTIONS_the_gate_it_is_cited_for
+  remove only the --dry-run    1 failed -- ..explains_the_four_things_a_GO_needs
+  ```
+
+  The second control is the more useful one: a **partially** documented gate fails exactly one named
+  test, so a future regression says which part went missing rather than just "the docs are wrong".
+
+  **A control caught a hole in the test's own fixture.** The first version keyed the summary on
+  `calcs_stubbed`, which no gate reads — so `second_compiler` never fired and was silently exempt from
+  every assertion in the file, with all of them passing. A second test now pins the fixture against
+  each gate's **own published `trigger`**, so a renamed trigger fails there, with a reason, instead of
+  quietly dropping a gate out of the population.
+
+  `polish_layout.py` also comes off `test_capability_discoverability`'s undocumented-script allowlist,
+  as that gate itself instructed — it is documented now, so the real check protects it.
+
+  **No deterministic output changed, and that is structural rather than measured:** no file under
+  `scripts/` is touched by this release, so no emitted artifact can move. Layout polish remains
+  optional and user-gated.
+
 - **`tableau-migration` (skill `2.367.0` → `2.368.0`): the date-axis fold's label disclosure now names
   the MECHANISM, because the obvious inference from the TMDL predicts the wrong string (#191).**
 

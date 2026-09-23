@@ -36,7 +36,6 @@ _RESOURCES = os.path.join(_ROOT, "resources")
 # Each is a real capability an agent currently cannot find. Documenting one = deleting a line here.
 _PRE_EXISTING_UNDOCUMENTED = frozenset({
     "geometry_audit.py",        # scores emitted geometry: overlaps / containment / displacement
-    "polish_layout.py",         # post-emit layout tidy pass
     "tmdl_lint.py",             # TMDL well-formedness (runs inside openability_gate, also a CLI)
     "workbook_calc_usage.py",   # where each calc is actually placed in the workbook
 })

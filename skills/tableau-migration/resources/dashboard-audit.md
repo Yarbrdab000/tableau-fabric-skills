@@ -269,6 +269,93 @@ already notes — those cannot invalidate the visual.
 
 ---
 
+## The formatting touch-up (`layout_polish`) — a separate, optional gate
+
+> **This is not a step of the audit above.** It is a second Tier-3 capability that happens to be
+> offered in the same breath, because a user deciding about their rebuilt report wants both questions
+> at once. The two are **independent**: take either, both, or neither. Declining this leaves the
+> deterministic rebuild exactly as it shipped.
+
+`report.json.pending_gates[]` emits a `layout_polish` gate on **every** rebuilt report — not only one
+with warned visuals. That is deliberate, and the reason is structural rather than a quality judgement:
+Tableau lays a filter band out with a **layout-flow container**, so the author never types coordinates
+and the container distributes them. Power BI has no such container — every visual is an absolute rect —
+so the rebuild has to *compute* what Tableau computed. Small per-card differences (a longer caption, a
+fixed-size zone, a scaled dashboard) accumulate into a visibly ragged band even when every individual
+rect came from a faithful reading of the source. There has never been an output that could not use
+polish, so the gate does not wait for a warning.
+
+### What it fixes, worst first
+
+Overlap comes first because it **hides content** — a row drawn on top of another is not untidy, it is
+unreadable:
+
+1. **band-to-band overlap** — a row drawn over the row above it, or over the content below;
+2. **non-uniform control size** within a band;
+3. **misaligned left edge / top** across bands;
+4. **uneven gutters** within a band.
+
+### Run it
+
+```bash
+# Measure first — writes NOTHING, prints the per-page score:
+py -3.11 "$SKILL\scripts\polish_layout.py" "<bundle>\pbip\<Workbook>\<Workbook>.Report" --dry-run
+
+# Apply:
+py -3.11 "$SKILL\scripts\polish_layout.py" "<bundle>\pbip\<Workbook>\<Workbook>.Report"
+```
+
+The path may be the `.Report` directory **or** the `.pbip` project folder containing it — the first
+`.Report` inside is resolved automatically. Output is JSON: per page a `changed` count plus `before` /
+`after` defect scores, and the same three totalled across the report.
+
+Importable too, for a caller that wants the numbers without the CLI:
+`polish_report(report_dir, apply=True)`, alongside `collect_visuals`, `score_page` and `polish_page`.
+
+### What may change on disk — and what cannot
+
+**Only `position` rects.** No field, filter, measure, visual type, page or binding is touched, so **no
+number on the report can move**. That is the boundary that makes this safe to run unattended once
+authorized, and it is why it is a different kind of operation from the audit above, which *can* change
+a visual's type within its listed `alternatives`.
+
+### The acceptance condition — a measured, monotonic gate
+
+Polish is kept **per page**, and only when the page's measured defect count **falls**. A page that
+would come out the same or worse is restored untouched. So there is no judgement call to make and no
+"does this look better?" to answer — re-run with `--dry-run` afterwards and read the score.
+
+This is checkable rather than claimed because the operation is **deterministic and idempotent**: every
+decision is a median or a derived pitch over the band's own members — no randomness, no clock, no I/O
+beyond the report. Two runs on the same input produce the same bytes, and polishing an
+already-polished page is a no-op.
+
+### How to judge the result
+
+```text
+before.total > after.total     the page improved; the new geometry was kept
+before.total == after.total    nothing was worth changing — the page is already clean,
+                               or every candidate change failed the gate and was reverted
+changed == 0                   no visual.json was rewritten
+```
+
+An unchanged page is a **complete, honest outcome**, exactly as a warned visual with no faithful
+improvement is. Do not hand-nudge rects to force a difference; the gate declining is the system
+working.
+
+### Invariants
+
+1. **Additive.** A run that declines polish is byte-identical to one from before this capability
+   existed. The deterministic rebuild is never altered by the gate merely being offered.
+2. **Optional, and user-gated.** Offer it; run only on an explicit `GO`. Declining ships the
+   deterministic rebuild as-is.
+3. **Geometry only.** If a proposed change would touch anything but a `position` rect, it is not this
+   operation.
+4. **Proven-improving or reverted.** The measured defect count is the authority, per page — never an
+   impression of the render.
+
+---
+
 ## Hard safety invariants (all tiers)
 
 1. **Match-or-beat, per visual.** A proposal is kept only if it regresses nothing; otherwise the exact
