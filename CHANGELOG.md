@@ -14,6 +14,76 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ### Fixed
 
+- **`tableau-migration` (skill `2.370.0` → `2.371.0`): a Visual Calculation now walks an axis the
+  visual actually groups on, instead of a hardcoded `ROWS`.**
+
+  A Visual Calculation is evaluated over the visual's own result matrix **along an axis**, so the
+  axis has to be one the visual groups on. The formula table-calc path never derived one — it passed
+  `axis="ROWS"` as a literal at its single call site. (The quick-table-calc path has had a whole
+  `_derive_axis` for this all along; only the formula path was hardcoded.)
+
+  That is right for a cartesian chart and silently degenerate for a **matrix grouped only on
+  COLUMNS**, where the `ROWS` axis holds exactly ONE row, so a whole-partition window spans a single
+  value:
+
+  * `AVERAGEX` over one row returns that row's value — wrong, and plausible enough that no static
+    check can see it;
+  * `STDEVX.S` over one row divides by `n - 1 = 0` and renders the literal text **`NaN`**.
+
+  The axis is now read from the visual's own grouping roles. A chart stays `ROWS` — a cartesian
+  chart's category axis *is* the rows of its result matrix, the same structural fact
+  `visual_calc_spec`'s `visual_axis` override already encodes. A matrix with no `Rows` grouping but a
+  `Columns` grouping becomes `COLUMNS`. **Everything else keeps today's answer**, including a matrix
+  grouped on *both* axes: choosing a direction there needs the Tableau ordering token this path does
+  not carry, and guessing would trade a known shape for an unevidenced one.
+
+  Verified at the **render**, with a positive control. OCR of the real Power BI Desktop renders
+  (`Windows.Media.Ocr`, no new dependency), cold-reopened from a persisted cache, before and after:
+
+  ```
+  PRE-FIX    Sales $139,730   Lower NaN          Upper NaN
+  POST-FIX   Sales $139,730   Lower 94,351.10    Upper 278,646.04
+  ```
+
+  The pre-fix image is the control: had it not read `NaN`, the reader was not looking at the right
+  region and the post-fix result would mean nothing. Those two values are exactly what the engine
+  computes independently over the 48-month partition (mean `186,498.57`, sample sd `92,147.47`,
+  k = 1), and the engine reproduces the defect directly — `STDEVX.S` over a single row returns `nan`.
+
+  Blast radius is one file: a corpus diff of the 34-workbook estate reports **0 added, 0 GUID churn
+  and exactly 1 substantive change**, the `visual.json` of the affected matrix.
+
+  Correction to a note that appeared in an earlier draft of this entry: I wrote that the
+  `unsupported function WINDOW_MAX` / `RANK` / `Total` stubs in `model_translation_handoff` are
+  "by design — a table calc belongs to the report layer — so they are not the calculation-parity
+  backlog they resemble." **The first half is true and the conclusion is false.** The measure path
+  declines a table calc deliberately; that is a real contract. But the design only holds if the
+  report layer then *carries* the calc, and measured on the corpus it does not:
+
+  ```
+  model stubs whose reason names a table-calc head   28
+    carried by an emitted Visual Calculation          0
+  positive control: calc names that ARE carried,
+    fed to the same matcher                           54 found, 0 missed
+  ```
+
+  The control is what makes the zero worth anything — a name matcher returning `0` is otherwise
+  indistinguishable from one that is blind. A first version of it matched *worksheet* names while the
+  measurement matched *calc* names, which would have certified the wrong field; the numbers above are
+  from the corrected one, run against calc names the report layer demonstrably carries (`Upper`,
+  `Lower`, `Rank`, `Percent of Total`, `Moving Average`, `Running Total`, …).
+
+  So the report layer really does carry table calcs — **11 of them** — and these 28 are a different
+  set that the measure path declines by design and nothing picks up: they *are* a backlog. The
+  `category_guidance` attached to 26 of
+  them compounds it by telling the reader to "recover the addressing ... then emit the windowed DAX",
+  i.e. pointing at the measure path that just declined them.
+
+  Recorded here rather than quietly dropped, because "an intentional decline" and "a calculation that
+  survives somewhere else" are different claims and only the first one was measured.
+
+### Fixed
+
 - **`tableau-migration` (skill `2.369.0` → `2.370.0`): the one first-party validator rule this engine
   knowingly fails is now disclosed where a USER meets it, not only beside the constant.**
 
