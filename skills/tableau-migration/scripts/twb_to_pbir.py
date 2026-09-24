@@ -9768,6 +9768,40 @@ _VC_QUERY_REFS = ("select", "select1", "select2", "select3", "select4")
 # ``categories(rows) + categories(cols)`` (so a projection-count split can re-nest it); a line/area
 # splits its shelves into Category vs SmallMultiple instead, which already carries the partition.
 _VC_CHART_TYPES = frozenset({VT_COLUMN, VT_BAR, VT_LINE, VT_AREA})
+
+
+def _formula_vc_axis(state, is_chart):
+    """The Visual-Calculation axis for a formula table calc, from the visual's OWN grouping roles.
+
+    A Visual Calculation walks the visual's result matrix along an axis, so the axis must be one the
+    visual actually groups on. This used to be hardcoded ``"ROWS"`` at the single call site, which is
+    correct for a cartesian chart and silently degenerate for a matrix grouped only on COLUMNS.
+
+    * **Chart -> always ROWS.** A cartesian chart's category axis IS the "rows" of its result matrix
+      whatever the Tableau ordering token said -- a structural fact of charts, and the same reason
+      ``visual_calc_spec``'s ``visual_axis`` override exists for the quick-table-calc path.
+    * **Matrix with NO row grouping but a column grouping -> COLUMNS.** The ROWS axis then holds
+      exactly ONE row, so a whole-partition window spans a single value: ``AVERAGEX`` returns that
+      value (wrong, and plausible enough to pass every static check) and ``STDEVX.S`` divides by
+      ``n - 1 = 0`` and renders the literal text **NaN**. Measured on ``0074_control_chart``, whose
+      matrix carries ``Columns=[Month Start]`` and no ``Rows``: the Upper/Lower control limits showed
+      ``NaN`` while Sales rendered normally, and the engine reproduces it exactly --
+      ``STDEVX.S`` over one row returns ``nan``. On the COLUMNS axis the same expressions give
+      ``Upper = 278,646.04`` / ``Lower = 94,351.10`` over the 48-month partition.
+    * **Anything else -> ROWS**, unchanged. A matrix grouped on BOTH axes needs the Tableau ordering
+      token to pick a direction, which this path does not carry; guessing there would trade a known
+      shape for an unevidenced one, so it keeps today's behaviour.
+
+    Deliberately narrow: the only case that moves is the one where the old answer is provably
+    meaningless, which is why the corpus is byte-identical apart from that visual.
+    """
+    if is_chart:
+        return "ROWS"
+    n_rows = len((state.get("Rows") or {}).get("projections") or [])
+    n_cols = len((state.get("Columns") or {}).get("projections") or [])
+    if n_rows == 0 and n_cols > 0:
+        return "COLUMNS"
+    return "ROWS"
 _VC_REORDER_TYPES = frozenset({VT_COLUMN, VT_BAR})
 
 
@@ -10297,6 +10331,7 @@ def _apply_formula_table_calc_chain(ws, state, chain_index, model_table, field_m
     values = (state.get(value_key) or {}).get("projections", [])
     if not values:
         return False, None
+    axis = _formula_vc_axis(state, is_chart)
 
     # A worksheet can display SEVERAL formula table calcs at once -- a control chart shows an Upper
     # AND a Lower band -- so every admitted usage is attempted, not just the first. Each attempt is
@@ -10305,7 +10340,8 @@ def _apply_formula_table_calc_chain(ws, state, chain_index, model_table, field_m
     emitted_facts, review_fact = [], None
     for usage in usages:
         handled, fact = _apply_one_formula_table_calc(
-            ws, state, usage, value_key, model_table, field_map, warnings, param_values)
+            ws, state, usage, value_key, model_table, field_map, warnings, param_values,
+            axis=axis)
         if handled:
             emitted_facts.append(fact)
         elif fact is not None and review_fact is None:
@@ -10322,7 +10358,7 @@ def _apply_formula_table_calc_chain(ws, state, chain_index, model_table, field_m
 
 
 def _apply_one_formula_table_calc(ws, state, usage, value_key, model_table, field_map, warnings,
-                                  param_values=None):
+                                  param_values=None, axis="ROWS"):
     """Rebuild ONE formula table-calc usage on ``ws`` as Visual Calculation(s).
 
     Returns ``(handled, fact)`` exactly as :func:`_apply_formula_table_calc_chain` does for a single
@@ -10436,7 +10472,7 @@ def _apply_one_formula_table_calc(ws, state, usage, value_key, model_table, fiel
                        "entry": entry_caption}
 
     defs, reason = compile_formula_chain(
-        entry_caption, calc_formulas, axis="ROWS",
+        entry_caption, calc_formulas, axis=axis,
         resolve_aggregate=resolve_aggregate, resolve_measure=resolve_measure, summaries=summaries)
     if not defs:
         return _review(reason or "chain did not compile")
