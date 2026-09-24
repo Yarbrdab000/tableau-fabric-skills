@@ -151,3 +151,34 @@ def test_a_degenerate_card_is_floored_not_dropped():
     """The floor's actual job: a tiny authored card must still render its control."""
     assert twb_to_pbir.SLICER_DROPDOWN_MIN_H >= 57.0
     assert layout_solve.MIN_SLICER[0] >= 120.0
+
+
+def test_the_known_false_positive_is_disclosed_where_a_USER_stands():
+    """The rationale must reach the person who meets the symptom, not only the one editing line 247.
+
+    Everything this file pins is aimed at the next EDITOR of the constant, and that is where the
+    rationale lived -- a detailed comment beside ``SLICER_DROPDOWN_MIN_H``, correctly placed for
+    someone already looking at it. The person who actually hits this is somewhere else entirely:
+    running ``powerbi-report-author validate`` over their own output and reading ~11 of 68 reports
+    fail. Nothing they can see says the rule is a false positive on this emitter.
+
+    That gap is not hypothetical -- it is the documented history of #180. A revert shipped, and it
+    regressed every dropdown card in the corpus by 19px.
+
+    So the disclosure is pinned on the surface the reader is standing on. Checks the symptom they
+    search for, the reason it is benign, and a pointer back to the authority -- not merely that the
+    code is mentioned somewhere.
+    """
+    doc = os.path.join(_HERE, "..", "resources", "troubleshooting.md")
+    assert os.path.isfile(doc), "troubleshooting.md is missing"
+    text = open(doc, encoding="utf-8-sig").read()
+
+    assert "PBIR_SLICER_HEIGHT_BELOW_FLOOR" in text, (
+        "the user-facing runbook never names the diagnostic code a user will search for")
+    low = text.lower()
+    assert "false positive" in low, (
+        "the runbook names the code but does not say it is benign on our output")
+    assert "textsize" in low, (
+        "the runbook does not give the REASON (the stamped authored size the rule cannot see)")
+    assert "SLICER_DROPDOWN_MIN_H" in text, (
+        "the runbook does not point back to the constant that owns the rationale")

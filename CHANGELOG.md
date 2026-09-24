@@ -14,6 +14,38 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
 
 ### Fixed
 
+- **`tableau-migration` (skill `2.369.0` → `2.370.0`): the one first-party validator rule this engine
+  knowingly fails is now disclosed where a USER meets it, not only beside the constant.**
+
+  `powerbi-report-author validate` flags `PBIR_SLICER_HEIGHT_BELOW_FLOOR` on our output —
+  *"Dropdown slicer height 57px < 76px minimum (header 28 + selector 32 + padding 8/8)"* — on
+  **11 of 68** corpus reports. It is a **known false positive**: the rule computes the chrome of
+  Power BI's default ~12pt face, while this emitter stamps the **authored** point size as `textSize`
+  on the slicer's `header` and `items` wells (94 of 94 corpus slicers carry both). The rule cannot
+  see that, so it demands a card sized for a face we do not emit.
+
+  All of that was already written down, correctly and in detail — in a comment beside
+  `SLICER_DROPDOWN_MIN_H`, and in `test_slicer_height_floor.py`. Both are aimed at the next
+  **editor** of the constant. The person who actually meets this is somewhere else: running the
+  validator over their own output and reading eleven reports fail, with nothing in reach saying the
+  rule is benign here.
+
+  **That gap has already cost a release.** Reverting the floor to 76 shipped once (#180) and
+  regressed every dropdown card in the corpus by 19px, because the premise was checked with the
+  wrong predicate (`fontSize`, which never appears, rather than `textSize`, which always does).
+
+  `resources/troubleshooting.md` now carries it, phrased as the symptom a user searches for, with
+  the reason, the measured prevalence, the instruction not to re-argue it from the validator, and a
+  pointer back to the constant that owns the rationale. A test pins that disclosure — proven able to
+  fail by deleting the entry.
+
+  **Nothing about the trade changed**, deliberately: the floor is still 57.0, the emitter is
+  untouched, and no file under `scripts/` is modified, so no emitted artifact can move. If that
+  trade is ever revisited, the instruction stands — **re-render, do not re-argue it from the
+  validator.**
+
+  Found while investigating #195, which does **not** reproduce here.
+
 - **`tableau-migration` (skill `2.368.0` → `2.369.0`): the `layout_polish` pending gate now points at
   a runbook that actually documents it, and a test enforces that for every gate (#193).**
 
