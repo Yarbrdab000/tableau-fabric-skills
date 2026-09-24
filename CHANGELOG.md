@@ -63,13 +63,19 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
   ```
   model stubs whose reason names a table-calc head   28
     carried by an emitted Visual Calculation          0
-  positive control: emitted visual calcs the same
-    matcher CAN find by name                          8 of 11
+  positive control: calc names that ARE carried,
+    fed to the same matcher                           54 found, 0 missed
   ```
 
   The control is what makes the zero worth anything — a name matcher returning `0` is otherwise
-  indistinguishable from one that is blind. So those 28 calcs are declined by the measure path by
-  design and picked up by nothing: they *are* a backlog. The `category_guidance` attached to 26 of
+  indistinguishable from one that is blind. A first version of it matched *worksheet* names while the
+  measurement matched *calc* names, which would have certified the wrong field; the numbers above are
+  from the corrected one, run against calc names the report layer demonstrably carries (`Upper`,
+  `Lower`, `Rank`, `Percent of Total`, `Moving Average`, `Running Total`, …).
+
+  So the report layer really does carry table calcs — **11 of them** — and these 28 are a different
+  set that the measure path declines by design and nothing picks up: they *are* a backlog. The
+  `category_guidance` attached to 26 of
   them compounds it by telling the reader to "recover the addressing ... then emit the windowed DAX",
   i.e. pointing at the measure path that just declined them.
 
