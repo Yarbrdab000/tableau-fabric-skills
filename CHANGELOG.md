@@ -64,14 +64,23 @@ own `VERSION` stamp (`skills/<name>/VERSION`).
   model stubs whose reason names a table-calc head   28
     carried by an emitted Visual Calculation          0
   positive control: calc names that ARE carried,
-    fed to the same matcher                           54 found, 0 missed
+    fed to the same matcher                           0 missed, under every indexing
   ```
 
   The control is what makes the zero worth anything — a name matcher returning `0` is otherwise
-  indistinguishable from one that is blind. A first version of it matched *worksheet* names while the
-  measurement matched *calc* names, which would have certified the wrong field; the numbers above are
-  from the corrected one, run against calc names the report layer demonstrably carries (`Upper`,
-  `Lower`, `Rank`, `Percent of Total`, `Moving Average`, `Running Total`, …).
+  indistinguishable from one that is blind. Two things about it are worth more than the counts:
+
+  A first version matched *worksheet* names while the measurement matched *calc* names. That is not
+  a weaker control, it is a control on a **different field** — it would have returned a confident
+  pass while certifying nothing. The numbers above come from the corrected one, run against calc
+  names the report layer demonstrably carries (`Upper`, `Lower`, `Rank`, `Percent of Total`,
+  `Moving Average`, `Running Total`, …).
+
+  And it is stated as an **invariant** rather than a population size on purpose: *every carried calc
+  name the matcher is given, it finds*. Three defensible indexings of "the carried set" give three
+  different totals (54 / 28 / 15, depending on how the duplicate `<wb>.Report` trees are deduped and
+  how broadly the harvest regex matches), so any single count implies a precision this does not have.
+  The invariant is what makes the zero mean something; the size of the population never was.
 
   So the report layer really does carry table calcs — **11 of them** — and these 28 are a different
   set that the measure path declines by design and nothing picks up: they *are* a backlog. The
